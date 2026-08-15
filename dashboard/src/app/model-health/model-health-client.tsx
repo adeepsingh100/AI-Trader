@@ -8,6 +8,7 @@ import type { ModelUsage } from "@/lib/types";
 
 export default function ModelHealthClient() {
   const [events, setEvents] = useState<ModelUsage[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -16,8 +17,10 @@ export default function ModelHealthClient() {
       .select("*")
       .order("timestamp", { ascending: false })
       .limit(500)
-      .then(({ data }) => {
-        if (!cancelled) setEvents(data ?? []);
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        setError(error ? error.message : null);
+        setEvents(error ? null : (data ?? []));
       });
     return () => {
       cancelled = true;
@@ -35,8 +38,13 @@ export default function ModelHealthClient() {
     <div className="space-y-6">
       <h1 className="text-xl font-semibold">Model health</h1>
 
-      {events === null && <p className="text-neutral-500">Loading…</p>}
-      {events?.length === 0 && <p className="text-neutral-500">No model_usage recorded yet.</p>}
+      {error && (
+        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+          Query failed: {error}
+        </p>
+      )}
+      {!error && events === null && <p className="text-neutral-500">Loading…</p>}
+      {!error && events?.length === 0 && <p className="text-neutral-500">No model_usage recorded yet.</p>}
 
       {stats.length > 0 && (
         <>

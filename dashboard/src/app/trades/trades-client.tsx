@@ -8,6 +8,7 @@ import type { Trade } from "@/lib/types";
 export default function TradesClient() {
   const mode = useMode();
   const [trades, setTrades] = useState<Trade[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -17,8 +18,10 @@ export default function TradesClient() {
       .eq("mode", mode)
       .order("opened_at", { ascending: false })
       .limit(50)
-      .then(({ data }) => {
-        if (!cancelled) setTrades(data ?? []);
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        setError(error ? error.message : null);
+        setTrades(error ? null : (data ?? []));
       });
     return () => {
       cancelled = true;
@@ -32,8 +35,13 @@ export default function TradesClient() {
         <ModeToggle />
       </div>
 
-      {trades === null && <p className="text-neutral-500">Loading…</p>}
-      {trades?.length === 0 && <p className="text-neutral-500">No trades yet.</p>}
+      {error && (
+        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+          Query failed: {error}
+        </p>
+      )}
+      {!error && trades === null && <p className="text-neutral-500">Loading…</p>}
+      {!error && trades?.length === 0 && <p className="text-neutral-500">No trades yet.</p>}
 
       {trades && trades.length > 0 && (
         <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">

@@ -18,18 +18,24 @@ export default function EvolutionClient() {
   const mode = useMode();
   const [versions, setVersions] = useState<StrategyVersion[] | null>(null);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
-      const [{ data: versionRows }, { data: pnlRows }] = await Promise.all([
+      const [
+        { data: versionRows, error: versionsError },
+        { data: pnlRows, error: pnlError },
+      ] = await Promise.all([
         supabase.from("strategy_versions").select("*").order("version_number", { ascending: false }),
         supabase.from("daily_pnl").select("*").eq("mode", mode).order("date", { ascending: true }),
       ]);
       if (cancelled) return;
-      setVersions(versionRows ?? []);
-      setDailyPnl(pnlRows ?? []);
+      const err = versionsError ?? pnlError;
+      setError(err ? err.message : null);
+      setVersions(err ? null : (versionRows ?? []));
+      setDailyPnl(err ? null : (pnlRows ?? []));
     }
 
     load();
@@ -52,6 +58,12 @@ export default function EvolutionClient() {
         <h1 className="text-xl font-semibold">Evolution</h1>
         <ModeToggle />
       </div>
+
+      {error && (
+        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+          Query failed: {error}
+        </p>
+      )}
 
       <div className="rounded-lg border border-neutral-200 bg-white p-4">
         <h2 className="text-sm font-medium text-neutral-500 mb-2">

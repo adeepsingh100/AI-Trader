@@ -96,16 +96,19 @@ function ConfigForm() {
   const [config, setConfig] = useState<CapitalConfig | null | undefined>(undefined);
   const [form, setForm] = useState<Record<string, number>>({});
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     setConfig(undefined);
+    setLoadError(null);
     supabase
       .from("capital_config")
       .select("*")
       .eq("mode", mode)
       .maybeSingle()
-      .then(({ data }) => {
-        setConfig(data ?? null);
+      .then(({ data, error }) => {
+        setLoadError(error ? error.message : null);
+        setConfig(error ? undefined : (data ?? null));
         if (data) {
           const next: Record<string, number> = {};
           for (const f of FIELDS) next[f.key] = data[f.key] as number;
@@ -125,8 +128,15 @@ function ConfigForm() {
     <div className="space-y-4">
       <ModeToggle />
 
-      {config === undefined && <p className="text-neutral-500">Loading…</p>}
-      {config === null && <p className="text-neutral-500">No capital_config row for {mode} yet.</p>}
+      {loadError && (
+        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+          Query failed: {loadError}
+        </p>
+      )}
+      {!loadError && config === undefined && <p className="text-neutral-500">Loading…</p>}
+      {!loadError && config === null && (
+        <p className="text-neutral-500">No capital_config row for {mode} yet.</p>
+      )}
 
       {config && (
         <form

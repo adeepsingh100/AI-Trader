@@ -10,12 +10,16 @@ export default function OverviewClient() {
   const mode = useMode();
   const [config, setConfig] = useState<CapitalConfig | null | undefined>(undefined);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
-      const [{ data: configRow }, { data: pnlRow }] = await Promise.all([
+      const [
+        { data: configRow, error: configError },
+        { data: pnlRow, error: pnlError },
+      ] = await Promise.all([
         supabase.from("capital_config").select("*").eq("mode", mode).maybeSingle(),
         supabase
           .from("daily_pnl")
@@ -25,7 +29,9 @@ export default function OverviewClient() {
           .maybeSingle(),
       ]);
       if (cancelled) return;
-      setConfig(configRow ?? null);
+      const err = configError ?? pnlError;
+      setError(err ? err.message : null);
+      setConfig(err ? undefined : (configRow ?? null));
       setDailyPnl(pnlRow ?? null);
     }
 
@@ -42,8 +48,13 @@ export default function OverviewClient() {
         <ModeToggle />
       </div>
 
-      {config === undefined && <p className="text-neutral-500">Loading…</p>}
-      {config === null && (
+      {error && (
+        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+          Query failed: {error}
+        </p>
+      )}
+      {!error && config === undefined && <p className="text-neutral-500">Loading…</p>}
+      {!error && config === null && (
         <p className="text-neutral-500">
           No capital_config row for {mode} yet — seed it with{" "}
           <code>python3 -m src.seed_config</code>.
