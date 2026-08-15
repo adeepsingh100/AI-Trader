@@ -46,10 +46,15 @@ def _record_close(mode: str, capital_config: dict, trade: dict, fill: dict, dail
 
 def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> dict:
     capital_config = models.get_capital_config(mode)
-    if capital_config is None:
-        raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
 
     if mode == "real":
+        # Real mode is expected to sit unconfigured for a long time (no
+        # capital_config, no promoted version) while paper trading earns
+        # its way to promotion — both are "not ready yet", not errors,
+        # so the cron job no-ops instead of failing every 10 minutes.
+        if capital_config is None:
+            return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
+
         # real only ever trades the version that's actually been promoted —
         # NOT just the newest strategy_versions row, since evolution keeps
         # minting new (unvetted) paper versions after a promotion too.
@@ -60,6 +65,8 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             )
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_promoted_version"}
     else:
+        if capital_config is None:
+            raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
         version = models.get_latest_version()
         if version is None:
             raise RuntimeError("no strategy_versions row — create one first")

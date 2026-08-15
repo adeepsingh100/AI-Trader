@@ -255,6 +255,23 @@ def test_run_cycle_real_mode_noop_when_nothing_promoted(mock_models):
 
 
 @patch("src.orchestrator.models")
+def test_run_cycle_real_mode_noop_when_no_capital_config(mock_models):
+    # real is expected to sit unconfigured for weeks while paper trading
+    # earns promotion — this must no-op quietly, not fail every cron tick.
+    mock_models.get_capital_config.return_value = None
+
+    result = run_cycle(mode="real")
+
+    assert result == {
+        "opened": [],
+        "closed": [],
+        "circuit_breaker": False,
+        "skipped": "no_capital_config",
+    }
+    mock_models.get_latest_promoted_version.assert_not_called()
+
+
+@patch("src.orchestrator.models")
 @patch("src.orchestrator.get_signal")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_real_mode_uses_promoted_version_not_latest(
