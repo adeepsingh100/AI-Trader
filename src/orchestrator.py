@@ -55,6 +55,9 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         if capital_config is None:
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
 
+        if capital_config.get("paused"):
+            return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
+
         # real only ever trades the version that's actually been promoted —
         # NOT just the newest strategy_versions row, since evolution keeps
         # minting new (unvetted) paper versions after a promotion too.
@@ -67,6 +70,8 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
     else:
         if capital_config is None:
             raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
+        if capital_config.get("paused"):
+            return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
         version = models.get_latest_version()
         if version is None:
             raise RuntimeError("no strategy_versions row — create one first")

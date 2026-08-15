@@ -271,6 +271,38 @@ def test_run_cycle_real_mode_noop_when_no_capital_config(mock_models):
     mock_models.get_latest_promoted_version.assert_not_called()
 
 
+@patch("src.orchestrator.get_signal")
+@patch("src.orchestrator.get_market_snapshot")
+@patch("src.orchestrator.models")
+def test_run_cycle_paper_paused_skips_without_touching_signal_agent(
+    mock_models, mock_snapshot, mock_get_signal
+):
+    mock_models.get_capital_config.return_value = _capital_config(paused=True)
+
+    result = run_cycle(mode="paper")
+
+    assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
+    mock_models.get_latest_version.assert_not_called()
+    mock_snapshot.assert_not_called()
+    mock_get_signal.assert_not_called()
+
+
+@patch("src.orchestrator.get_signal")
+@patch("src.orchestrator.get_market_snapshot")
+@patch("src.orchestrator.models")
+def test_run_cycle_real_paused_skips_without_touching_signal_agent(
+    mock_models, mock_snapshot, mock_get_signal
+):
+    mock_models.get_capital_config.return_value = _capital_config(paused=True)
+
+    result = run_cycle(mode="real")
+
+    assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
+    mock_models.get_latest_promoted_version.assert_not_called()
+    mock_snapshot.assert_not_called()
+    mock_get_signal.assert_not_called()
+
+
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_signal")
 @patch("src.orchestrator.get_market_snapshot")

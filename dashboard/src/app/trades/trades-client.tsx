@@ -48,13 +48,23 @@ export default function TradesClient() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-neutral-500 border-b border-neutral-200">
-                {["Symbol", "Side", "Qty", "Entry", "Exit", "PnL", "Status", "Opened", "Reasoning"].map(
-                  (h) => (
-                    <th key={h} className="px-3 py-2 font-medium">
-                      {h}
-                    </th>
-                  )
-                )}
+                {[
+                  "Symbol",
+                  "Side",
+                  "Qty",
+                  "Entry",
+                  "Exit",
+                  "Bought for",
+                  "Sold for",
+                  "PnL",
+                  "Status",
+                  "Opened",
+                  "Reasoning",
+                ].map((h) => (
+                  <th key={h} className="px-3 py-2 font-medium">
+                    {h}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -65,6 +75,14 @@ export default function TradesClient() {
                   <td className="px-3 py-2">{t.qty}</td>
                   <td className="px-3 py-2">{t.entry_price}</td>
                   <td className="px-3 py-2">{t.exit_price ?? "-"}</td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    ₹{(t.qty * t.entry_price).toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+                  </td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    {t.exit_price != null
+                      ? `₹${(t.qty * t.exit_price).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`
+                      : "-"}
+                  </td>
                   <td
                     className={
                       "px-3 py-2 " +

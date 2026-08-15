@@ -97,6 +97,8 @@ function ConfigForm() {
   const [form, setForm] = useState<Record<string, number>>({});
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [pauseSaving, setPauseSaving] = useState(false);
+  const [pauseError, setPauseError] = useState<string | null>(null);
 
   useEffect(() => {
     setConfig(undefined);
@@ -124,6 +126,20 @@ function ConfigForm() {
     setStatus(error ? "error" : "saved");
   }
 
+  async function togglePaused() {
+    if (!config) return;
+    const next = !config.paused;
+    setPauseSaving(true);
+    setPauseError(null);
+    const { error } = await supabase.from("capital_config").update({ paused: next }).eq("mode", mode);
+    setPauseSaving(false);
+    if (error) {
+      setPauseError(error.message);
+    } else {
+      setConfig({ ...config, paused: next });
+    }
+  }
+
   return (
     <div className="space-y-4">
       <ModeToggle />
@@ -136,6 +152,35 @@ function ConfigForm() {
       {!loadError && config === undefined && <p className="text-neutral-500">Loading…</p>}
       {!loadError && config === null && (
         <p className="text-neutral-500">No capital_config row for {mode} yet.</p>
+      )}
+
+      {config && (
+        <div
+          className={
+            "rounded-lg border p-4 flex items-center justify-between max-w-sm " +
+            (config.paused ? "border-amber-300 bg-amber-50" : "border-emerald-200 bg-emerald-50")
+          }
+        >
+          <div>
+            <div className="text-sm font-medium">{config.paused ? "Stopped" : "Running"}</div>
+            <div className="text-xs text-neutral-600 mt-0.5">
+              {config.paused
+                ? `${mode} is paused — no model calls, no new orders.`
+                : `${mode} is active — cycles run on schedule.`}
+            </div>
+            {pauseError && <div className="text-xs text-red-600 mt-1">{pauseError}</div>}
+          </div>
+          <button
+            onClick={togglePaused}
+            disabled={pauseSaving}
+            className={
+              "rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-50 shrink-0 ml-3 " +
+              (config.paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-red-600 hover:bg-red-700")
+            }
+          >
+            {pauseSaving ? "…" : config.paused ? "Start" : "Stop"}
+          </button>
+        </div>
       )}
 
       {config && (

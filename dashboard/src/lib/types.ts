@@ -8,6 +8,7 @@ export interface CapitalConfig {
   max_daily_loss: number;
   position_size_pct: number;
   max_concurrent_positions: number;
+  paused: boolean;
   updated_at: string;
 }
 

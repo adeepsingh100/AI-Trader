@@ -161,6 +161,7 @@ capital_config (
   max_daily_loss          numeric not null,
   position_size_pct       numeric not null default 10,   -- % of capital_to_use per trade
   max_concurrent_positions int not null default 5,
+  paused                  boolean not null default false, -- dashboard Start/Stop; orchestrator.py no-ops before any model/exchange call when true (0003_pause_flag.sql)
   updated_at              timestamptz not null default now()
 )
 

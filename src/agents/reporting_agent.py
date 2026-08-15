@@ -77,6 +77,8 @@ def _trade_log_html(trades: list[dict]) -> str:
             f"{t['qty']:.6f}",
             f"{t['entry_price']:.2f}",
             f"{t['exit_price']:.2f}" if t["exit_price"] is not None else "-",
+            f"{t['qty'] * t['entry_price']:.2f}",
+            f"{t['qty'] * t['exit_price']:.2f}" if t["exit_price"] is not None else "-",
             f"{t['pnl']:.2f}" if t["pnl"] is not None else "-",
             html.escape(t["status"]),
             html.escape(t["opened_at"]),
@@ -85,7 +87,19 @@ def _trade_log_html(trades: list[dict]) -> str:
         for t in trades
     ]
     return _table(
-        ["Symbol", "Side", "Qty", "Entry", "Exit", "PnL", "Status", "Opened", "Reasoning"],
+        [
+            "Symbol",
+            "Side",
+            "Qty",
+            "Entry",
+            "Exit",
+            "Bought for",
+            "Sold for",
+            "PnL",
+            "Status",
+            "Opened",
+            "Reasoning",
+        ],
         rows,
         "No trades yet.",
     )

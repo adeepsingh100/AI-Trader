@@ -64,6 +64,12 @@ export default function OverviewClient() {
       {config && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatCard
+            label="Trading status"
+            value={config.paused ? "Stopped" : "Running"}
+            sub={config.paused ? "no model calls, no new orders" : "cycles run on schedule"}
+            tone={config.paused ? "negative" : "positive"}
+          />
+          <StatCard
             label="Capital in use"
             value={`₹${config.capital_to_use.toLocaleString("en-IN")}`}
             sub={`of ₹${config.total_capital.toLocaleString("en-IN")}`}
