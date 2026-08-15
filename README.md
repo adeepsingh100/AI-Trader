@@ -24,7 +24,9 @@ real order once funds exist, before trusting it for real money.
 3. **Env vars**: copy `.env.example` to `.env` and fill in `GROQ_API_KEY`,
    `COINDCX_API_KEY`/`COINDCX_API_SECRET` (only needed once step 11's real
    execution lands), and the Supabase URL/service key from your project
-   settings.
+   settings. To use Ollama Cloud instead of Groq, set `LLM_PROVIDER=ollama`
+   and `OLLAMA_API_KEY` (from https://ollama.com/settings/keys) — no code
+   change needed either way.
 4. **Seed config**: `python3 -m src.seed_config` — sets capital/target/
    loss for a mode and bootstraps the first strategy version. Throwaway,
    replaced by the dashboard's Config panel at step 10.
@@ -39,6 +41,9 @@ repo secrets (Settings → Secrets and variables → Actions) so they can:
 - `GROQ_API_KEY`, `GROQ_MODEL_CHAIN`
 - `COINDCX_API_KEY`, `COINDCX_API_SECRET`
 - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`
+- `LLM_PROVIDER`, `OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL_CHAIN` —
+  only needed if you flip `LLM_PROVIDER` to `ollama`; harmless to leave unset
+  while on Groq (default)
 
 `.github/workflows/trading_cycle.yml` runs every 10 minutes (paper and
 real, in parallel — real no-ops until a strategy is promoted).

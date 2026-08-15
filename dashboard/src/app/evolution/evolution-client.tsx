@@ -12,6 +12,7 @@ import {
 } from "recharts";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { CHROME, SERIES } from "@/lib/palette";
 import type { DailyPnl, StrategyVersion } from "@/lib/types";
 
 export default function EvolutionClient() {
@@ -55,45 +56,77 @@ export default function EvolutionClient() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Evolution</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Evolution</h1>
         <ModeToggle />
       </div>
 
       {error && (
-        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+        <p className="text-sm rounded-lg p-3" style={{ background: "#fdecea", color: "var(--status-critical)" }}>
           Query failed: {error}
         </p>
       )}
 
-      <div className="rounded-lg border border-neutral-200 bg-white p-4">
-        <h2 className="text-sm font-medium text-neutral-500 mb-2">
+      <div
+        className="rounded-xl p-4 shadow-sm"
+        style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+      >
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: "var(--text-muted)" }}>
           Cumulative realized PnL ({mode})
         </h2>
         {chartData.length === 0 ? (
-          <p className="text-neutral-500 text-sm">No daily_pnl history yet.</p>
+          <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+            No daily_pnl history yet.
+          </p>
         ) : (
           <ResponsiveContainer width="100%" height={240}>
             <LineChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="date" fontSize={12} />
-              <YAxis fontSize={12} />
-              <Tooltip />
-              <Line type="monotone" dataKey="cumulative_pnl" stroke="#0f766e" dot={false} />
+              <CartesianGrid strokeDasharray="3 3" stroke={CHROME.gridline} vertical={false} />
+              <XAxis
+                dataKey="date"
+                fontSize={12}
+                stroke={CHROME.axis}
+                tick={{ fill: CHROME.textMuted }}
+                tickLine={false}
+              />
+              <YAxis fontSize={12} stroke={CHROME.axis} tick={{ fill: CHROME.textMuted }} tickLine={false} />
+              <Tooltip
+                contentStyle={{
+                  background: CHROME.surface,
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  fontSize: 13,
+                }}
+              />
+              <Line
+                type="monotone"
+                dataKey="cumulative_pnl"
+                stroke={SERIES.blue}
+                strokeWidth={2}
+                dot={false}
+              />
             </LineChart>
           </ResponsiveContainer>
         )}
       </div>
 
       <div>
-        <h2 className="text-sm font-medium text-neutral-500 mb-2">Version history</h2>
-        {versions === null && <p className="text-neutral-500">Loading…</p>}
+        <h2 className="text-xs uppercase tracking-wide mb-2" style={{ color: "var(--text-muted)" }}>
+          Version history
+        </h2>
+        {versions === null && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
         {versions && (
-          <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
+          <div
+            className="overflow-x-auto rounded-xl shadow-sm"
+            style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+          >
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <tr
+                  className="text-left text-xs uppercase tracking-wide"
+                  style={{ color: "var(--text-muted)", borderBottom: "1px solid var(--gridline)" }}
+                >
                   {["Version", "Status", "Notes", "Created"].map((h) => (
-                    <th key={h} className="px-3 py-2 font-medium">
+                    <th key={h} className="px-3 py-2.5 font-medium">
                       {h}
                     </th>
                   ))}
@@ -101,17 +134,30 @@ export default function EvolutionClient() {
               </thead>
               <tbody>
                 {versions.map((v) => (
-                  <tr key={v.id} className="border-b border-neutral-100 last:border-0">
-                    <td className="px-3 py-2 font-medium">v{v.version_number}</td>
-                    <td className="px-3 py-2">
+                  <tr
+                    key={v.id}
+                    className="hover:bg-black/[0.02] transition-colors"
+                    style={{ borderBottom: "1px solid var(--gridline)" }}
+                  >
+                    <td className="px-3 py-2.5 font-medium tabular-nums">v{v.version_number}</td>
+                    <td className="px-3 py-2.5">
                       {v.promoted_to_real ? (
-                        <span className="text-emerald-600">real</span>
+                        <span
+                          className="text-xs font-medium px-1.5 py-0.5 rounded"
+                          style={{ color: "var(--status-good)", background: "#eafaea" }}
+                        >
+                          real
+                        </span>
                       ) : (
-                        "paper-only"
+                        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+                          paper-only
+                        </span>
                       )}
                     </td>
-                    <td className="px-3 py-2 text-neutral-600">{v.notes}</td>
-                    <td className="px-3 py-2 whitespace-nowrap">
+                    <td className="px-3 py-2.5" style={{ color: "var(--text-secondary)" }}>
+                      {v.notes}
+                    </td>
+                    <td className="px-3 py-2.5 whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
                       {new Date(v.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
                     </td>
                   </tr>

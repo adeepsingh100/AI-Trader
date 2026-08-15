@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 
 from src.groq_client import ModelUsageEvent, chat
+from src.lenient_json import parse_llm_json
 
 
 def _messages_for(market: dict, strategy_prompt: str) -> list[dict]:
@@ -31,7 +32,7 @@ def _messages_for(market: dict, strategy_prompt: str) -> list[dict]:
 def get_signal(market: dict, strategy_prompt: str) -> tuple[dict, list[ModelUsageEvent]]:
     content, events = chat(_messages_for(market, strategy_prompt))
     try:
-        signal = json.loads(content)
+        signal = parse_llm_json(content)
     except (json.JSONDecodeError, TypeError):
         signal = {
             "direction": "flat",

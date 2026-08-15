@@ -120,11 +120,18 @@ runs to completion and exits — no long-running process (see §7).
   Agent → Risk Manager → Execution Agent → persist to `trades` /
   `daily_pnl` / `agent_logs`.
 
-## 4. Groq LLM integration
+## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
-- Model chain is **configurable** (env var, ordered list — Groq
+- Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
+  (Ollama Cloud — `https://ollama.com`, authenticated via `OLLAMA_API_KEY`,
+  not a local instance). Same retry/fallback/logging behavior either way;
+  `src/groq_client.py`'s `chat()` is the single entry point both agents call,
+  so switching providers is an env var change, not a code change.
+- Model chain is **configurable** per provider (env var, ordered list — Groq
   deprecates models periodically): default
-  `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`.
+  `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
+  `OLLAMA_MODEL_CHAIN=gpt-oss:120b` (no `-cloud` suffix — that's only for
+  routing through a local Ollama daemon, not this direct-to-`ollama.com` setup).
 - On 429 or any API error: retry with exponential backoff on the current
   model, then fall back to the next model in the chain.
 - Every call (success or failure, every model tried) logs to

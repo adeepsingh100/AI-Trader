@@ -16,6 +16,7 @@ from src.config import (
 )
 from src.db import models
 from src.groq_client import chat
+from src.lenient_json import parse_llm_json
 
 
 def compute_metrics(trades: list[dict], capital_to_use: float) -> dict:
@@ -85,9 +86,12 @@ def propose_next_version(metrics: dict, current_prompt: str, current_params: dic
             ),
         },
     ]
-    content, events = chat(messages)
+    # A rewritten strategy prompt + params + notes runs longer than a
+    # signal's one-line reasoning — more headroom than chat()'s default,
+    # still well inside the 8K total budget alongside this call's small input.
+    content, events = chat(messages, max_tokens=2048)
     try:
-        proposal = json.loads(content)
+        proposal = parse_llm_json(content)
     except (json.JSONDecodeError, TypeError):
         proposal = {
             "prompt_text": current_prompt,

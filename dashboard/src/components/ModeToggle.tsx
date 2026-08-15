@@ -14,14 +14,19 @@ export function ModeToggle() {
   const pathname = usePathname();
 
   return (
-    <div className="inline-flex rounded-md border border-neutral-300 overflow-hidden text-sm">
+    <div
+      className="inline-flex rounded-md overflow-hidden text-sm shadow-sm"
+      style={{ border: "1px solid var(--border)" }}
+    >
       {(["paper", "real"] as const).map((m) => (
         <Link
           key={m}
           href={`${pathname}?mode=${m}`}
-          className={
-            "px-3 py-1 " +
-            (m === mode ? "bg-neutral-900 text-white" : "bg-white text-neutral-700")
+          className="px-3 py-1 font-medium transition-colors"
+          style={
+            m === mode
+              ? { background: "var(--text-primary)", color: "#fff" }
+              : { background: "var(--surface-1)", color: "var(--text-secondary)" }
           }
         >
           {m === "paper" ? "Paper" : "Real"}

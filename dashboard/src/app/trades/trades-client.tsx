@@ -3,7 +3,14 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { STATUS } from "@/lib/palette";
 import type { Trade } from "@/lib/types";
+
+const STATUS_COLOR: Record<Trade["status"], string> = {
+  open: "#2a78d6",
+  closed: "var(--text-muted)",
+  flattened: STATUS.critical,
+};
 
 export default function TradesClient() {
   const mode = useMode();
@@ -31,23 +38,31 @@ export default function TradesClient() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Trades</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Trades</h1>
         <ModeToggle />
       </div>
 
       {error && (
-        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+        <p className="text-sm rounded-lg p-3" style={{ background: "#fdecea", color: "var(--status-critical)" }}>
           Query failed: {error}
         </p>
       )}
-      {!error && trades === null && <p className="text-neutral-500">Loading…</p>}
-      {!error && trades?.length === 0 && <p className="text-neutral-500">No trades yet.</p>}
+      {!error && trades === null && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
+      {!error && trades?.length === 0 && (
+        <p style={{ color: "var(--text-muted)" }}>No trades yet.</p>
+      )}
 
       {trades && trades.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
+        <div
+          className="overflow-x-auto rounded-xl shadow-sm"
+          style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+        >
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+              <tr
+                className="text-left text-xs uppercase tracking-wide"
+                style={{ color: "var(--text-muted)", borderBottom: "1px solid var(--gridline)" }}
+              >
                 {[
                   "Symbol",
                   "Side",
@@ -61,7 +76,7 @@ export default function TradesClient() {
                   "Opened",
                   "Reasoning",
                 ].map((h) => (
-                  <th key={h} className="px-3 py-2 font-medium">
+                  <th key={h} className="px-3 py-2.5 font-medium">
                     {h}
                   </th>
                 ))}
@@ -69,33 +84,53 @@ export default function TradesClient() {
             </thead>
             <tbody>
               {trades.map((t) => (
-                <tr key={t.id} className="border-b border-neutral-100 last:border-0 align-top">
-                  <td className="px-3 py-2 font-medium">{t.symbol}</td>
-                  <td className="px-3 py-2">{t.side}</td>
-                  <td className="px-3 py-2">{t.qty}</td>
-                  <td className="px-3 py-2">{t.entry_price}</td>
-                  <td className="px-3 py-2">{t.exit_price ?? "-"}</td>
-                  <td className="px-3 py-2 whitespace-nowrap">
+                <tr
+                  key={t.id}
+                  className="align-top hover:bg-black/[0.02] transition-colors"
+                  style={{ borderBottom: "1px solid var(--gridline)" }}
+                >
+                  <td className="px-3 py-2.5 font-medium">{t.symbol}</td>
+                  <td className="px-3 py-2.5">
+                    <span
+                      className="text-xs font-medium px-1.5 py-0.5 rounded"
+                      style={{
+                        color: t.side === "buy" ? STATUS.good : "var(--text-secondary)",
+                        background: t.side === "buy" ? "#eafaea" : "var(--page-plane)",
+                      }}
+                    >
+                      {t.side}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 tabular-nums">{t.qty}</td>
+                  <td className="px-3 py-2.5 tabular-nums">{t.entry_price}</td>
+                  <td className="px-3 py-2.5 tabular-nums">{t.exit_price ?? "-"}</td>
+                  <td className="px-3 py-2.5 tabular-nums whitespace-nowrap">
                     ₹{(t.qty * t.entry_price).toLocaleString("en-IN", { maximumFractionDigits: 2 })}
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap">
+                  <td className="px-3 py-2.5 tabular-nums whitespace-nowrap">
                     {t.exit_price != null
                       ? `₹${(t.qty * t.exit_price).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`
                       : "-"}
                   </td>
                   <td
-                    className={
-                      "px-3 py-2 " +
-                      (t.pnl == null ? "" : t.pnl >= 0 ? "text-emerald-600" : "text-red-600")
-                    }
+                    className="px-3 py-2.5 tabular-nums font-medium"
+                    style={{
+                      color: t.pnl == null ? "var(--text-primary)" : t.pnl >= 0 ? STATUS.good : STATUS.critical,
+                    }}
                   >
                     {t.pnl ?? "-"}
                   </td>
-                  <td className="px-3 py-2">{t.status}</td>
-                  <td className="px-3 py-2 whitespace-nowrap">
+                  <td className="px-3 py-2.5">
+                    <span className="text-xs font-medium" style={{ color: STATUS_COLOR[t.status] }}>
+                      {t.status}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2.5 whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
                     {new Date(t.opened_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
                   </td>
-                  <td className="px-3 py-2 max-w-xs text-neutral-600">{t.reasoning_text}</td>
+                  <td className="px-3 py-2.5 max-w-xs" style={{ color: "var(--text-secondary)" }}>
+                    {t.reasoning_text}
+                  </td>
                 </tr>
               ))}
             </tbody>

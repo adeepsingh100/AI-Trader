@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { supabase } from "@/lib/supabase";
 import { aggregateModelUsage } from "@/lib/modelUsageStats";
+import { CHROME, SERIES } from "@/lib/palette";
 import type { ModelUsage } from "@/lib/types";
 
 export default function ModelHealthClient() {
@@ -36,38 +37,68 @@ export default function ModelHealthClient() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-xl font-semibold">Model health</h1>
+      <h1 className="text-2xl font-semibold tracking-tight">Model health</h1>
 
       {error && (
-        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+        <p className="text-sm rounded-lg p-3" style={{ background: "#fdecea", color: "var(--status-critical)" }}>
           Query failed: {error}
         </p>
       )}
-      {!error && events === null && <p className="text-neutral-500">Loading…</p>}
-      {!error && events?.length === 0 && <p className="text-neutral-500">No model_usage recorded yet.</p>}
+      {!error && events === null && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
+      {!error && events?.length === 0 && (
+        <p style={{ color: "var(--text-muted)" }}>No model_usage recorded yet.</p>
+      )}
 
       {stats.length > 0 && (
         <>
-          <div className="rounded-lg border border-neutral-200 bg-white p-4">
+          <div
+            className="rounded-xl p-4 shadow-sm"
+            style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+          >
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="model" fontSize={12} />
-                <YAxis fontSize={12} unit="%" />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="success %" fill="#0f766e" />
-                <Bar dataKey="fallback %" fill="#b45309" />
+                <CartesianGrid strokeDasharray="3 3" stroke={CHROME.gridline} vertical={false} />
+                <XAxis
+                  dataKey="model"
+                  fontSize={12}
+                  stroke={CHROME.axis}
+                  tick={{ fill: CHROME.textMuted }}
+                  tickLine={false}
+                />
+                <YAxis
+                  fontSize={12}
+                  unit="%"
+                  stroke={CHROME.axis}
+                  tick={{ fill: CHROME.textMuted }}
+                  tickLine={false}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: CHROME.surface,
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    fontSize: 13,
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12, color: CHROME.textSecondary }} />
+                <Bar dataKey="success %" fill={SERIES.blue} radius={[4, 4, 0, 0]} />
+                <Bar dataKey="fallback %" fill={SERIES.red} radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
 
-          <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
+          <div
+            className="overflow-x-auto rounded-xl shadow-sm"
+            style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+          >
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <tr
+                  className="text-left text-xs uppercase tracking-wide"
+                  style={{ color: "var(--text-muted)", borderBottom: "1px solid var(--gridline)" }}
+                >
                   {["Model", "Calls", "Success rate", "Fallback rate", "Avg latency"].map((h) => (
-                    <th key={h} className="px-3 py-2 font-medium">
+                    <th key={h} className="px-3 py-2.5 font-medium">
                       {h}
                     </th>
                   ))}
@@ -75,12 +106,16 @@ export default function ModelHealthClient() {
               </thead>
               <tbody>
                 {stats.map((s) => (
-                  <tr key={s.model} className="border-b border-neutral-100 last:border-0">
-                    <td className="px-3 py-2 font-medium">{s.model}</td>
-                    <td className="px-3 py-2">{s.calls}</td>
-                    <td className="px-3 py-2">{(s.successRate * 100).toFixed(1)}%</td>
-                    <td className="px-3 py-2">{(s.fallbackRate * 100).toFixed(1)}%</td>
-                    <td className="px-3 py-2">{s.avgLatencyMs.toFixed(0)} ms</td>
+                  <tr
+                    key={s.model}
+                    className="hover:bg-black/[0.02] transition-colors"
+                    style={{ borderBottom: "1px solid var(--gridline)" }}
+                  >
+                    <td className="px-3 py-2.5 font-medium">{s.model}</td>
+                    <td className="px-3 py-2.5 tabular-nums">{s.calls}</td>
+                    <td className="px-3 py-2.5 tabular-nums">{(s.successRate * 100).toFixed(1)}%</td>
+                    <td className="px-3 py-2.5 tabular-nums">{(s.fallbackRate * 100).toFixed(1)}%</td>
+                    <td className="px-3 py-2.5 tabular-nums">{s.avgLatencyMs.toFixed(0)} ms</td>
                   </tr>
                 ))}
               </tbody>

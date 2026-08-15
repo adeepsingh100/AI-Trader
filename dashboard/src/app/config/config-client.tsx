@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { STATUS } from "@/lib/palette";
 import type { CapitalConfig } from "@/lib/types";
 
 export default function ConfigClient() {
@@ -18,18 +19,19 @@ export default function ConfigClient() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Config</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Config</h1>
         {session && (
           <button
             onClick={() => supabase.auth.signOut()}
-            className="text-sm text-neutral-500 hover:text-neutral-900"
+            className="text-sm hover:underline"
+            style={{ color: "var(--text-muted)" }}
           >
             Sign out
           </button>
         )}
       </div>
 
-      {session === undefined && <p className="text-neutral-500">Loading…</p>}
+      {session === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
       {session === null && <LoginForm />}
       {session && <ConfigForm />}
     </div>
@@ -52,14 +54,21 @@ function LoginForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4">
-      <p className="text-sm text-neutral-500">Sign in to edit capital, target, and loss limits.</p>
+    <form
+      onSubmit={handleSubmit}
+      className="max-w-sm space-y-3 rounded-xl p-5 shadow-sm"
+      style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+    >
+      <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+        Sign in to edit capital, target, and loss limits.
+      </p>
       <input
         type="email"
         placeholder="Email"
         value={email}
         onChange={(e) => setEmail(e.target.value)}
-        className="w-full rounded border border-neutral-300 px-3 py-1.5 text-sm"
+        className="w-full rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-neutral-900/20"
+        style={{ border: "1px solid var(--border)" }}
         required
       />
       <input
@@ -67,14 +76,19 @@ function LoginForm() {
         placeholder="Password"
         value={password}
         onChange={(e) => setPassword(e.target.value)}
-        className="w-full rounded border border-neutral-300 px-3 py-1.5 text-sm"
+        className="w-full rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-neutral-900/20"
+        style={{ border: "1px solid var(--border)" }}
         required
       />
-      {error && <p className="text-sm text-red-600">{error}</p>}
+      {error && (
+        <p className="text-sm" style={{ color: "var(--status-critical)" }}>
+          {error}
+        </p>
+      )}
       <button
         type="submit"
         disabled={submitting}
-        className="rounded bg-neutral-900 text-white text-sm px-3 py-1.5 disabled:opacity-50"
+        className="rounded-md bg-neutral-900 text-white text-sm px-3 py-1.5 disabled:opacity-50 hover:bg-neutral-800 transition-colors"
       >
         {submitting ? "Signing in…" : "Sign in"}
       </button>
@@ -145,38 +159,50 @@ function ConfigForm() {
       <ModeToggle />
 
       {loadError && (
-        <p className="text-red-600 text-sm rounded border border-red-200 bg-red-50 p-3">
+        <p className="text-sm rounded-lg p-3" style={{ background: "#fdecea", color: "var(--status-critical)" }}>
           Query failed: {loadError}
         </p>
       )}
-      {!loadError && config === undefined && <p className="text-neutral-500">Loading…</p>}
+      {!loadError && config === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
       {!loadError && config === null && (
-        <p className="text-neutral-500">No capital_config row for {mode} yet.</p>
+        <p style={{ color: "var(--text-muted)" }}>No capital_config row for {mode} yet.</p>
       )}
 
       {config && (
         <div
-          className={
-            "rounded-lg border p-4 flex items-center justify-between max-w-sm " +
-            (config.paused ? "border-amber-300 bg-amber-50" : "border-emerald-200 bg-emerald-50")
-          }
+          className="rounded-xl p-4 flex items-center justify-between max-w-sm shadow-sm"
+          style={{
+            background: config.paused ? "#fdf3e2" : "#eafaea",
+            border: `1px solid ${config.paused ? STATUS.warning : STATUS.good}33`,
+          }}
         >
-          <div>
-            <div className="text-sm font-medium">{config.paused ? "Stopped" : "Running"}</div>
-            <div className="text-xs text-neutral-600 mt-0.5">
-              {config.paused
-                ? `${mode} is paused — no model calls, no new orders.`
-                : `${mode} is active — cycles run on schedule.`}
+          <div className="flex items-start gap-2">
+            <span
+              className="inline-block w-2 h-2 rounded-full shrink-0 mt-1.5"
+              style={{ background: config.paused ? STATUS.critical : STATUS.good }}
+              aria-hidden
+            />
+            <div>
+              <div className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>
+                {config.paused ? "Stopped" : "Running"}
+              </div>
+              <div className="text-xs mt-0.5" style={{ color: "var(--text-secondary)" }}>
+                {config.paused
+                  ? `${mode} is paused — no model calls, no new orders.`
+                  : `${mode} is active — cycles run on schedule.`}
+              </div>
+              {pauseError && (
+                <div className="text-xs mt-1" style={{ color: "var(--status-critical)" }}>
+                  {pauseError}
+                </div>
+              )}
             </div>
-            {pauseError && <div className="text-xs text-red-600 mt-1">{pauseError}</div>}
           </div>
           <button
             onClick={togglePaused}
             disabled={pauseSaving}
-            className={
-              "rounded px-4 py-2 text-sm font-medium text-white disabled:opacity-50 shrink-0 ml-3 " +
-              (config.paused ? "bg-emerald-600 hover:bg-emerald-700" : "bg-red-600 hover:bg-red-700")
-            }
+            className="rounded-md px-4 py-2 text-sm font-medium text-white disabled:opacity-50 shrink-0 ml-3 transition-colors"
+            style={{ background: config.paused ? STATUS.good : STATUS.critical }}
           >
             {pauseSaving ? "…" : config.paused ? "Start" : "Stop"}
           </button>
@@ -186,17 +212,19 @@ function ConfigForm() {
       {config && (
         <form
           onSubmit={handleSubmit}
-          className="max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4"
+          className="max-w-sm space-y-3 rounded-xl p-5 shadow-sm"
+          style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
         >
           {FIELDS.map((f) => (
             <label key={f.key} className="block text-sm">
-              <span className="text-neutral-500">{f.label}</span>
+              <span style={{ color: "var(--text-muted)" }}>{f.label}</span>
               <input
                 type="number"
                 step="any"
                 value={form[f.key] ?? ""}
                 onChange={(e) => setForm({ ...form, [f.key]: Number(e.target.value) })}
-                className="mt-1 w-full rounded border border-neutral-300 px-3 py-1.5"
+                className="mt-1 w-full rounded-md px-3 py-1.5 tabular-nums outline-none focus:ring-2 focus:ring-neutral-900/20"
+                style={{ border: "1px solid var(--border)" }}
                 required
               />
             </label>
@@ -204,13 +232,17 @@ function ConfigForm() {
           <button
             type="submit"
             disabled={status === "saving"}
-            className="rounded bg-neutral-900 text-white text-sm px-3 py-1.5 disabled:opacity-50"
+            className="rounded-md bg-neutral-900 text-white text-sm px-3 py-1.5 disabled:opacity-50 hover:bg-neutral-800 transition-colors"
           >
             {status === "saving" ? "Saving…" : "Save"}
           </button>
-          {status === "saved" && <p className="text-sm text-emerald-600">Saved.</p>}
+          {status === "saved" && (
+            <p className="text-sm" style={{ color: "var(--status-good)" }}>
+              Saved.
+            </p>
+          )}
           {status === "error" && (
-            <p className="text-sm text-red-600">
+            <p className="text-sm" style={{ color: "var(--status-critical)" }}>
               Save failed — check you&apos;re signed in and RLS allows the update.
             </p>
           )}
