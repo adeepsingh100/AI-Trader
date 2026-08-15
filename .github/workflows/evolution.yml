@@ -1,0 +1,24 @@
+name: Evolution
+
+on:
+  # 18:45 UTC = 00:15 IST — just after the IST trading-day rollover
+  # (PROJECT_SPEC.md §2/§9), so it reviews the day that just closed.
+  schedule:
+    - cron: "45 18 * * *"
+  workflow_dispatch:
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m src.agents.evolution_agent
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
