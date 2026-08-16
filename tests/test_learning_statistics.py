@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from src.learning.statistics import compute_bucket_statistics
+from src.learning.statistics import compute_bucket_statistics, streaks, z_test_two_means, z_test_two_proportions
 
 
 def _trade(pnl, opened="2026-01-01T00:00:00Z", closed="2026-01-01T01:00:00Z"):
@@ -109,3 +109,85 @@ def test_avg_holding_time_seconds():
     ]
     stats = compute_bucket_statistics(trades, capital_to_use=1000)
     assert stats["avg_holding_time_seconds"] == pytest.approx(2700.0)
+
+
+# --- z_test_two_proportions ---
+
+
+def test_z_test_two_proportions_known_value():
+    # p1=0.6 (30/50), p2=0.4 (20/50) -> hand-verified p-value
+    assert z_test_two_proportions(30, 50, 20, 50) == pytest.approx(0.04550026389635842)
+
+
+def test_z_test_two_proportions_identical_rates_high_p_value():
+    assert z_test_two_proportions(25, 50, 25, 50) == pytest.approx(1.0)
+
+
+def test_z_test_two_proportions_none_on_zero_sample():
+    assert z_test_two_proportions(0, 0, 5, 10) is None
+    assert z_test_two_proportions(5, 10, 0, 0) is None
+
+
+def test_z_test_two_proportions_none_on_degenerate_variance():
+    # both groups all-wins -> pooled variance is 0
+    assert z_test_two_proportions(10, 10, 10, 10) is None
+
+
+# --- z_test_two_means ---
+
+
+def test_z_test_two_means_known_value():
+    assert z_test_two_means(10, 2, 30, 8, 2, 30) == pytest.approx(0.00010751117672946897)
+
+
+def test_z_test_two_means_identical_means_high_p_value():
+    assert z_test_two_means(5, 1, 20, 5, 1, 20) == pytest.approx(1.0)
+
+
+def test_z_test_two_means_none_when_fewer_than_two_samples():
+    assert z_test_two_means(10, 2, 1, 8, 2, 30) is None
+    assert z_test_two_means(10, 2, 30, 8, 2, 1) is None
+
+
+def test_z_test_two_means_none_on_zero_variance():
+    assert z_test_two_means(10, 0, 30, 8, 0, 30) is None
+
+
+# --- streaks ---
+
+
+def test_streaks_tracks_longest_and_current():
+    trades = [
+        _trade(100, closed="2026-01-01T00:00:00Z"),
+        _trade(100, closed="2026-01-02T00:00:00Z"),
+        _trade(-50, closed="2026-01-03T00:00:00Z"),
+        _trade(100, closed="2026-01-04T00:00:00Z"),
+        _trade(100, closed="2026-01-05T00:00:00Z"),
+        _trade(100, closed="2026-01-06T00:00:00Z"),
+    ]
+    result = streaks(trades)
+    assert result["longest_win_streak"] == 3
+    assert result["longest_loss_streak"] == 1
+    assert result["current_streak_type"] == "win"
+    assert result["current_streak_length"] == 3
+
+
+def test_streaks_current_streak_is_loss():
+    trades = [
+        _trade(100, closed="2026-01-01T00:00:00Z"),
+        _trade(-50, closed="2026-01-02T00:00:00Z"),
+        _trade(-50, closed="2026-01-03T00:00:00Z"),
+    ]
+    result = streaks(trades)
+    assert result["current_streak_type"] == "loss"
+    assert result["current_streak_length"] == 2
+
+
+def test_streaks_empty_input():
+    result = streaks([])
+    assert result == {
+        "longest_win_streak": 0,
+        "longest_loss_streak": 0,
+        "current_streak_type": None,
+        "current_streak_length": 0,
+    }

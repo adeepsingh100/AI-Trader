@@ -26,3 +26,11 @@ jobs:
           OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — pure
+      # statistics, no LLM calls, so no LLM secrets needed. Runs after
+      # evolution_agent so its weight/threshold recommendations and
+      # feature-importance rows are already fresh for the day.
+      - run: python -m src.learning.adaptive_strategy_engine
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

@@ -44,3 +44,50 @@ def test_pure_historical_when_ai_confidence_missing():
     assert result["final_confidence"] == 80
     assert result["ai_weight_used"] == 0.0
     assert result["historical_weight_used"] == 1.0
+
+
+# --- adaptive confidence modifier chain ---
+
+
+def test_modifiers_default_to_none_and_dont_change_base_confidence():
+    result = calibrate_confidence(ai_confidence=70, historical_confidence=None, sample_size=0)
+    assert result["final_confidence"] == 70
+    assert result["regime_modifier"] is None
+    assert result["symbol_modifier"] is None
+    assert result["recent_performance_modifier"] is None
+
+
+def test_modifiers_sum_onto_base_confidence():
+    result = calibrate_confidence(
+        ai_confidence=70,
+        historical_confidence=None,
+        sample_size=0,
+        regime_modifier=5.0,
+        symbol_modifier=-2.0,
+        recent_performance_modifier=3.0,
+    )
+    assert result["final_confidence"] == pytest.approx(76.0)
+    assert result["regime_modifier"] == 5.0
+    assert result["symbol_modifier"] == -2.0
+    assert result["recent_performance_modifier"] == 3.0
+
+
+def test_modifiers_clamped_to_0_100():
+    result = calibrate_confidence(
+        ai_confidence=95, historical_confidence=None, sample_size=0, regime_modifier=50.0
+    )
+    assert result["final_confidence"] == 100.0
+
+    result = calibrate_confidence(
+        ai_confidence=5, historical_confidence=None, sample_size=0, recent_performance_modifier=-50.0
+    )
+    assert result["final_confidence"] == 0.0
+
+
+def test_modifiers_never_applied_when_base_confidence_is_none():
+    # both ai_confidence and historical_confidence missing -> nothing to
+    # modify, must stay None rather than becoming a fabricated 0 + modifier
+    result = calibrate_confidence(
+        ai_confidence=None, historical_confidence=None, sample_size=0, regime_modifier=10.0
+    )
+    assert result["final_confidence"] is None

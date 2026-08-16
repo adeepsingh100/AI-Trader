@@ -6,7 +6,7 @@ or makes an LLM call; consumes compute_multi_timeframe_features() output.
 Missing indicators (short history) degrade gracefully: every aggregation
 step (timeframe components -> a timeframe's sub-score, per-timeframe
 sub-scores -> the blended sub-score, sub-scores -> the final opportunity
-score) goes through the same _weighted_average helper, which renormalizes
+score) goes through the same weighted_average helper, which renormalizes
 weights among whatever's actually available and returns None only when
 nothing at all is available — never a fabricated 0."""
 
@@ -54,7 +54,7 @@ def _bool_score(condition: bool | None) -> float | None:
     return 100.0 if condition else 0.0
 
 
-def _weighted_average(values: dict[str, float | None], weights: dict[str, float]) -> float | None:
+def weighted_average(values: dict[str, float | None], weights: dict[str, float]) -> float | None:
     """Weighted average of whatever's not None, renormalized among the
     available subset. None only if literally nothing is available — the
     one rule every aggregation step in this module goes through."""
@@ -79,7 +79,7 @@ def _score_trend_for_timeframe(f: dict) -> float | None:
         "ema50_gt_ema100": _bool_score(e50 > e100) if e50 is not None and e100 is not None else None,
         "ema100_gt_ema200": _bool_score(e100 > e200) if e100 is not None and e200 is not None else None,
     }
-    return _weighted_average(components, dict.fromkeys(components, 0.25))
+    return weighted_average(components, dict.fromkeys(components, 0.25))
 
 
 def _score_momentum_for_timeframe(f: dict) -> float | None:
@@ -88,7 +88,7 @@ def _score_momentum_for_timeframe(f: dict) -> float | None:
         "macd": _bool_score(f["macd_histogram"] > 0) if f["macd_histogram"] is not None else None,
         "stoch_rsi": _linear_score(f["stoch_rsi_k"], STOCH_RSI_SCORE_FLOOR, STOCH_RSI_SCORE_CEIL),
     }
-    return _weighted_average(components, dict.fromkeys(components, 1 / 3))
+    return weighted_average(components, dict.fromkeys(components, 1 / 3))
 
 
 def _score_volume_for_timeframe(f: dict) -> float | None:
@@ -97,7 +97,7 @@ def _score_volume_for_timeframe(f: dict) -> float | None:
         "relative_volume": _clamp((rel_vol - 1) * VOLUME_SCORE_SCALE, 0, 100) if rel_vol is not None else None,
         "obv": _bool_score(f["obv_rising"]),
     }
-    return _weighted_average(components, {"relative_volume": 0.5, "obv": 0.5})
+    return weighted_average(components, {"relative_volume": 0.5, "obv": 0.5})
 
 
 def _score_volatility_for_timeframe(f: dict) -> float | None:
@@ -118,7 +118,7 @@ def _score_risk_for_timeframe(f: dict) -> float | None:
 
 
 def _blend_across_timeframes(per_tf_scores: dict[str, float | None]) -> float | None:
-    return _weighted_average(per_tf_scores, TIMEFRAME_WEIGHTS)
+    return weighted_average(per_tf_scores, TIMEFRAME_WEIGHTS)
 
 
 def score_trend(features_by_tf: dict[str, dict]) -> float | None:
@@ -195,7 +195,7 @@ def score_opportunity(features_by_tf: dict[str, dict]) -> dict:
         "volume_score": sub_scores["volume"],
         "volatility_score": sub_scores["volatility"],
         "risk_score": sub_scores["risk"],
-        "opportunity_score": _weighted_average(sub_scores, weights),
+        "opportunity_score": weighted_average(sub_scores, weights),
         "market_regime": classify_market_regime(features_by_tf),
     }
 

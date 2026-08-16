@@ -387,21 +387,26 @@ def get_learning_statistics(mode: str, dimension_type: str | None = None) -> lis
 # --- feature_importance ---
 
 
-def upsert_feature_importance(mode: str, feature_name: str, correlation_score: float, sample_count: int) -> None:
+def upsert_feature_importance(
+    mode: str, feature_name: str, correlation_score: float, sample_count: int, timeframe: str
+) -> None:
     get_client().table("feature_importance").upsert(
         {
             "mode": mode,
             "feature_name": feature_name,
             "correlation_score": correlation_score,
             "sample_count": sample_count,
+            "timeframe": timeframe,
         },
-        on_conflict="mode,feature_name",
+        on_conflict="mode,feature_name,timeframe",
     ).execute()
 
 
-def get_feature_importance(mode: str) -> list[dict]:
-    res = get_client().table("feature_importance").select("*").eq("mode", mode).execute()
-    return res.data
+def get_feature_importance(mode: str, timeframe: str | None = None) -> list[dict]:
+    query = get_client().table("feature_importance").select("*").eq("mode", mode)
+    if timeframe is not None:
+        query = query.eq("timeframe", timeframe)
+    return query.execute().data
 
 
 def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
@@ -440,6 +445,9 @@ def log_confidence_calibration(
     historical_weight: float,
     final_confidence: float | None,
     similar_trades_count: int,
+    regime_modifier: float | None = None,
+    symbol_modifier: float | None = None,
+    recent_performance_modifier: float | None = None,
 ) -> None:
     get_client().table("confidence_calibration").insert(
         {
@@ -450,6 +458,9 @@ def log_confidence_calibration(
             "historical_weight": historical_weight,
             "final_confidence": final_confidence,
             "similar_trades_count": similar_trades_count,
+            "regime_modifier": regime_modifier,
+            "symbol_modifier": symbol_modifier,
+            "recent_performance_modifier": recent_performance_modifier,
         }
     ).execute()
 
@@ -478,6 +489,10 @@ def insert_recommendation(
     recommended_value: float,
     rationale: str,
     sample_size: int,
+    category: str = "threshold",
+    confidence: float | None = None,
+    evidence: dict | None = None,
+    batch_id: str | None = None,
 ) -> None:
     get_client().table("recommendations").insert(
         {
@@ -487,15 +502,116 @@ def insert_recommendation(
             "recommended_value": recommended_value,
             "rationale": rationale,
             "sample_size": sample_size,
+            "category": category,
+            "confidence": confidence,
+            "evidence": evidence,
+            "batch_id": batch_id,
         }
     ).execute()
 
 
-def get_recommendations(mode: str, status: str | None = None) -> list[dict]:
+def get_recommendations(
+    mode: str, status: str | None = None, category: str | None = None
+) -> list[dict]:
     query = get_client().table("recommendations").select("*").eq("mode", mode)
     if status is not None:
         query = query.eq("status", status)
+    if category is not None:
+        query = query.eq("category", category)
     return query.order("created_at", desc=True).execute().data
+
+
+# --- strategy_simulations ---
+
+
+def insert_strategy_simulation(
+    recommendation_batch_id: str | None,
+    mode: str,
+    train_window_start: datetime,
+    train_window_end: datetime,
+    test_window_start: datetime,
+    test_window_end: datetime,
+    baseline_metrics: dict | None,
+    candidate_metrics: dict | None,
+    p_value: float | None,
+    passed: bool,
+) -> dict:
+    res = (
+        get_client()
+        .table("strategy_simulations")
+        .insert(
+            {
+                "recommendation_batch_id": recommendation_batch_id,
+                "mode": mode,
+                "train_window_start": train_window_start.isoformat(),
+                "train_window_end": train_window_end.isoformat(),
+                "test_window_start": test_window_start.isoformat(),
+                "test_window_end": test_window_end.isoformat(),
+                "baseline_metrics": baseline_metrics,
+                "candidate_metrics": candidate_metrics,
+                "p_value": p_value,
+                "passed": passed,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_strategy_simulations(mode: str, passed: bool | None = None) -> list[dict]:
+    query = get_client().table("strategy_simulations").select("*").eq("mode", mode)
+    if passed is not None:
+        query = query.eq("passed", passed)
+    return query.order("created_at", desc=True).execute().data
+
+
+# --- adaptive_strategy_versions ---
+
+
+def insert_adaptive_strategy_version(
+    mode: str,
+    version_number: int,
+    params_json: dict,
+    source_recommendation_batch_id: str | None,
+    source_simulation_id: int | None,
+    notes: str | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("adaptive_strategy_versions")
+        .insert(
+            {
+                "mode": mode,
+                "version_number": version_number,
+                "params_json": params_json,
+                "source_recommendation_batch_id": source_recommendation_batch_id,
+                "source_simulation_id": source_simulation_id,
+                "notes": notes,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_adaptive_strategy_versions(mode: str, status: str | None = None) -> list[dict]:
+    query = get_client().table("adaptive_strategy_versions").select("*").eq("mode", mode)
+    if status is not None:
+        query = query.eq("status", status)
+    return query.order("created_at", desc=True).execute().data
+
+
+def get_latest_adaptive_strategy_version(mode: str) -> dict | None:
+    res = (
+        get_client()
+        .table("adaptive_strategy_versions")
+        .select("*")
+        .eq("mode", mode)
+        .order("version_number", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
 
 
 # --- trade_evaluations ---

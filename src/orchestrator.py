@@ -21,6 +21,8 @@ meant for a tighter cron than the full LLM validation cycle."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from src.agents.data_agent import get_market_snapshot
 from src.agents.execution.paper import PaperExecutionAgent
 from src.agents.execution.real import RealExecutionAgent
@@ -33,7 +35,17 @@ from src.agents.risk_manager import (
 )
 from src.agents.signal_agent import validate_opportunity
 from src.coindcx_client import get_ticker
-from src.config import EXIT_SCORE_THRESHOLD, MIN_FINAL_CONFIDENCE
+from src.config import (
+    BUCKET_MODIFIER_CAP,
+    BUCKET_MODIFIER_SENSITIVITY,
+    EXIT_SCORE_THRESHOLD,
+    LEARNING_CATCHUP_LOOKBACK_HOURS,
+    MIN_FINAL_CONFIDENCE,
+    RECENT_PERFORMANCE_LOOKBACK_TRADES,
+    RECENT_STREAK_LOSS_MODIFIER_CAP,
+    RECENT_STREAK_WIN_MODIFIER_CAP,
+    RECOMMENDATION_MIN_SAMPLE_SIZE,
+)
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
 from src.features.opportunity_scorer import (
@@ -42,7 +54,7 @@ from src.features.opportunity_scorer import (
     select_top_candidates,
 )
 from src.learning.confidence_calibration import calibrate_confidence
-from src.learning.statistics import process_closed_trades
+from src.learning.statistics import process_closed_trades, streaks
 from src.learning.trade_memory import find_similar_trades
 
 MODE = "paper"
@@ -69,6 +81,47 @@ def _update_excursion(open_trades: list[dict], prices: dict) -> None:
         if new_mfe != prior_mfe or new_mae != prior_mae:
             models.update_trade_excursion(trade["id"], new_mfe, new_mae)
             trade["mfe_pct"], trade["mae_pct"] = new_mfe, new_mae
+
+
+def _bucket_modifier(bucket_stats_by_value: dict, value: str | None, overall_win_rate: float | None) -> float | None:
+    """Adaptive confidence chain (Step 7): how much better/worse this
+    regime's or symbol's win rate is than the overall baseline, scaled
+    and capped. None (no contribution) unless the bucket has enough
+    samples to trust — never nudges confidence from a handful of trades."""
+    if value is None or overall_win_rate is None:
+        return None
+    row = bucket_stats_by_value.get(value)
+    if row is None:
+        return None
+    win_rate = row.get("win_rate")
+    trades_count = row.get("trades_count") or 0
+    if win_rate is None or trades_count < RECOMMENDATION_MIN_SAMPLE_SIZE:
+        return None
+    raw = (win_rate - overall_win_rate) * BUCKET_MODIFIER_SENSITIVITY
+    return max(-BUCKET_MODIFIER_CAP, min(BUCKET_MODIFIER_CAP, raw))
+
+
+def _recent_performance_modifier(mode: str) -> float | None:
+    """Adaptive confidence chain (Step 7): current win/loss streak over
+    the last RECENT_PERFORMANCE_LOOKBACK_TRADES closed trades, scaled to
+    the streak length and capped — deliberately asymmetric (a losing
+    streak can suppress confidence more than a winning streak inflates
+    it). Computed once per cycle, not per candidate."""
+    since = datetime.now(timezone.utc) - timedelta(hours=LEARNING_CATCHUP_LOOKBACK_HOURS)
+    recent = sorted(
+        (t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None),
+        key=lambda t: t["closed_at"],
+    )[-RECENT_PERFORMANCE_LOOKBACK_TRADES:]
+    if not recent:
+        return None
+
+    streak = streaks(recent)
+    length_fraction = streak["current_streak_length"] / RECENT_PERFORMANCE_LOOKBACK_TRADES
+    if streak["current_streak_type"] == "loss":
+        return -min(RECENT_STREAK_LOSS_MODIFIER_CAP, length_fraction * RECENT_STREAK_LOSS_MODIFIER_CAP)
+    if streak["current_streak_type"] == "win":
+        return min(RECENT_STREAK_WIN_MODIFIER_CAP, length_fraction * RECENT_STREAK_WIN_MODIFIER_CAP)
+    return None
 
 
 def _sweep_stop_loss_take_profit(
@@ -241,6 +294,19 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
     not_held = [r for r in scored if r["symbol"] not in open_by_symbol]
     candidate_symbols = {r["symbol"] for r in select_top_candidates(not_held)}
 
+    # Adaptive confidence chain (Step 7) inputs — fetched once per cycle,
+    # not once per candidate (Step 13: cached/batched, not redundant
+    # per-candidate queries). overall_win_rate uses the active version's
+    # own learning_statistics bucket (already computed, already cached)
+    # as the baseline regime/symbol win rates are compared against,
+    # rather than a fresh full-trades scan every cycle.
+    regime_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="market_regime")}
+    symbol_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="symbol")}
+    version_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="strategy_version")}
+    overall_row = version_stats.get(str(version["id"]))
+    overall_win_rate = overall_row.get("win_rate") if overall_row else None
+    recent_performance_modifier = _recent_performance_modifier(mode)
+
     # Pass 2: LLM validation only for entry candidates and held positions
     # whose score has deteriorated past the exit threshold — everyone else
     # is logged with no LLM call at all.
@@ -269,7 +335,16 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             llm_raw_response = verdict
 
             historical_confidence = similar["win_rate"] * 100 if similar["win_rate"] is not None else None
-            calibrated = calibrate_confidence(verdict.get("confidence"), historical_confidence, similar["count"])
+            regime_modifier = _bucket_modifier(regime_stats, record["market_regime"], overall_win_rate)
+            symbol_modifier = _bucket_modifier(symbol_stats, symbol, overall_win_rate)
+            calibrated = calibrate_confidence(
+                verdict.get("confidence"),
+                historical_confidence,
+                similar["count"],
+                regime_modifier=regime_modifier,
+                symbol_modifier=symbol_modifier,
+                recent_performance_modifier=recent_performance_modifier,
+            )
             calibration_to_log = {
                 "ai_confidence": verdict.get("confidence"),
                 "historical_confidence": historical_confidence,
@@ -277,6 +352,9 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 "historical_weight": calibrated["historical_weight_used"],
                 "final_confidence": calibrated["final_confidence"],
                 "similar_trades_count": similar["count"],
+                "regime_modifier": calibrated["regime_modifier"],
+                "symbol_modifier": calibrated["symbol_modifier"],
+                "recent_performance_modifier": calibrated["recent_performance_modifier"],
             }
             confidence_cleared = (
                 calibrated["final_confidence"] is None or calibrated["final_confidence"] >= MIN_FINAL_CONFIDENCE

@@ -300,6 +300,90 @@ this is expected to be noisy until real trade history accumulates.
   `strong_bear` / `weak_bear`, derived from ADX + trend_score, no separate
   "trending" label (redundant with strong_bull/strong_bear).
 
+## 3b. Adaptive Strategy Intelligence Engine (`src/learning/`)
+
+Closes the loop from the Learning Engine's statistics into recommended
+parameter changes — walk-forward validated and simulated before a
+candidate is even created, then requiring explicit human approval before
+being treated as adopted. Two trust levels: everything that could change
+what the bot trades (weights, thresholds, avoid-symbol/avoid-regime)
+stays advisory, human-approved in Supabase, same as `recommendations`
+already worked before this. The one automatic piece is the confidence
+modifier chain, an extension of the already-automatic (and
+inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
+
+- **`feature_importance.py`** (extended): `compute_feature_importance`
+  now accepts a `timeframes` list (default `[PRIMARY_TIMEFRAME]`,
+  unchanged behavior) — passing `FEATURE_TIMEFRAMES` computes correlation
+  independently per timeframe using each trade's already-stored
+  multi-timeframe feature dump, zero new candle fetches. New
+  `compute_subscore_correlation_weights(mode)` correlates the 5
+  already-flat opportunity_evaluations sub-score columns against
+  win/loss, normalizes positive correlations into a weight distribution,
+  and caches them in `feature_importance` (`timeframe="blended"`) — read
+  back live (but cheaply, no recomputation) by
+  `trade_memory._feature_importance_weights`, which is no longer a
+  permanent no-op stub. New `score_separation_p_value(trades, weights)`
+  recomputes each trade's opportunity score under a candidate weight set
+  and z-tests whether winners and losers separate significantly better
+  than under the current weights.
+- **`statistics.py`** (extended): `streaks()` (moved from `reports.py`,
+  now also returns the *current* streak, not just the longest, since the
+  live confidence chain needs it every cycle) and stdlib-only two-sample
+  z-test helpers (`z_test_two_proportions`, `z_test_two_means`, normal
+  approximation via `math.erf`) — used for both a recommendation's stated
+  confidence and its walk-forward pass/fail gate.
+- **`recommendations.py`** (extended, `generate_recommendations` itself
+  unchanged): `generate_weight_recommendations` (candidate
+  `OPPORTUNITY_WEIGHT_*` values, accepted only if they separate
+  winners/losers better than the live weights), `generate_regime_recommendations`
+  ("avoid regime X" plus regime-conditioned weight recommendations),
+  `generate_symbol_recommendations` ("avoid symbol X" plus a per-symbol
+  optimal-threshold sweep for confidence/opportunity_score/stop_distance/
+  volatility, via a generalized `_find_optimal_threshold` shared with the
+  original sweep). Every generator: only ever re-evaluates trades already
+  taken (no counterfactual discovery — that would need a real
+  candle-replay backtester, out of scope), and is idempotent the same way
+  the original threshold sweep already was.
+- **`simulation.py`** (new): walk-forward validation — a recommendation
+  is regenerated using only the older TRAIN fraction of
+  `LEARNING_HISTORY_WINDOW_DAYS`, then evaluated only against the newer
+  TEST fraction, never touched during generation. On a statistically
+  significant pass (`SIGNIFICANCE_THRESHOLD`), lazily creates an
+  `adaptive_strategy_versions` candidate row — only for proposals that
+  clear the bar, so that table only ever holds genuine candidates.
+  Currently simulates the mode-wide weight recommendation and the
+  mode-wide `MIN_OPPORTUNITY_SCORE` threshold recommendation; regime-/
+  symbol-scoped recommendations stay recommend-only (each already needs
+  the full sample floor per bucket just to be generated once).
+- **`adaptive_strategy_engine.py`** (new): `AdaptiveStrategyEngine.analyze(mode)`
+  — the single composed entry point, calling every generator above plus
+  the simulations, then logging a summary. Never executes a trade, never
+  writes to `config.py` or any trading table. Runs as its own nightly
+  step in `evolution.yml` (after `evolution_agent`, no new workflow) —
+  deliberately NOT called from `run_evolution()` itself, so
+  `evolution_agent.py`'s existing `generate_recommendations`/
+  `compute_feature_importance` calls stay untouched.
+- **Adaptive confidence chain** (`confidence_calibration.py`, extended):
+  `calibrate_confidence` gains optional `regime_modifier`/
+  `symbol_modifier`/`recent_performance_modifier` params — each a bounded
+  adjustment (`BUCKET_MODIFIER_SENSITIVITY`/`BUCKET_MODIFIER_CAP` for
+  regime/symbol, based on that bucket's win rate vs. the active version's
+  overall win rate; `RECENT_STREAK_WIN_MODIFIER_CAP`/
+  `RECENT_STREAK_LOSS_MODIFIER_CAP` for the current win/loss streak over
+  the last `RECENT_PERFORMANCE_LOOKBACK_TRADES` closed trades), summed
+  onto the existing AI+historical blend and clamped to 0-100. Computed
+  once per cycle in `orchestrator.py` (not once per candidate), gated on
+  each bucket clearing `RECOMMENDATION_MIN_SAMPLE_SIZE`. No live
+  per-trade timeframe modifier — a trade blends across
+  `FEATURE_TIMEFRAMES`, so there's no single per-trade timeframe bucket
+  to look up the way there is for symbol/regime; that signal lives in
+  `feature_importance`'s per-timeframe correlation instead.
+- **`reports.py`** (extended): `generate_adaptive_strategy_report_html`,
+  wired into `reporting_agent.py` as one more section — best/accepted/
+  rejected recommendations, simulation results, candidate/approved
+  adaptive strategy versions.
+
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
 - Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
@@ -474,19 +558,26 @@ learning_statistics (
   unique (mode, dimension_type, dimension_value)
 )
 
--- feature_importance: point-biserial correlation, primary timeframe only
+-- feature_importance: point-biserial correlation. timeframe added in
+-- 0006_adaptive_strategy_engine.sql — raw Feature Engine keys use their
+-- own timeframe, the 5 opportunity-scorer sub-scores always use the
+-- explicit sentinel 'blended' (see §3b)
 feature_importance (
   id                bigserial primary key,
   mode              text not null,
-  feature_name      text not null,             -- a Feature Engine FEATURE_KEYS entry
+  feature_name      text not null,             -- a Feature Engine FEATURE_KEYS entry, or a sub-score name (trend_score, ...)
+  timeframe         text not null,             -- '1m' | '15m' | '1h' | '1d' | 'blended'
   correlation_score numeric,
   sample_count      int not null default 0,
   computed_at       timestamptz not null default now(),
-  unique (mode, feature_name)
+  unique (mode, feature_name, timeframe)
 )
 
 -- confidence_calibration: audit log, one row per entry-validation call
--- (not aggregate stats — what was actually applied to a specific decision)
+-- (not aggregate stats — what was actually applied to a specific decision).
+-- *_modifier columns added in 0006_adaptive_strategy_engine.sql (§3b's
+-- adaptive confidence chain) so every stage, not just final_confidence,
+-- is individually auditable.
 confidence_calibration (
   id                        bigserial primary key,
   opportunity_evaluation_id bigint not null references opportunity_evaluations(id),
@@ -496,11 +587,17 @@ confidence_calibration (
   historical_weight         numeric,
   final_confidence          numeric,
   similar_trades_count      int not null default 0,
+  regime_modifier           numeric,
+  symbol_modifier           numeric,
+  recent_performance_modifier numeric,
   created_at                timestamptz not null default now()
 )
 
 -- recommendations: advisory only, human approval required, never
 -- auto-applied. Append-only (idempotency enforced in application code).
+-- category/confidence/evidence/batch_id added in
+-- 0006_adaptive_strategy_engine.sql (§3b) so weight/regime/symbol
+-- recommendations share this table rather than duplicating it.
 recommendations (
   id                bigserial primary key,
   mode              text not null,
@@ -509,7 +606,11 @@ recommendations (
   recommended_value numeric,
   rationale         text,
   sample_size       int not null default 0,
-  status            text not null default 'pending',  -- 'pending' | 'reviewed' | 'dismissed'
+  status            text not null default 'pending',  -- 'pending' | 'reviewed' | 'approved' | 'dismissed'
+  category          text not null default 'threshold', -- 'threshold' | 'weight' | 'regime' | 'symbol'
+  confidence        numeric,                    -- (1 - p_value) * 100 from the walk-forward z-test
+  evidence          jsonb,                       -- supporting trade ids / affected bucket refs, variable per category
+  batch_id          uuid,                        -- groups co-generated rows (e.g. the 5 weight recommendations from one call)
   created_at        timestamptz not null default now()
 )
 
@@ -526,11 +627,53 @@ trade_evaluations (
   target_assessment             text,           -- 'realistic' | 'too_ambitious' | null
   evaluated_at                  timestamptz not null default now()
 )
+
+-- strategy_simulations: walk-forward train/test result for one
+-- recommendation batch (0006_adaptive_strategy_engine.sql, §3b) — this
+-- table IS "Walk Forward Results" too, same computation reported
+-- together, not a second artifact.
+strategy_simulations (
+  id                      bigserial primary key,
+  recommendation_batch_id uuid,
+  mode                    text not null,
+  train_window_start      timestamptz not null,
+  train_window_end        timestamptz not null,
+  test_window_start       timestamptz not null,
+  test_window_end         timestamptz not null,
+  baseline_metrics        jsonb,
+  candidate_metrics       jsonb,
+  p_value                 numeric,
+  passed                  boolean not null,
+  created_at              timestamptz not null default now()
+)
+
+-- adaptive_strategy_versions: versions QUANTITATIVE PARAMETERS (a
+-- params_json snapshot of tunable adaptive constants) — orthogonal to
+-- strategy_versions above, which versions LLM PROMPT TEXT. Created
+-- lazily, only for simulations that pass. No separate "currently active"
+-- table — `WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
+-- answers that; auto-deploy is out of scope, a human still copies
+-- approved values into env vars by hand.
+adaptive_strategy_versions (
+  id                             bigserial primary key,
+  mode                           text not null,
+  version_number                 int not null,
+  params_json                    jsonb not null,
+  source_recommendation_batch_id uuid,
+  source_simulation_id           bigint references strategy_simulations(id),
+  status                         text not null default 'candidate',  -- 'candidate' | 'approved' | 'rolled_back'
+  notes                          text,
+  created_at                     timestamptz not null default now()
+)
 ```
 
 No separate `market_regimes` table — `learning_statistics WHERE
 dimension_type='market_regime'` already is that data; a second table
-would duplicate it under a different name.
+would duplicate it under a different name. Likewise no separate "Adaptive
+Strategies" table for a currently-active parameter set (§3b) and no
+separate "Feature Weight History"/"Threshold History" tables —
+`recommendations WHERE category = ...` (append-only) already is that
+history.
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
@@ -545,10 +688,11 @@ GitHub Actions (cron */10) ─┬─> orchestrator.py --mode=paper ─┐
                              └─> orchestrator.py --mode=real  ─┤
                                  (no-op if nothing promoted)   │
                                                                 ▼
-GitHub Actions (daily cron) ──> evolution_agent.py ──┐    Supabase (Postgres)
-                                                       └──────────▲
-                                                                  │
-Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ──┘
+GitHub Actions (daily cron) ──> evolution_agent.py ────┐  Supabase (Postgres)
+                             └─> adaptive_strategy_engine.py ┤◄──────▲
+                                 (same job, after evolution_agent)   │
+                                                                      │
+Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ──────┘
 ```
 
 ## 8. Dashboard (Next.js on Vercel)
@@ -620,12 +764,14 @@ funds exist, before trusting it beyond the promotion gate.
 │   ├── features/                    # deterministic, zero-LLM scoring pipeline
 │   │   ├── feature_engine.py
 │   │   └── opportunity_scorer.py    # includes classify_market_regime
-│   ├── learning/                    # Trade Memory + Learning Engine, see §3a
+│   ├── learning/                    # Trade Memory + Learning Engine (§3a) + Adaptive Strategy Engine (§3b)
 │   │   ├── statistics.py
 │   │   ├── trade_memory.py
 │   │   ├── confidence_calibration.py
 │   │   ├── feature_importance.py
 │   │   ├── recommendations.py
+│   │   ├── simulation.py            # walk-forward validation, §3b
+│   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b
 │   │   └── reports.py
 │   └── db/
 │       ├── models.py
@@ -634,7 +780,8 @@ funds exist, before trusting it beyond the promotion gate.
 │           ├── 0002_rls.sql
 │           ├── 0003_pause_flag.sql
 │           ├── 0004_opportunity_evaluations.sql
-│           └── 0005_learning_engine.sql
+│           ├── 0005_learning_engine.sql
+│           └── 0006_adaptive_strategy_engine.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

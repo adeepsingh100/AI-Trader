@@ -181,5 +181,41 @@ CONFIDENCE_BUCKET_WIDTH = float(os.getenv("CONFIDENCE_BUCKET_WIDTH", "10"))
 # recommendations (Step 8, advisory only, never auto-applied) and
 # feature_importance both need enough samples before a suggestion/correlation
 # means anything rather than reading noise as signal — same floor, one knob.
+# Also reused (deliberately, not duplicated) as the "trust this bucket"
+# floor for the adaptive confidence modifiers below.
 RECOMMENDATION_MIN_IMPROVEMENT_PCT = float(os.getenv("RECOMMENDATION_MIN_IMPROVEMENT_PCT", "15"))
 RECOMMENDATION_MIN_SAMPLE_SIZE = int(os.getenv("RECOMMENDATION_MIN_SAMPLE_SIZE", "20"))
+# Absolute expectancy-delta floor, alongside the relative-percent check
+# above — needed once recommendations get generated per symbol/regime
+# bucket, where a near-zero baseline expectancy makes the relative-percent
+# check trivially pass on a meaningless swing.
+MIN_EXPECTANCY_DELTA = float(os.getenv("MIN_EXPECTANCY_DELTA", "1.0"))
+
+# --- Adaptive Strategy Intelligence Engine -----------------------------------
+# Closes the loop from the Learning Engine's statistics back into advisory
+# recommendations — never auto-applied to config/live scoring (human
+# approves in Supabase, same as `recommendations` already works). The one
+# automatic piece is the confidence-modifier chain below, which extends the
+# already-automatic (and inert-by-default, MIN_FINAL_CONFIDENCE=0)
+# calibrate_confidence gate. Pure statistics throughout — no ML/RL.
+
+# Walk-forward validation: generate a recommendation using only the older
+# TRAIN fraction of LEARNING_HISTORY_WINDOW_DAYS, evaluate it only against
+# the newer TEST fraction — never touched during generation.
+ADAPTIVE_TRAIN_TEST_SPLIT_PCT = float(os.getenv("ADAPTIVE_TRAIN_TEST_SPLIT_PCT", "0.7"))
+# p-value threshold (two-sample z-test, normal approximation) below which a
+# simulated improvement counts as statistically significant, not noise.
+SIGNIFICANCE_THRESHOLD = float(os.getenv("SIGNIFICANCE_THRESHOLD", "0.05"))
+
+# Adaptive confidence chain: base (AI+historical, unchanged) + regime +
+# symbol + recent-performance modifiers, each capped and gated on sample
+# size. Regime/symbol share one formula and one pair of constants since
+# both are "this bucket's win rate vs. the overall baseline".
+BUCKET_MODIFIER_SENSITIVITY = float(os.getenv("BUCKET_MODIFIER_SENSITIVITY", "20"))
+BUCKET_MODIFIER_CAP = float(os.getenv("BUCKET_MODIFIER_CAP", "10"))
+RECENT_PERFORMANCE_LOOKBACK_TRADES = int(os.getenv("RECENT_PERFORMANCE_LOOKBACK_TRADES", "10"))
+# Deliberately asymmetric defaults — a losing streak can suppress
+# confidence more than a winning streak inflates it (standard
+# risk-management practice), but both are independently configurable.
+RECENT_STREAK_WIN_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_WIN_MODIFIER_CAP", "5"))
+RECENT_STREAK_LOSS_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_LOSS_MODIFIER_CAP", "15"))

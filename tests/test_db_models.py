@@ -250,9 +250,22 @@ def test_upsert_feature_importance_conflict_key(monkeypatch):
     client = Mock(table=Mock(return_value=table))
     monkeypatch.setattr(models, "get_client", lambda: client)
 
-    models.upsert_feature_importance("paper", "rsi", 0.42, 30)
+    models.upsert_feature_importance("paper", "rsi", 0.42, 30, "1h")
 
-    assert table.upsert.call_args.kwargs["on_conflict"] == "mode,feature_name"
+    inserted = table.upsert.call_args[0][0]
+    assert inserted["timeframe"] == "1h"
+    assert table.upsert.call_args.kwargs["on_conflict"] == "mode,feature_name,timeframe"
+
+
+def test_get_feature_importance_filters_by_timeframe(monkeypatch):
+    table = _fluent_mock([{"feature_name": "trend_score", "timeframe": "blended"}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.get_feature_importance("paper", timeframe="blended")
+
+    table.eq.assert_any_call("timeframe", "blended")
+    assert result == [{"feature_name": "trend_score", "timeframe": "blended"}]
 
 
 # --- confidence_calibration ---

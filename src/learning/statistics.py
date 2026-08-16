@@ -50,6 +50,43 @@ def _downside_deviation(returns: list[float], mar: float) -> float | None:
     return dd if dd else None
 
 
+def _normal_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+
+
+# ponytail: normal approximation, not Student's-t — valid at the sample
+# floors these are actually gated behind (RECOMMENDATION_MIN_SAMPLE_SIZE,
+# default 20+); revisit with a t-distribution if that floor is ever
+# lowered materially below ~20.
+def z_test_two_proportions(wins1: int, n1: int, wins2: int, n2: int) -> float | None:
+    """Two-tailed p-value for two independent win-rate samples differing
+    by chance alone. None on any degenerate input (zero samples, zero
+    pooled variance) — never a fabricated p-value."""
+    if n1 <= 0 or n2 <= 0:
+        return None
+    p1, p2 = wins1 / n1, wins2 / n2
+    pooled = (wins1 + wins2) / (n1 + n2)
+    variance = pooled * (1 - pooled) * (1 / n1 + 1 / n2)
+    if variance <= 0:
+        return None
+    z = (p1 - p2) / math.sqrt(variance)
+    return 2 * (1 - _normal_cdf(abs(z)))
+
+
+def z_test_two_means(mean1: float, stdev1: float, n1: int, mean2: float, stdev2: float, n2: int) -> float | None:
+    """Two-tailed p-value for two independent sample means (e.g. expectancy
+    under current vs. candidate parameters) differing by chance alone.
+    Welch-style (no equal-variance assumption). None if either sample has
+    fewer than 2 observations or pooled variance is 0."""
+    if n1 < 2 or n2 < 2:
+        return None
+    variance = (stdev1**2) / n1 + (stdev2**2) / n2
+    if variance <= 0:
+        return None
+    z = (mean1 - mean2) / math.sqrt(variance)
+    return 2 * (1 - _normal_cdf(abs(z)))
+
+
 def compute_bucket_statistics(trades: list[dict], capital_to_use: float) -> dict:
     closed = [t for t in trades if t.get("pnl") is not None]
     if not closed or capital_to_use <= 0:
@@ -113,6 +150,38 @@ def compute_bucket_statistics(trades: list[dict], capital_to_use: float) -> dict
         "sharpe_ratio": sharpe,
         "sortino_ratio": sortino,
         "calmar_ratio": calmar,
+    }
+
+
+def streaks(trades: list[dict]) -> dict:
+    """Longest and current win/loss streaks over a chronologically-ordered
+    trade list. Lives here (not reports.py, which locally-imports from
+    reporting_agent to stay a leaf/reporting-only module) since the
+    adaptive confidence chain's recent-performance modifier needs the
+    CURRENT streak live, every cycle — making it depend on a reporting
+    module would invert that layering."""
+    ordered = sorted((t for t in trades if t.get("pnl") is not None), key=lambda t: t["closed_at"])
+    longest_win = longest_loss = current_win = current_loss = 0
+    for t in ordered:
+        if t["pnl"] > 0:
+            current_win, current_loss = current_win + 1, 0
+        else:
+            current_loss, current_win = current_loss + 1, 0
+        longest_win = max(longest_win, current_win)
+        longest_loss = max(longest_loss, current_loss)
+
+    if current_win:
+        current_streak_type, current_streak_length = "win", current_win
+    elif current_loss:
+        current_streak_type, current_streak_length = "loss", current_loss
+    else:
+        current_streak_type, current_streak_length = None, 0
+
+    return {
+        "longest_win_streak": longest_win,
+        "longest_loss_streak": longest_loss,
+        "current_streak_type": current_streak_type,
+        "current_streak_length": current_streak_length,
     }
 
 
