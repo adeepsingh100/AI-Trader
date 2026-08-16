@@ -101,3 +101,36 @@ def test_get_latest_promoted_version_filters_and_orders(monkeypatch):
     table.eq.assert_called_with("promoted_to_real", True)
     table.order.assert_called_with("version_number", desc=True)
     assert result["id"] == 2
+
+
+def test_log_opportunity_evaluation_inserts_expected_row(monkeypatch):
+    table = _fluent_mock([{"id": 1}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    models.log_opportunity_evaluation(
+        mode="paper",
+        symbol="BTCINR",
+        version_id=1,
+        features={"5m": {"rsi": 55.0}},
+        trend_score=80.0,
+        momentum_score=70.0,
+        volume_score=60.0,
+        volatility_score=100.0,
+        risk_score=90.0,
+        opportunity_score=82.0,
+        llm_decision="accept",
+        llm_reasoning="strong setup",
+        llm_raw_response={"decision": "accept", "reasoning": "strong setup"},
+        risk_manager_result="size",
+        final_decision="buy",
+        reason="strong setup",
+    )
+
+    client.table.assert_called_with("opportunity_evaluations")
+    inserted = table.insert.call_args[0][0]
+    assert inserted["symbol"] == "BTCINR"
+    assert inserted["opportunity_score"] == 82.0
+    assert inserted["llm_decision"] == "accept"
+    assert inserted["final_decision"] == "buy"
+    assert inserted["features"] == {"5m": {"rsi": 55.0}}

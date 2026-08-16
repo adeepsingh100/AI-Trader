@@ -273,3 +273,46 @@ def get_recent_model_usage(limit: int = 500) -> list[dict]:
         .execute()
     )
     return res.data
+
+
+# --- opportunity_evaluations ---
+
+
+def log_opportunity_evaluation(
+    mode: str,
+    symbol: str,
+    version_id: int,
+    features: dict,
+    trend_score: float | None,
+    momentum_score: float | None,
+    volume_score: float | None,
+    volatility_score: float | None,
+    risk_score: float | None,
+    opportunity_score: float | None,
+    llm_decision: str | None,
+    llm_reasoning: str | None,
+    llm_raw_response: Any,
+    risk_manager_result: str | None,
+    final_decision: str,
+    reason: str | None,
+) -> None:
+    get_client().table("opportunity_evaluations").insert(
+        {
+            "mode": mode,
+            "symbol": symbol,
+            "version_id": version_id,
+            "features": features,
+            "trend_score": trend_score,
+            "momentum_score": momentum_score,
+            "volume_score": volume_score,
+            "volatility_score": volatility_score,
+            "risk_score": risk_score,
+            "opportunity_score": opportunity_score,
+            "llm_decision": llm_decision,
+            "llm_reasoning": llm_reasoning,
+            "llm_raw_response": llm_raw_response,
+            "risk_manager_result": risk_manager_result,
+            "final_decision": final_decision,
+            "reason": reason,
+        }
+    ).execute()

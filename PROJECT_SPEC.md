@@ -52,21 +52,90 @@ are binding unless the user says otherwise. Everything marked
 ## 3. Multi-agent architecture
 
 All agents are separate, independently testable Python modules under
-`src/agents/`. One full cycle (data → signal → risk → execute → log)
-runs to completion and exits — no long-running process (see §7).
+`src/agents/` (plus `src/features/` for the deterministic scoring
+pipeline). One full cycle runs to completion and exits — no long-running
+process (see §7):
+
+```
+Data Agent → Feature Engine → Opportunity Scorer → Candidate Filter
+    → Signal Agent (LLM validation) → Risk Manager → Execution Agent → log
+```
+
+**Quant-first, not LLM-first**: the LLM never picks direction and never
+sees raw candles. A deterministic scorer (zero AI, zero randomness) ranks
+every scanned symbol; only the top candidates and deteriorating held
+positions reach the LLM at all, as a curated validate/reject gate. This
+is what actually bounds LLM call volume per cycle — not the scan
+breadth (`n_symbols`, still top-10-by-turnover), which stays cheap
+because scoring is pure math.
 
 ### Data Agent (`src/agents/data_agent.py`)
-- Pulls CoinDCX's public market endpoints (ticker, orderbook, candles).
+- Pulls CoinDCX's public market endpoints (ticker, candles).
 - Each cycle: fetches 24h ticker volume for all INR pairs, selects the
-  **top 10 by volume**, pulls candles/orderbook for those 10. (Resolved
-  decision — see §9: dynamic top-10-by-volume, not a fixed pair list.)
+  **top 10 by volume** (Resolved decision — see §9: dynamic
+  top-10-by-volume, not a fixed pair list), pulls candles for each of
+  `FEATURE_TIMEFRAMES` (**configurable**, default `5m,15m,1h,4h`) at
+  `FEATURE_CANDLE_LIMIT` (default 250) candles per timeframe.
+- No orderbook fetch — nothing in the pipeline consumes book depth
+  (`PaperExecutionAgent` uses a flat slippage bps, `RealExecutionAgent`
+  trades at market), so it was dropped as a dead API call.
 - No auth required (public endpoints only).
 
-### Signal Agent (`src/agents/signal_agent.py`)
-- For each of the top-10 candidates, calls the LLM (via Groq, see §4)
-  with market data + the active strategy version's prompt/params.
-- Returns a signal per symbol: direction, confidence, reasoning text.
-  Reasoning text is always persisted (`trades.reasoning_text`).
+### Feature Engine (`src/features/feature_engine.py`)
+- Pure functions, no trading decisions: EMA (20/50/100/200), RSI, MACD +
+  histogram, Stochastic RSI, ATR (+ ATR%), Bollinger Band width (as a
+  %, comparable across differently-priced symbols), relative volume,
+  volume spike, OBV (+ short-window rising/falling), support/resistance
+  (lookback min/max), ADX/+DI/-DI, and a volatility regime bucket
+  (low/medium/high). Every period/threshold is a named `src/config.py`
+  constant (`RSI_PERIOD`, `ATR_PERIOD`, `EMA_TREND_PERIOD_1..4`, etc.) —
+  nothing is a bare literal.
+- Computed once per configured timeframe (`compute_multi_timeframe_features`)
+  from that timeframe's own candles alone. Never raises on short
+  history — every indicator degrades to `None` instead, so a thin/new
+  listing doesn't crash the cycle.
+
+### Opportunity Scorer (`src/features/opportunity_scorer.py`)
+- Deterministic, zero AI/LLM/randomness. Blends Feature Engine output
+  into 5 sub-scores (trend/momentum/volume/volatility/risk, each 0–100)
+  via fixed formulas over named config weights/thresholds
+  (`OPPORTUNITY_WEIGHT_*`, `RSI_SCORE_FLOOR/CEIL`, `TIMEFRAME_WEIGHTS`,
+  etc. — see `.env.example` for the full list), then a weighted
+  `opportunity_score` (0–100) from the 5 sub-scores.
+- Every aggregation step (timeframe components → a timeframe's
+  sub-score, per-timeframe scores → the blended sub-score, sub-scores →
+  the final score) goes through one shared weighted-average helper that
+  renormalizes among whatever inputs are actually available — a missing
+  indicator never fabricates a 0, it's excluded and the remaining
+  weights renormalize. Result is `None` only if literally nothing was
+  computable for that symbol.
+- `select_top_candidates`: filters not-held symbols to
+  `opportunity_score >= MIN_OPPORTUNITY_SCORE` (default 60), sorts
+  descending, keeps the top `TOP_N_CANDIDATES` (default 5, **configurable**).
+  A held position whose recomputed score falls below
+  `EXIT_SCORE_THRESHOLD` (default 40) becomes an LLM exit-validation
+  candidate. The gap between the two thresholds is a deliberate
+  hysteresis band — a symbol scoring in between is never simultaneously
+  too-weak-to-enter and forced-to-exit-if-held.
+
+### Signal Agent (`src/agents/signal_agent.py`) — LLM validation gate
+- `validate_opportunity(opportunity_summary, strategy_prompt, context)`
+  is the only entry point now (`context` is `"entry"` or `"exit"`).
+  Receives a curated digest (symbol, opportunity_score, the 5 sub-scores,
+  volatility label, support/resistance, ADX, volume spike, and —
+  exit-context only — the held position's entry price/qty/unrealized
+  PnL%) — **never raw candles, never the full multi-timeframe feature
+  dump**.
+- Asks the LLM to accept or reject, with reasoning/risks/expected
+  duration/invalidation point; only `decision` and `reasoning` drive
+  control flow, the full verdict is stored losslessly as jsonb
+  (`opportunity_evaluations.llm_raw_response`).
+- Fails **closed**: an unparseable response or every model in the
+  fallback chain failing both resolve to `decision: "reject"` — the LLM
+  is a gate now, not the primary decision-maker, so a broken gate must
+  not silently let a trade through.
+- `reasoning` is what gets persisted to `trades.reasoning_text` on an
+  accepted entry/exit — same column, same dashboard rendering as before.
 
 ### Risk Manager Agent (`src/agents/risk_manager.py`)
 - **Safety-critical — build and unit-test this first (build order step 6).**
@@ -82,8 +151,10 @@ runs to completion and exits — no long-running process (see §7).
 - Owns the circuit-breaker: tracks realized PnL for the current IST
   trading day, flips `circuit_breaker_triggered` and instructs Execution
   Agent to flatten when `max_daily_loss` is breached.
-- From the top-10 signals, only takes symbols with an open sizing slot
-  and a non-flat signal; ties broken by signal confidence.
+- Only sizes a position once the Opportunity Scorer has ranked the
+  symbol a top candidate AND the Signal Agent's LLM validation has
+  accepted it (§3) — ranking/ties are the Opportunity Scorer's job
+  (`opportunity_score`, descending), not this module's.
 - Per-trade stop-loss/take-profit (`exit_reason()`): the active strategy
   version's `params_json.stop_loss_pct`/`take_profit_pct` (decimal
   fraction of entry price, e.g. `0.02` = 2%) are enforced against every
@@ -143,9 +214,20 @@ runs to completion and exits — no long-running process (see §7).
 ### Orchestrator (`src/orchestrator.py`)
 - Single script invocation, one full cycle, then exit. Invoked per mode
   (paper, real) — real invocation is a no-op if no version is promoted.
-- Sequence: check circuit-breaker state for today → Data Agent → Signal
-  Agent → Risk Manager → Execution Agent → persist to `trades` /
-  `daily_pnl` / `agent_logs`.
+- Sequence: check circuit-breaker state for today → stop-loss/take-profit
+  sweep (`_sweep_stop_loss_take_profit`, zero LLM) → circuit-breaker
+  recheck → Data Agent → **Pass 1** (pure, no LLM): Feature Engine +
+  Opportunity Scorer score every scanned symbol, split into
+  not-held/held, `select_top_candidates` picks the entry candidate set →
+  **Pass 2**: for each scanned symbol, circuit-breaker check (same
+  position as before every buy, preserved from the original design) →
+  entry candidates and score-deteriorated held positions go to Signal
+  Agent validation → accepted entries go through Risk Manager → Execution
+  Agent → every symbol reaching Pass 2 gets exactly one
+  `opportunity_evaluations` row logged regardless of outcome (most with
+  `llm_decision = null` — the checkable proof LLM call volume actually
+  dropped), plus `trades` / `daily_pnl` / `agent_logs` / `model_usage` as
+  before.
 
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
@@ -267,6 +349,29 @@ model_usage (
   latency_ms     int not null,
   success        boolean not null
 )
+
+-- opportunity_evaluations: one row per scanned symbol per cycle,
+-- logged regardless of outcome (0004_opportunity_evaluations.sql)
+opportunity_evaluations (
+  id                  bigserial primary key,
+  timestamp           timestamptz not null default now(),
+  mode                text not null,
+  symbol              text not null,
+  version_id          bigint not null references strategy_versions(id),
+  features            jsonb not null,          -- compute_multi_timeframe_features() output
+  trend_score         numeric,
+  momentum_score      numeric,
+  volume_score        numeric,
+  volatility_score    numeric,
+  risk_score          numeric,
+  opportunity_score   numeric,
+  llm_decision        text,                    -- 'accept' | 'reject' | null (null = never reached LLM)
+  llm_reasoning       text,
+  llm_raw_response    jsonb,                   -- full parsed verdict, null when no LLM call
+  risk_manager_result text,                    -- 'size' | 'block_circuit_breaker' | 'block_max_positions' | 'block_capital_limit' | null
+  final_decision      text not null,           -- 'buy' | 'sell' | 'hold' | 'circuit_breaker'
+  reason              text
+)
 ```
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
@@ -346,7 +451,7 @@ funds exist, before trusting it beyond the promotion gate.
 │   ├── orchestrator.py
 │   ├── agents/
 │   │   ├── data_agent.py
-│   │   ├── signal_agent.py
+│   │   ├── signal_agent.py          # LLM validation gate, not primary decision-maker
 │   │   ├── risk_manager.py
 │   │   ├── evolution_agent.py
 │   │   ├── reporting_agent.py
@@ -354,10 +459,16 @@ funds exist, before trusting it beyond the promotion gate.
 │   │       ├── base.py
 │   │       ├── paper.py
 │   │       └── real.py
+│   ├── features/                    # deterministic, zero-LLM scoring pipeline
+│   │   ├── feature_engine.py
+│   │   └── opportunity_scorer.py
 │   └── db/
 │       ├── models.py
 │       └── migrations/
-│           └── 0001_init.sql
+│           ├── 0001_init.sql
+│           ├── 0002_rls.sql
+│           ├── 0003_pause_flag.sql
+│           └── 0004_opportunity_evaluations.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

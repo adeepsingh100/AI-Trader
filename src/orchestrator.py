@@ -1,16 +1,23 @@
-"""One full cycle: data -> signal -> risk -> execute -> log. Single
-invocation, runs to completion, exits — see PROJECT_SPEC.md §5.
+"""One full cycle: scan -> feature engine -> opportunity score -> top
+candidates -> LLM validation -> risk -> execute -> log. Single invocation,
+runs to completion, exits — see PROJECT_SPEC.md §5.
 
-Spot-only: a "sell" signal closes an existing held position for that
-symbol (there's no shorting on CoinDCX spot). A "buy" opens one if the
-Risk Manager clears it. Circuit breaker is checked before every buy,
-not just once at cycle start, since a loss realized earlier in the same
-cycle must stop later buys in that same cycle.
+Quant-first: OpportunityScorer (src/features/) deterministically scores
+every scanned symbol, zero LLM calls. Only the top-scoring not-held
+candidates (TOP_N_CANDIDATES) and held positions whose score has fallen
+below EXIT_SCORE_THRESHOLD go to the LLM for accept/reject validation —
+the LLM never sees raw candles and never picks direction on its own.
+
+Spot-only: an accepted exit closes an existing held position for that
+symbol (there's no shorting on CoinDCX spot). An accepted entry opens one
+if the Risk Manager clears it. Circuit breaker is checked before every
+buy, not just once at cycle start, since a loss realized earlier in the
+same cycle must stop later buys in that same cycle.
 
 Stop-loss/take-profit (from the active version's params_json) is swept
 every cycle too, and doesn't wait on the LLM to say "sell" — see
 run_risk_check() below, which does only that sweep with no LLM calls,
-meant for a tighter cron than the full LLM signal cycle."""
+meant for a tighter cron than the full LLM validation cycle."""
 
 from __future__ import annotations
 
@@ -24,11 +31,22 @@ from src.agents.risk_manager import (
     target_hit,
     today_ist,
 )
-from src.agents.signal_agent import get_signal
+from src.agents.signal_agent import validate_opportunity
 from src.coindcx_client import get_ticker
+from src.config import EXIT_SCORE_THRESHOLD, TIMEFRAME_WEIGHTS
 from src.db import models
+from src.features.feature_engine import compute_multi_timeframe_features
+from src.features.opportunity_scorer import score_opportunity, select_top_candidates
 
 MODE = "paper"
+
+# The blend across timeframes weights every configured timeframe, but a
+# few point-in-time context fields in the LLM summary (support/resistance,
+# volatility label, ADX) can't be blended — they're read from whichever
+# configured timeframe carries the most weight, since that's the one the
+# scoring itself trusts most. Dynamic, not hardcoded to a specific string,
+# so re-weighting TIMEFRAME_WEIGHTS in config also moves this.
+_PRIMARY_TIMEFRAME = max(TIMEFRAME_WEIGHTS, key=TIMEFRAME_WEIGHTS.get)
 
 
 def _empty_daily_pnl() -> dict:
@@ -67,6 +85,42 @@ def _sweep_stop_loss_take_profit(
         del open_by_symbol[trade["symbol"]]
 
     return closed, daily_pnl
+
+
+def _opportunity_summary(record: dict, held: dict | None = None) -> dict:
+    """Curated digest for the LLM — never the raw multi-timeframe feature
+    dump (160+ floats), which would strain the token budget for no gain
+    over what a human/LLM actually needs to judge the call."""
+    primary = record["features_by_tf"].get(_PRIMARY_TIMEFRAME) or {}
+    summary = {
+        "symbol": record["symbol"],
+        "last_price": record["market"]["last_price"],
+        "opportunity_score": record["opportunity_score"],
+        "sub_scores": {
+            "trend": record["trend_score"],
+            "momentum": record["momentum_score"],
+            "volume": record["volume_score"],
+            "volatility": record["volatility_score"],
+            "risk": record["risk_score"],
+        },
+        "volatility_label": primary.get("volatility_regime"),
+        "support": primary.get("support"),
+        "resistance": primary.get("resistance"),
+        "distance_from_resistance_pct": primary.get("distance_from_resistance_pct"),
+        "volume_spike": primary.get("volume_spike"),
+        "adx": primary.get("adx"),
+        "di_plus": primary.get("di_plus"),
+        "di_minus": primary.get("di_minus"),
+    }
+    if held is not None:
+        entry_price = held["entry_price"]
+        last_price = record["market"]["last_price"]
+        summary["held_position"] = {
+            "entry_price": entry_price,
+            "qty": held["qty"],
+            "unrealized_pnl_pct": (last_price - entry_price) / entry_price * 100 if entry_price else None,
+        }
+    return summary
 
 
 def _record_close(mode: str, capital_config: dict, trade: dict, fill: dict, daily_pnl: dict):
@@ -146,50 +200,105 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
     snapshot = get_market_snapshot(n_symbols)
 
+    # Pass 1: pure, no LLM, no side effects — score every scanned symbol.
+    scored = []
     for market in snapshot:
+        features_by_tf = compute_multi_timeframe_features(market["candles_by_timeframe"])
+        scores = score_opportunity(features_by_tf)
+        scored.append(
+            {"symbol": market["symbol"], "market": market, "features_by_tf": features_by_tf, **scores}
+        )
+
+    not_held = [r for r in scored if r["symbol"] not in open_by_symbol]
+    candidate_symbols = {r["symbol"] for r in select_top_candidates(not_held)}
+
+    # Pass 2: LLM validation only for entry candidates and held positions
+    # whose score has deteriorated past the exit threshold — everyone else
+    # is logged with no LLM call at all.
+    for record in scored:
         if circuit_breaker_triggered(daily_pnl, capital_config):
             execution_agent.flatten_all(mode)
             break
 
-        signal, usage_events = get_signal(market, version["prompt_text"])
-        models.log_model_usage(usage_events)
+        symbol = record["symbol"]
+        market = record["market"]
+        held = open_by_symbol.get(symbol)
+        opportunity_score = record["opportunity_score"]
 
-        held = open_by_symbol.get(market["symbol"])
+        llm_decision = llm_reasoning = llm_raw_response = risk_manager_result = None
+        final_decision, reason = "hold", None
 
-        if signal["direction"] == "sell" and held is not None:
-            fill = execution_agent.place_order(
-                market["symbol"], "sell", held["qty"], market["last_price"]
-            )
-            _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl)
-            closed.append(held)
-            open_trades.remove(held)
-            del open_by_symbol[market["symbol"]]
-            continue
+        if held is None and symbol in candidate_symbols:
+            summary = _opportunity_summary(record)
+            verdict, usage_events = validate_opportunity(summary, version["prompt_text"], context="entry")
+            models.log_model_usage(usage_events)
+            llm_decision = verdict.get("decision")
+            llm_reasoning = verdict.get("reasoning")
+            llm_raw_response = verdict
 
-        if signal["direction"] != "buy" or held is not None:
-            continue  # flat, sell-with-nothing-held, or already holding (no pyramiding)
+            if llm_decision == "accept":
+                decision = evaluate(capital_config, daily_pnl, open_trades, market["last_price"])
+                risk_manager_result = decision.action
+                if decision.action == "size":
+                    fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
+                    trade = models.open_trade(
+                        mode=mode,
+                        version_id=version["id"],
+                        symbol=symbol,
+                        side="buy",
+                        qty=decision.qty,
+                        entry_price=fill["fill_price"],
+                        fees=fill["fees"],
+                        reasoning_text=llm_reasoning,
+                    )
+                    models.log_agent_event("orchestrator", "info", f"opened buy {symbol}")
+                    opened.append(trade)
+                    open_trades.append(trade)
+                    open_by_symbol[symbol] = trade
+                    final_decision, reason = "buy", llm_reasoning
+                else:
+                    reason = f"risk_manager blocked: {decision.action}"
+            else:
+                reason = llm_reasoning or "llm rejected entry"
 
-        decision = evaluate(capital_config, daily_pnl, open_trades, market["last_price"])
-        if decision.action != "size":
-            continue
+        elif held is not None and opportunity_score is not None and opportunity_score < EXIT_SCORE_THRESHOLD:
+            summary = _opportunity_summary(record, held=held)
+            verdict, usage_events = validate_opportunity(summary, version["prompt_text"], context="exit")
+            models.log_model_usage(usage_events)
+            llm_decision = verdict.get("decision")
+            llm_reasoning = verdict.get("reasoning")
+            llm_raw_response = verdict
 
-        fill = execution_agent.place_order(
-            market["symbol"], "buy", decision.qty, market["last_price"]
-        )
-        trade = models.open_trade(
+            if llm_decision == "accept":
+                fill = execution_agent.place_order(symbol, "sell", held["qty"], market["last_price"])
+                _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl)
+                closed.append(held)
+                open_trades.remove(held)
+                del open_by_symbol[symbol]
+                final_decision, reason = "sell", llm_reasoning
+            else:
+                reason = llm_reasoning or "llm rejected exit"
+        else:
+            reason = "not_a_candidate" if held is None else "score_above_exit_threshold_or_unavailable"
+
+        models.log_opportunity_evaluation(
             mode=mode,
+            symbol=symbol,
             version_id=version["id"],
-            symbol=market["symbol"],
-            side="buy",
-            qty=decision.qty,
-            entry_price=fill["fill_price"],
-            fees=fill["fees"],
-            reasoning_text=signal["reasoning"],
+            features=record["features_by_tf"],
+            trend_score=record["trend_score"],
+            momentum_score=record["momentum_score"],
+            volume_score=record["volume_score"],
+            volatility_score=record["volatility_score"],
+            risk_score=record["risk_score"],
+            opportunity_score=opportunity_score,
+            llm_decision=llm_decision,
+            llm_reasoning=llm_reasoning,
+            llm_raw_response=llm_raw_response,
+            risk_manager_result=risk_manager_result,
+            final_decision=final_decision,
+            reason=reason,
         )
-        models.log_agent_event("orchestrator", "info", f"opened buy {market['symbol']}")
-        opened.append(trade)
-        open_trades.append(trade)
-        open_by_symbol[market["symbol"]] = trade
 
     return {
         "opened": opened,
