@@ -11,6 +11,7 @@ import time
 import requests
 
 from src.config import COINDCX_API_KEY, COINDCX_API_SECRET
+from src.resilience import retry_with_backoff
 
 TICKER_URL = "https://api.coindcx.com/exchange/ticker"
 MARKETS_DETAILS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
@@ -18,17 +19,29 @@ ORDERBOOK_URL = "https://public.coindcx.com/market_data/orderbook"
 CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 AUTH_BASE_URL = "https://api.coindcx.com"
 
+# Retried below: every plain read (idempotent, safe to repeat on a
+# transient network blip). create_order is deliberately NOT retried — a
+# failed request whose response was lost but which actually succeeded
+# server-side would place a second order on retry, a real double-submission
+# risk unlike a re-read.
+
 
 def get_ticker() -> list[dict]:
-    resp = requests.get(TICKER_URL, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    def _fetch():
+        resp = requests.get(TICKER_URL, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    return retry_with_backoff(_fetch, exceptions=(requests.RequestException,))
 
 
 def get_markets_details() -> list[dict]:
-    resp = requests.get(MARKETS_DETAILS_URL, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    def _fetch():
+        resp = requests.get(MARKETS_DETAILS_URL, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    return retry_with_backoff(_fetch, exceptions=(requests.RequestException,))
 
 
 def top_inr_pairs_by_turnover(n: int = 10, ticker: list[dict] | None = None) -> list[dict]:
@@ -56,17 +69,23 @@ def symbol_to_pair(symbol: str, markets_details: list[dict] | None = None) -> st
 
 
 def get_orderbook(pair: str) -> dict:
-    resp = requests.get(ORDERBOOK_URL, params={"pair": pair}, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    def _fetch():
+        resp = requests.get(ORDERBOOK_URL, params={"pair": pair}, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    return retry_with_backoff(_fetch, exceptions=(requests.RequestException,))
 
 
 def get_candles(pair: str, interval: str = "1m", limit: int = 100) -> list[dict]:
-    resp = requests.get(
-        CANDLES_URL, params={"pair": pair, "interval": interval, "limit": limit}, timeout=10
-    )
-    resp.raise_for_status()
-    return resp.json()
+    def _fetch():
+        resp = requests.get(
+            CANDLES_URL, params={"pair": pair, "interval": interval, "limit": limit}, timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    return retry_with_backoff(_fetch, exceptions=(requests.RequestException,))
 
 
 def _signed_post(path: str, body: dict) -> dict | list:
@@ -86,12 +105,16 @@ def _signed_post(path: str, body: dict) -> dict | list:
 
 
 def get_balances() -> list[dict]:
-    return _signed_post("/exchange/v1/users/balances", {})
+    return retry_with_backoff(
+        lambda: _signed_post("/exchange/v1/users/balances", {}),
+        exceptions=(requests.RequestException,),
+    )
 
 
 def create_order(
     market: str, side: str, total_quantity: float, order_type: str = "market_order"
 ) -> dict:
+    # Deliberately not retried — see the module-level note above.
     return _signed_post(
         "/exchange/v1/orders/create",
         {
@@ -104,4 +127,7 @@ def create_order(
 
 
 def get_order_status(order_id: str) -> dict:
-    return _signed_post("/exchange/v1/orders/status", {"id": order_id})
+    return retry_with_backoff(
+        lambda: _signed_post("/exchange/v1/orders/status", {"id": order_id}),
+        exceptions=(requests.RequestException,),
+    )

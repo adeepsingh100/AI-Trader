@@ -21,19 +21,33 @@ meant for a tighter cron than the full LLM validation cycle."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from src.agents.data_agent import get_market_snapshot
 from src.agents.execution.paper import PaperExecutionAgent
 from src.agents.execution.real import RealExecutionAgent
 from src.agents.risk_manager import (
     circuit_breaker_triggered,
+    committed_capital,
     evaluate,
     exit_reason,
     target_hit,
     today_ist,
 )
 from src.agents.signal_agent import validate_opportunity
+from src.audit.trail import config_version
 from src.coindcx_client import get_ticker
-from src.config import EXIT_SCORE_THRESHOLD, MIN_FINAL_CONFIDENCE
+from src.config import (
+    BUCKET_MODIFIER_CAP,
+    BUCKET_MODIFIER_SENSITIVITY,
+    EXIT_SCORE_THRESHOLD,
+    LEARNING_CATCHUP_LOOKBACK_HOURS,
+    MIN_FINAL_CONFIDENCE,
+    RECENT_PERFORMANCE_LOOKBACK_TRADES,
+    RECENT_STREAK_LOSS_MODIFIER_CAP,
+    RECENT_STREAK_WIN_MODIFIER_CAP,
+    RECOMMENDATION_MIN_SAMPLE_SIZE,
+)
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
 from src.features.opportunity_scorer import (
@@ -42,8 +56,10 @@ from src.features.opportunity_scorer import (
     select_top_candidates,
 )
 from src.learning.confidence_calibration import calibrate_confidence
-from src.learning.statistics import process_closed_trades
+from src.learning.statistics import process_closed_trades, streaks
 from src.learning.trade_memory import find_similar_trades
+from src.monitoring.metrics import log_resource_snapshot, track
+from src.portfolio.intelligence import Position, correlation, returns_series
 
 MODE = "paper"
 
@@ -69,6 +85,90 @@ def _update_excursion(open_trades: list[dict], prices: dict) -> None:
         if new_mfe != prior_mfe or new_mae != prior_mae:
             models.update_trade_excursion(trade["id"], new_mfe, new_mae)
             trade["mfe_pct"], trade["mae_pct"] = new_mfe, new_mae
+
+
+def _bucket_modifier(bucket_stats_by_value: dict, value: str | None, overall_win_rate: float | None) -> float | None:
+    """Adaptive confidence chain (Step 7): how much better/worse this
+    regime's or symbol's win rate is than the overall baseline, scaled
+    and capped. None (no contribution) unless the bucket has enough
+    samples to trust — never nudges confidence from a handful of trades."""
+    if value is None or overall_win_rate is None:
+        return None
+    row = bucket_stats_by_value.get(value)
+    if row is None:
+        return None
+    win_rate = row.get("win_rate")
+    trades_count = row.get("trades_count") or 0
+    if win_rate is None or trades_count < RECOMMENDATION_MIN_SAMPLE_SIZE:
+        return None
+    raw = (win_rate - overall_win_rate) * BUCKET_MODIFIER_SENSITIVITY
+    return max(-BUCKET_MODIFIER_CAP, min(BUCKET_MODIFIER_CAP, raw))
+
+
+def _recent_performance_modifier(mode: str) -> float | None:
+    """Adaptive confidence chain (Step 7): current win/loss streak over
+    the last RECENT_PERFORMANCE_LOOKBACK_TRADES closed trades, scaled to
+    the streak length and capped — deliberately asymmetric (a losing
+    streak can suppress confidence more than a winning streak inflates
+    it). Computed once per cycle, not per candidate."""
+    since = datetime.now(timezone.utc) - timedelta(hours=LEARNING_CATCHUP_LOOKBACK_HOURS)
+    recent = sorted(
+        (t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None),
+        key=lambda t: t["closed_at"],
+    )[-RECENT_PERFORMANCE_LOOKBACK_TRADES:]
+    if not recent:
+        return None
+
+    streak = streaks(recent)
+    length_fraction = streak["current_streak_length"] / RECENT_PERFORMANCE_LOOKBACK_TRADES
+    if streak["current_streak_type"] == "loss":
+        return -min(RECENT_STREAK_LOSS_MODIFIER_CAP, length_fraction * RECENT_STREAK_LOSS_MODIFIER_CAP)
+    if streak["current_streak_type"] == "win":
+        return min(RECENT_STREAK_WIN_MODIFIER_CAP, length_fraction * RECENT_STREAK_WIN_MODIFIER_CAP)
+    return None
+
+
+def _price_history_from_snapshot(scored: list[dict]) -> dict[str, list[float]]:
+    """Daily closes for every symbol scanned this cycle — already-fetched
+    data (market["candles_by_timeframe"]["1d"]), no extra API calls.
+    Symbols not in this cycle's top-N snapshot (a held position that's
+    fallen out of top turnover) simply aren't keys here; Portfolio
+    Intelligence degrades correlation/beta for them to None rather than
+    guessing — concentration/sector checks don't need price history at
+    all, so they're unaffected."""
+    history: dict[str, list[float]] = {}
+    for r in scored:
+        daily = r["market"]["candles_by_timeframe"].get("1d")
+        if daily:
+            history[r["symbol"]] = [c["close"] for c in daily if c.get("close") is not None]
+    return history
+
+
+def _portfolio_positions(open_trades: list[dict], last_prices: dict[str, float]) -> list[Position]:
+    """Current price falls back to entry_price for a held symbol this
+    cycle's snapshot didn't cover — an approximation (not a fresh ticker
+    price), but keeps concentration math running rather than skipping a
+    position it does hold."""
+    return [
+        Position(t["symbol"], t["qty"], t["entry_price"], last_prices.get(t["symbol"], t["entry_price"]))
+        for t in open_trades
+    ]
+
+
+def _avg_correlation_with_book(symbol: str, open_trades: list[dict], price_history: dict[str, list[float]]) -> float | None:
+    candidate_prices = price_history.get(symbol)
+    if not candidate_prices:
+        return None
+    candidate_returns = returns_series(candidate_prices)
+    correlations = []
+    for t in open_trades:
+        held_prices = price_history.get(t["symbol"])
+        if not held_prices or t["symbol"] == symbol:
+            continue
+        c = correlation(candidate_returns, returns_series(held_prices))
+        if c is not None:
+            correlations.append(c)
+    return sum(correlations) / len(correlations) if correlations else None
 
 
 def _sweep_stop_loss_take_profit(
@@ -203,7 +303,18 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
         version = models.get_latest_version()
         if version is None:
-            raise RuntimeError("no strategy_versions row — create one first")
+            # Two different situations share "no active version": never
+            # bootstrapped at all (seed_config.py never ran — a real setup
+            # error, still worth a loud crash) vs. every existing version
+            # is suspended (Strategy Health Engine, PROJECT_SPEC.md §3d —
+            # a legitimate, reversible outcome that must no-op, not
+            # crash-loop the cron every 10 minutes).
+            if not models.get_all_strategy_versions():
+                raise RuntimeError("no strategy_versions row — create one first")
+            models.log_agent_event(
+                "orchestrator", "info", "paper mode: every strategy version is suspended, skipping"
+            )
+            return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_active_version"}
 
     if execution_agent is None:
         execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
@@ -227,7 +338,8 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         execution_agent.flatten_all(mode)
         return {"opened": opened, "closed": closed, "circuit_breaker": True}
 
-    snapshot = get_market_snapshot(n_symbols)
+    with track("data_agent", "market_snapshot"):
+        snapshot = get_market_snapshot(n_symbols)
 
     # Pass 1: pure, no LLM, no side effects — score every scanned symbol.
     scored = []
@@ -241,13 +353,39 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
     not_held = [r for r in scored if r["symbol"] not in open_by_symbol]
     candidate_symbols = {r["symbol"] for r in select_top_candidates(not_held)}
 
+    # Adaptive confidence chain (Step 7) inputs — fetched once per cycle,
+    # not once per candidate (Step 13: cached/batched, not redundant
+    # per-candidate queries). overall_win_rate uses the active version's
+    # own learning_statistics bucket (already computed, already cached)
+    # as the baseline regime/symbol win rates are compared against,
+    # rather than a fresh full-trades scan every cycle.
+    regime_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="market_regime")}
+    symbol_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="symbol")}
+    version_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="strategy_version")}
+    overall_row = version_stats.get(str(version["id"]))
+    overall_win_rate = overall_row.get("win_rate") if overall_row else None
+    recent_performance_modifier = _recent_performance_modifier(mode)
+
+    # Portfolio Intelligence + Capital Allocation inputs (PROJECT_SPEC.md
+    # §3d) — built once per cycle from data already fetched this cycle
+    # (no extra API calls), reused by every candidate's risk_manager.evaluate
+    # call below.
+    price_history = _price_history_from_snapshot(scored)
+    last_price_by_symbol = {r["symbol"]: r["market"]["last_price"] for r in scored}
+
     # Pass 2: LLM validation only for entry candidates and held positions
     # whose score has deteriorated past the exit threshold — everyone else
     # is logged with no LLM call at all.
-    for record in scored:
-        if circuit_breaker_triggered(daily_pnl, capital_config):
-            execution_agent.flatten_all(mode)
-            break
+    #
+    # Per-symbol fault isolation (Resilience, PROJECT_SPEC.md §3d): the body
+    # is a nested function so one symbol's exception (a malformed LLM
+    # response, a transient execution error) can be caught and logged by
+    # the loop below without aborting every remaining symbol in the cycle —
+    # a confirmed real gap before this. `nonlocal daily_pnl` is needed
+    # because the exit branch reassigns it (via _record_close) and that
+    # update must be visible to the next iteration's circuit-breaker check.
+    def _process_candidate(record: dict) -> None:
+        nonlocal daily_pnl
 
         symbol = record["symbol"]
         market = record["market"]
@@ -269,7 +407,16 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             llm_raw_response = verdict
 
             historical_confidence = similar["win_rate"] * 100 if similar["win_rate"] is not None else None
-            calibrated = calibrate_confidence(verdict.get("confidence"), historical_confidence, similar["count"])
+            regime_modifier = _bucket_modifier(regime_stats, record["market_regime"], overall_win_rate)
+            symbol_modifier = _bucket_modifier(symbol_stats, symbol, overall_win_rate)
+            calibrated = calibrate_confidence(
+                verdict.get("confidence"),
+                historical_confidence,
+                similar["count"],
+                regime_modifier=regime_modifier,
+                symbol_modifier=symbol_modifier,
+                recent_performance_modifier=recent_performance_modifier,
+            )
             calibration_to_log = {
                 "ai_confidence": verdict.get("confidence"),
                 "historical_confidence": historical_confidence,
@@ -277,13 +424,42 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 "historical_weight": calibrated["historical_weight_used"],
                 "final_confidence": calibrated["final_confidence"],
                 "similar_trades_count": similar["count"],
+                "regime_modifier": calibrated["regime_modifier"],
+                "symbol_modifier": calibrated["symbol_modifier"],
+                "recent_performance_modifier": calibrated["recent_performance_modifier"],
             }
             confidence_cleared = (
                 calibrated["final_confidence"] is None or calibrated["final_confidence"] >= MIN_FINAL_CONFIDENCE
             )
 
             if llm_decision == "accept" and confidence_cleared:
-                decision = evaluate(capital_config, daily_pnl, open_trades, market["last_price"])
+                capital_to_use = capital_config.get("capital_to_use") or 0
+                sizing_context = {
+                    "avg_correlation": _avg_correlation_with_book(symbol, open_trades, price_history),
+                    "candidate_volatility_pct": (record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}).get("atr_pct"),
+                    # Not computed live yet — no live mark-to-market equity
+                    # curve exists to derive it from (that's backtest-only,
+                    # src/backtest/portfolio_manager.py); the drawdown
+                    # factor defaults to neutral (1.0) rather than a
+                    # fabricated estimate.
+                    "recent_drawdown_pct": None,
+                    "current_exposure_pct": (
+                        committed_capital(open_trades) / capital_to_use * 100 if capital_to_use else None
+                    ),
+                    "strategy_win_rate": overall_win_rate,
+                    "market_regime": record["market_regime"],
+                    "confidence": calibrated["final_confidence"],
+                }
+                decision = evaluate(
+                    capital_config,
+                    daily_pnl,
+                    open_trades,
+                    market["last_price"],
+                    symbol=symbol,
+                    portfolio_positions=_portfolio_positions(open_trades, last_price_by_symbol),
+                    price_history=price_history,
+                    sizing_context=sizing_context,
+                )
                 risk_manager_result = decision.action
                 if decision.action == "size":
                     fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
@@ -356,13 +532,27 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             final_decision=final_decision,
             reason=reason,
             trade_id=trade_id,
+            market_regime=record["market_regime"],
+            config_version=config_version(),
         )
         if calibration_to_log is not None:
             models.log_confidence_calibration(
                 opportunity_evaluation_id=evaluation_row["id"], **calibration_to_log
             )
 
+    for record in scored:
+        if circuit_breaker_triggered(daily_pnl, capital_config):
+            execution_agent.flatten_all(mode)
+            break
+        try:
+            _process_candidate(record)
+        except Exception as e:
+            models.log_agent_event(
+                "orchestrator", "error", f"{record['symbol']}: {type(e).__name__}: {e}"
+            )
+
     process_closed_trades(mode)
+    log_resource_snapshot("orchestrator")
 
     return {
         "opened": opened,

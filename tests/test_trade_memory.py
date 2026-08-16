@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from src.learning.trade_memory import _distance, find_similar_trades
+from src.learning.trade_memory import _distance, _feature_importance_weights, find_similar_trades
 
 
 def _eval_row(trade_id, **scores):
@@ -132,3 +132,36 @@ def test_find_similar_trades_empty_when_no_candidates(mock_models):
         "avg_loss_pct": None,
         "avg_holding_time_seconds": None,
     }
+
+
+# --- _feature_importance_weights: reads the nightly-cached sub-score
+# correlations (feature_importance table, timeframe="blended"), no longer
+# a permanent no-op stub ---
+
+
+@patch("src.learning.trade_memory.models")
+def test_feature_importance_weights_none_when_nothing_cached(mock_models):
+    mock_models.get_feature_importance.return_value = []
+    assert _feature_importance_weights("paper") is None
+    mock_models.get_feature_importance.assert_called_once_with("paper", timeframe="blended")
+
+
+@patch("src.learning.trade_memory.models")
+def test_feature_importance_weights_none_when_all_correlations_non_positive(mock_models):
+    mock_models.get_feature_importance.return_value = [
+        {"feature_name": "trend_score", "correlation_score": -0.2},
+        {"feature_name": "momentum_score", "correlation_score": 0.0},
+    ]
+    assert _feature_importance_weights("paper") is None
+
+
+@patch("src.learning.trade_memory.models")
+def test_feature_importance_weights_normalizes_positive_correlations(mock_models):
+    mock_models.get_feature_importance.return_value = [
+        {"feature_name": "trend_score", "correlation_score": 0.4},
+        {"feature_name": "momentum_score", "correlation_score": 0.2},
+        {"feature_name": "volume_score", "correlation_score": -0.1},  # floored to 0
+        {"feature_name": "rsi", "correlation_score": 0.9},  # not a sub-score key, ignored
+    ]
+    weights = _feature_importance_weights("paper")
+    assert weights == pytest.approx({"trend_score": 2 / 3, "momentum_score": 1 / 3, "volume_score": 0.0})

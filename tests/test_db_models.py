@@ -5,12 +5,13 @@ from src.groq_client import ModelUsageEvent
 
 
 def _fluent_mock(execute_result):
-    """A mock whose chained methods (select/eq/insert/update/upsert/order/
-    limit/in_/gte) all return itself, so call args land on the same mock
-    and .execute() returns a fixed result."""
+    """A mock whose chained methods (select/eq/neq/insert/update/upsert/
+    order/limit/in_/gte) all return itself, so call args land on the same
+    mock and .execute() returns a fixed result."""
     m = Mock()
     m.select.return_value = m
     m.eq.return_value = m
+    m.neq.return_value = m
     m.insert.return_value = m
     m.update.return_value = m
     m.upsert.return_value = m
@@ -250,9 +251,22 @@ def test_upsert_feature_importance_conflict_key(monkeypatch):
     client = Mock(table=Mock(return_value=table))
     monkeypatch.setattr(models, "get_client", lambda: client)
 
-    models.upsert_feature_importance("paper", "rsi", 0.42, 30)
+    models.upsert_feature_importance("paper", "rsi", 0.42, 30, "1h")
 
-    assert table.upsert.call_args.kwargs["on_conflict"] == "mode,feature_name"
+    inserted = table.upsert.call_args[0][0]
+    assert inserted["timeframe"] == "1h"
+    assert table.upsert.call_args.kwargs["on_conflict"] == "mode,feature_name,timeframe"
+
+
+def test_get_feature_importance_filters_by_timeframe(monkeypatch):
+    table = _fluent_mock([{"feature_name": "trend_score", "timeframe": "blended"}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.get_feature_importance("paper", timeframe="blended")
+
+    table.eq.assert_any_call("timeframe", "blended")
+    assert result == [{"feature_name": "trend_score", "timeframe": "blended"}]
 
 
 # --- confidence_calibration ---

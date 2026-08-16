@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from src.orchestrator import run_cycle, run_risk_check
+from src.orchestrator import _bucket_modifier, _recent_performance_modifier, run_cycle, run_risk_check
 
 
 def _capital_config(**overrides):
@@ -63,7 +63,14 @@ def _permissive_calibration():
     # final_confidence=None -> the MIN_FINAL_CONFIDENCE gate treats "no
     # signal" as passing, matching every pre-existing accept-path test's
     # expectations without needing to reason about confidence at all.
-    return {"final_confidence": None, "ai_weight_used": 0.0, "historical_weight_used": 0.0}
+    return {
+        "final_confidence": None,
+        "ai_weight_used": 0.0,
+        "historical_weight_used": 0.0,
+        "regime_modifier": None,
+        "symbol_modifier": None,
+        "recent_performance_modifier": None,
+    }
 
 
 # --- entry: candidate selection + LLM validation + risk manager ---
@@ -233,7 +240,14 @@ def test_run_cycle_confidence_gate_blocks_despite_llm_accept(
     mock_select.return_value = [{"symbol": "BTCINR"}]
     mock_validate.return_value = ({"decision": "accept", "confidence": 30, "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
-    mock_calibrate.return_value = {"final_confidence": 30.0, "ai_weight_used": 1.0, "historical_weight_used": 0.0}
+    mock_calibrate.return_value = {
+        "final_confidence": 30.0,
+        "ai_weight_used": 1.0,
+        "historical_weight_used": 0.0,
+        "regime_modifier": None,
+        "symbol_modifier": None,
+        "recent_performance_modifier": None,
+    }
 
     execution_agent = Mock()
     with patch("src.orchestrator.MIN_FINAL_CONFIDENCE", 50.0):
@@ -538,6 +552,55 @@ def test_run_cycle_logs_every_scanned_symbol_even_without_an_llm_call(
     mock_process.assert_called_once_with("paper")
 
 
+# --- per-symbol fault isolation (Resilience, PROJECT_SPEC.md §3d) ---
+
+
+@patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.calibrate_confidence")
+@patch("src.orchestrator.find_similar_trades")
+@patch("src.orchestrator.validate_opportunity")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+):
+    """A confirmed real gap before this fix: one symbol's exception used
+    to crash the whole cycle, so every remaining symbol never got
+    processed even though the cycle is otherwise safe to retry from a
+    clean DB-read state."""
+    mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_latest_version.return_value = _version()
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_snapshot.return_value = [_market("BTCINR"), _market("ETHINR")]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = [{"symbol": "BTCINR"}, {"symbol": "ETHINR"}]
+    mock_models.open_trade.return_value = {"id": 99}
+    mock_models.log_opportunity_evaluation.return_value = {"id": 501}
+    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
+    mock_calibrate.return_value = _permissive_calibration()
+    # First symbol's similarity lookup blows up; second symbol must still
+    # be processed normally.
+    mock_similar.side_effect = [RuntimeError("boom"), _empty_similar()]
+
+    execution_agent = Mock()
+    execution_agent.place_order.return_value = {"fill_price": 1_000_500, "fees": 1.0}
+
+    result = run_cycle(execution_agent=execution_agent)
+
+    # Second symbol (ETHINR) still opened a trade despite the first
+    # symbol's exception.
+    assert result["opened"] == [{"id": 99}]
+    mock_models.log_agent_event.assert_any_call(
+        "orchestrator", "error", "BTCINR: RuntimeError: boom"
+    )
+    # process_closed_trades still runs at the end — the cycle completed,
+    # it didn't abort.
+    mock_process.assert_called_once_with("paper")
+
+
 # --- real mode / paused / promoted-version routing (unaffected by scoring) ---
 
 
@@ -734,3 +797,115 @@ def test_run_risk_check_updates_excursion_for_open_trades(mock_models, mock_tick
     run_risk_check(execution_agent=Mock())
 
     mock_models.update_trade_excursion.assert_called_once_with(5, pytest.approx(1.0), 0.0)
+
+
+# --- adaptive confidence chain: _bucket_modifier / _recent_performance_modifier ---
+
+
+@patch("src.orchestrator.BUCKET_MODIFIER_SENSITIVITY", 20)
+@patch("src.orchestrator.BUCKET_MODIFIER_CAP", 10)
+@patch("src.orchestrator.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+def test_bucket_modifier_scales_with_win_rate_edge_over_baseline():
+    stats = {"strong_bull": {"win_rate": 0.7, "trades_count": 20}}
+    assert _bucket_modifier(stats, "strong_bull", overall_win_rate=0.5) == pytest.approx(4.0)
+
+
+@patch("src.orchestrator.BUCKET_MODIFIER_SENSITIVITY", 20)
+@patch("src.orchestrator.BUCKET_MODIFIER_CAP", 10)
+@patch("src.orchestrator.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+def test_bucket_modifier_clamped_to_cap():
+    stats = {"strong_bull": {"win_rate": 0.9, "trades_count": 20}}
+    assert _bucket_modifier(stats, "strong_bull", overall_win_rate=0.1) == pytest.approx(10.0)
+
+
+@patch("src.orchestrator.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+def test_bucket_modifier_none_below_sample_floor():
+    stats = {"strong_bull": {"win_rate": 0.9, "trades_count": 5}}
+    assert _bucket_modifier(stats, "strong_bull", overall_win_rate=0.1) is None
+
+
+def test_bucket_modifier_none_when_value_or_baseline_missing():
+    assert _bucket_modifier({}, None, overall_win_rate=0.5) is None
+    assert _bucket_modifier({}, "strong_bull", overall_win_rate=None) is None
+    assert _bucket_modifier({}, "unknown_regime", overall_win_rate=0.5) is None
+
+
+@patch("src.orchestrator.RECENT_STREAK_WIN_MODIFIER_CAP", 8)
+@patch("src.orchestrator.RECENT_STREAK_LOSS_MODIFIER_CAP", 16)
+@patch("src.orchestrator.RECENT_PERFORMANCE_LOOKBACK_TRADES", 4)
+@patch("src.orchestrator.models")
+def test_recent_performance_modifier_full_winning_streak_hits_cap(mock_models):
+    trades = [
+        {"pnl": 10, "closed_at": f"2026-01-0{i}T00:00:00Z"} for i in range(1, 5)
+    ]
+    mock_models.get_recently_closed_trades.return_value = trades
+    assert _recent_performance_modifier("paper") == pytest.approx(8.0)
+
+
+@patch("src.orchestrator.RECENT_STREAK_WIN_MODIFIER_CAP", 8)
+@patch("src.orchestrator.RECENT_STREAK_LOSS_MODIFIER_CAP", 16)
+@patch("src.orchestrator.RECENT_PERFORMANCE_LOOKBACK_TRADES", 4)
+@patch("src.orchestrator.models")
+def test_recent_performance_modifier_partial_losing_streak_scales_below_cap(mock_models):
+    trades = [
+        {"pnl": 10, "closed_at": "2026-01-01T00:00:00Z"},
+        {"pnl": 10, "closed_at": "2026-01-02T00:00:00Z"},
+        {"pnl": -10, "closed_at": "2026-01-03T00:00:00Z"},
+        {"pnl": -10, "closed_at": "2026-01-04T00:00:00Z"},
+    ]
+    mock_models.get_recently_closed_trades.return_value = trades
+    # current streak = 2 losses out of a 4-trade lookback -> half the cap
+    assert _recent_performance_modifier("paper") == pytest.approx(-8.0)
+
+
+@patch("src.orchestrator.models")
+def test_recent_performance_modifier_none_when_no_recent_trades(mock_models):
+    mock_models.get_recently_closed_trades.return_value = []
+    assert _recent_performance_modifier("paper") is None
+
+
+@patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.calibrate_confidence")
+@patch("src.orchestrator.find_similar_trades")
+@patch("src.orchestrator.validate_opportunity")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+):
+    mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_latest_version.return_value = _version()
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_snapshot.return_value = [_market()]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = [{"symbol": "BTCINR"}]
+    mock_models.open_trade.return_value = {"id": 99}
+    mock_models.log_opportunity_evaluation.return_value = {"id": 501}
+    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
+    mock_similar.return_value = _empty_similar()
+    mock_calibrate.return_value = _permissive_calibration()
+
+    def _learning_stats(mode, dimension_type=None):
+        if dimension_type == "market_regime":
+            return [{"dimension_value": "strong_bull", "win_rate": 0.8, "trades_count": 50}]
+        if dimension_type == "symbol":
+            return [{"dimension_value": "BTCINR", "win_rate": 0.7, "trades_count": 50}]
+        if dimension_type == "strategy_version":
+            return [{"dimension_value": "1", "win_rate": 0.5, "trades_count": 100}]
+        return []
+
+    mock_models.get_learning_statistics.side_effect = _learning_stats
+    mock_models.get_recently_closed_trades.return_value = []
+
+    execution_agent = Mock()
+    execution_agent.place_order.return_value = {"fill_price": 1_000_500, "fees": 1.0}
+
+    run_cycle(execution_agent=execution_agent)
+
+    calibrate_kwargs = mock_calibrate.call_args.kwargs
+    # default BUCKET_MODIFIER_SENSITIVITY=20 -> (0.8-0.5)*20=6.0, (0.7-0.5)*20=4.0
+    assert calibrate_kwargs["regime_modifier"] == pytest.approx(6.0)
+    assert calibrate_kwargs["symbol_modifier"] == pytest.approx(4.0)

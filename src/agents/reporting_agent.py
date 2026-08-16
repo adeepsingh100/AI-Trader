@@ -9,7 +9,7 @@ import html
 
 from src.agents.risk_manager import today_ist
 from src.db import models
-from src.learning.reports import generate_learning_report_html
+from src.learning.reports import generate_adaptive_strategy_report_html, generate_learning_report_html
 
 MODES = ["paper", "real"]
 
@@ -128,6 +128,8 @@ def _mode_section_html(section: dict) -> str:
       {_trade_log_html(section['trades'])}
       <h3>Learning insights</h3>
       {generate_learning_report_html(mode)}
+      <h3>Adaptive strategy recommendations</h3>
+      {generate_adaptive_strategy_report_html(mode)}
     </section>
     """
 

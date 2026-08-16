@@ -26,3 +26,24 @@ jobs:
           OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — pure
+      # statistics, no LLM calls, so no LLM secrets needed. Runs after
+      # evolution_agent so its weight/threshold recommendations and
+      # feature-importance rows are already fresh for the day.
+      - run: python -m src.learning.adaptive_strategy_engine
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Feature Drift Detection + Strategy Health Engine (PROJECT_SPEC.md
+      # §3d) — each its own step, after but never merged into the two
+      # steps above (same "independent learning steps stay independent"
+      # rule adaptive_strategy_engine already follows). Pure statistics,
+      # no LLM calls, so no LLM secrets needed.
+      - run: python -m src.learning.drift_detection
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - run: python -m src.learning.strategy_health
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

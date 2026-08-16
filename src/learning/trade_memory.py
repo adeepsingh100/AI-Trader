@@ -25,6 +25,7 @@ from src.config import (
     SIMILARITY_TOP_N,
 )
 from src.db import models
+from src.learning.feature_importance import BLENDED_TIMEFRAME, SUB_SCORE_KEYS
 
 _SUB_SCORE_KEYS = ("trend_score", "momentum_score", "volume_score", "volatility_score", "risk_score")
 
@@ -55,13 +56,24 @@ def _distance(a: dict, b: dict, weights: dict[str, float] | None = None) -> floa
 
 
 def _feature_importance_weights(mode: str) -> dict[str, float] | None:
-    # feature_importance is keyed by raw Feature Engine names (rsi, adx,
-    # ...), not the 5 sub-score names compared here — no direct mapping
-    # exists yet, so this is a documented no-op hook (equal weights) until
-    # a future pass maps individual-feature importance onto its parent
-    # sub-score. Kept as its own function so that mapping has one place
-    # to land rather than being inlined into find_similar_trades.
-    return None
+    """Reads the nightly-cached sub-score correlation weights (written by
+    feature_importance.compute_subscore_correlation_weights, keyed by
+    feature_name=trend_score/momentum_score/... at timeframe="blended") —
+    no live recomputation, just a cheap read of a table that already
+    exists. Positive correlations only, normalized to sum 1.0; None if
+    nothing's cached yet or every correlation is <= 0, in which case
+    _distance() falls back to its own equal-weight default."""
+    rows = models.get_feature_importance(mode, timeframe=BLENDED_TIMEFRAME)
+    correlations = {
+        r["feature_name"]: r["correlation_score"]
+        for r in rows
+        if r["feature_name"] in SUB_SCORE_KEYS and r.get("correlation_score") is not None
+    }
+    if not correlations:
+        return None
+    positive = {k: max(0.0, v) for k, v in correlations.items()}
+    total = sum(positive.values())
+    return {k: v / total for k, v in positive.items()} if total > 0 else None
 
 
 def find_similar_trades(

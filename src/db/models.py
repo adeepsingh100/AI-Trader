@@ -11,6 +11,7 @@ from supabase import Client, create_client
 
 from src.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from src.groq_client import ModelUsageEvent
+from src.resilience import retry_with_backoff
 
 _client: Client | None = None
 
@@ -22,11 +23,25 @@ def get_client() -> Client:
     return _client
 
 
+def _execute(builder):
+    """Retries a read/upsert query builder on a transient Supabase error —
+    safe here because select/upsert are naturally idempotent (a repeat
+    doesn't create a second row). Plain .insert() calls are NOT routed
+    through this: a retry after a request whose response was lost but
+    which actually succeeded server-side would insert a duplicate row
+    (a trade, a log line) — a real correctness risk this codebase's own
+    "never fabricate/duplicate financial state" ethos rules out. Applied at
+    the handful of call sites that gate whether a cycle can start at all
+    (capital_config/version/daily_pnl/open_trades reads) rather than
+    mechanically retrofitted across all 55 functions in this file."""
+    return retry_with_backoff(builder.execute)
+
+
 # --- capital_config ---
 
 
 def get_capital_config(mode: str) -> dict | None:
-    res = get_client().table("capital_config").select("*").eq("mode", mode).execute()
+    res = _execute(get_client().table("capital_config").select("*").eq("mode", mode))
     return res.data[0] if res.data else None
 
 
@@ -57,26 +72,29 @@ def upsert_capital_config(
 
 
 def get_latest_version() -> dict | None:
-    res = (
+    # Excludes suspended versions (Strategy Health Engine, PROJECT_SPEC.md
+    # §3d) — without this filter, auto-suspension would be a silent no-op
+    # since this is still an unfiltered "newest row" query otherwise.
+    res = _execute(
         get_client()
         .table("strategy_versions")
         .select("*")
+        .neq("status", "suspended")
         .order("version_number", desc=True)
         .limit(1)
-        .execute()
     )
     return res.data[0] if res.data else None
 
 
 def get_latest_promoted_version() -> dict | None:
-    res = (
+    res = _execute(
         get_client()
         .table("strategy_versions")
         .select("*")
         .eq("promoted_to_real", True)
+        .neq("status", "suspended")
         .order("version_number", desc=True)
         .limit(1)
-        .execute()
     )
     return res.data[0] if res.data else None
 
@@ -180,7 +198,7 @@ def update_trade_excursion(trade_id: int, mfe_pct: float, mae_pct: float) -> Non
 
 
 def get_open_trades(mode: str) -> list[dict]:
-    res = get_client().table("trades").select("*").eq("mode", mode).eq("status", "open").execute()
+    res = _execute(get_client().table("trades").select("*").eq("mode", mode).eq("status", "open"))
     return res.data
 
 
@@ -233,13 +251,12 @@ def get_closed_trades(mode: str, version_id: int) -> list[dict]:
 
 
 def get_daily_pnl(day: Date, mode: str) -> dict | None:
-    res = (
+    res = _execute(
         get_client()
         .table("daily_pnl")
         .select("*")
         .eq("date", day.isoformat())
         .eq("mode", mode)
-        .execute()
     )
     return res.data[0] if res.data else None
 
@@ -332,7 +349,16 @@ def log_opportunity_evaluation(
     final_decision: str,
     reason: str | None,
     trade_id: int | None = None,
+    market_regime: str | None = None,
+    config_version: str | None = None,
 ) -> dict:
+    """market_regime/config_version (Audit System, PROJECT_SPEC.md §3d) —
+    the two fields Step 9's decision-trail needed that weren't already
+    columns here; everything else in the audit spec (timestamp/component/
+    input/decision/output/reason/strategy-version/confidence/trade-id) was
+    already captured by this table plus confidence_calibration/trades, so
+    src.audit.trail reads those three tables rather than adding a new
+    write path."""
     res = (
         get_client()
         .table("opportunity_evaluations")
@@ -355,6 +381,8 @@ def log_opportunity_evaluation(
                 "final_decision": final_decision,
                 "reason": reason,
                 "trade_id": trade_id,
+                "market_regime": market_regime,
+                "config_version": config_version,
             }
         )
         .execute()
@@ -387,21 +415,26 @@ def get_learning_statistics(mode: str, dimension_type: str | None = None) -> lis
 # --- feature_importance ---
 
 
-def upsert_feature_importance(mode: str, feature_name: str, correlation_score: float, sample_count: int) -> None:
+def upsert_feature_importance(
+    mode: str, feature_name: str, correlation_score: float, sample_count: int, timeframe: str
+) -> None:
     get_client().table("feature_importance").upsert(
         {
             "mode": mode,
             "feature_name": feature_name,
             "correlation_score": correlation_score,
             "sample_count": sample_count,
+            "timeframe": timeframe,
         },
-        on_conflict="mode,feature_name",
+        on_conflict="mode,feature_name,timeframe",
     ).execute()
 
 
-def get_feature_importance(mode: str) -> list[dict]:
-    res = get_client().table("feature_importance").select("*").eq("mode", mode).execute()
-    return res.data
+def get_feature_importance(mode: str, timeframe: str | None = None) -> list[dict]:
+    query = get_client().table("feature_importance").select("*").eq("mode", mode)
+    if timeframe is not None:
+        query = query.eq("timeframe", timeframe)
+    return query.execute().data
 
 
 def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
@@ -440,6 +473,9 @@ def log_confidence_calibration(
     historical_weight: float,
     final_confidence: float | None,
     similar_trades_count: int,
+    regime_modifier: float | None = None,
+    symbol_modifier: float | None = None,
+    recent_performance_modifier: float | None = None,
 ) -> None:
     get_client().table("confidence_calibration").insert(
         {
@@ -450,6 +486,9 @@ def log_confidence_calibration(
             "historical_weight": historical_weight,
             "final_confidence": final_confidence,
             "similar_trades_count": similar_trades_count,
+            "regime_modifier": regime_modifier,
+            "symbol_modifier": symbol_modifier,
+            "recent_performance_modifier": recent_performance_modifier,
         }
     ).execute()
 
@@ -478,6 +517,10 @@ def insert_recommendation(
     recommended_value: float,
     rationale: str,
     sample_size: int,
+    category: str = "threshold",
+    confidence: float | None = None,
+    evidence: dict | None = None,
+    batch_id: str | None = None,
 ) -> None:
     get_client().table("recommendations").insert(
         {
@@ -487,15 +530,116 @@ def insert_recommendation(
             "recommended_value": recommended_value,
             "rationale": rationale,
             "sample_size": sample_size,
+            "category": category,
+            "confidence": confidence,
+            "evidence": evidence,
+            "batch_id": batch_id,
         }
     ).execute()
 
 
-def get_recommendations(mode: str, status: str | None = None) -> list[dict]:
+def get_recommendations(
+    mode: str, status: str | None = None, category: str | None = None
+) -> list[dict]:
     query = get_client().table("recommendations").select("*").eq("mode", mode)
     if status is not None:
         query = query.eq("status", status)
+    if category is not None:
+        query = query.eq("category", category)
     return query.order("created_at", desc=True).execute().data
+
+
+# --- strategy_simulations ---
+
+
+def insert_strategy_simulation(
+    recommendation_batch_id: str | None,
+    mode: str,
+    train_window_start: datetime,
+    train_window_end: datetime,
+    test_window_start: datetime,
+    test_window_end: datetime,
+    baseline_metrics: dict | None,
+    candidate_metrics: dict | None,
+    p_value: float | None,
+    passed: bool,
+) -> dict:
+    res = (
+        get_client()
+        .table("strategy_simulations")
+        .insert(
+            {
+                "recommendation_batch_id": recommendation_batch_id,
+                "mode": mode,
+                "train_window_start": train_window_start.isoformat(),
+                "train_window_end": train_window_end.isoformat(),
+                "test_window_start": test_window_start.isoformat(),
+                "test_window_end": test_window_end.isoformat(),
+                "baseline_metrics": baseline_metrics,
+                "candidate_metrics": candidate_metrics,
+                "p_value": p_value,
+                "passed": passed,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_strategy_simulations(mode: str, passed: bool | None = None) -> list[dict]:
+    query = get_client().table("strategy_simulations").select("*").eq("mode", mode)
+    if passed is not None:
+        query = query.eq("passed", passed)
+    return query.order("created_at", desc=True).execute().data
+
+
+# --- adaptive_strategy_versions ---
+
+
+def insert_adaptive_strategy_version(
+    mode: str,
+    version_number: int,
+    params_json: dict,
+    source_recommendation_batch_id: str | None,
+    source_simulation_id: int | None,
+    notes: str | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("adaptive_strategy_versions")
+        .insert(
+            {
+                "mode": mode,
+                "version_number": version_number,
+                "params_json": params_json,
+                "source_recommendation_batch_id": source_recommendation_batch_id,
+                "source_simulation_id": source_simulation_id,
+                "notes": notes,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_adaptive_strategy_versions(mode: str, status: str | None = None) -> list[dict]:
+    query = get_client().table("adaptive_strategy_versions").select("*").eq("mode", mode)
+    if status is not None:
+        query = query.eq("status", status)
+    return query.order("created_at", desc=True).execute().data
+
+
+def get_latest_adaptive_strategy_version(mode: str) -> dict | None:
+    res = (
+        get_client()
+        .table("adaptive_strategy_versions")
+        .select("*")
+        .eq("mode", mode)
+        .order("version_number", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
 
 
 # --- trade_evaluations ---
@@ -535,10 +679,271 @@ def get_trade_evaluation_ids(trade_ids: list[int]) -> set[int]:
     return {row["trade_id"] for row in res.data}
 
 
+def get_trade_evaluations(trade_ids: list[int]) -> list[dict]:
+    """Full trade_evaluations rows (confidence_was_accurate/
+    opportunity_score_was_accurate) for drift_detection.py — distinct from
+    get_trade_evaluation_ids, which only returns the id set for the
+    already-evaluated membership check process_closed_trades() needs."""
+    if not trade_ids:
+        return []
+    res = get_client().table("trade_evaluations").select("*").in_("trade_id", trade_ids).execute()
+    return res.data
+
+
 def get_trades_by_ids(trade_ids: list[int]) -> list[dict]:
     if not trade_ids:
         return []
     res = get_client().table("trades").select("*").in_("id", trade_ids).execute()
+    return res.data
+
+
+# --- historical_candles ---
+
+
+def upsert_historical_candles(pair: str, interval: str, candles: list[dict]) -> None:
+    """candles: list of {"time","open","high","low","close","volume"} dicts,
+    CoinDCX's own raw shape — caller passes them through unchanged."""
+    if not candles:
+        return
+    rows = [
+        {
+            "pair": pair,
+            "interval": interval,
+            "time": c["time"],
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+            "volume": c["volume"],
+        }
+        for c in candles
+    ]
+    get_client().table("historical_candles").upsert(rows, on_conflict="pair,interval,time").execute()
+
+
+def get_historical_candles(pair: str, interval: str, start_time_ms: int, end_time_ms: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("historical_candles")
+        .select("*")
+        .eq("pair", pair)
+        .eq("interval", interval)
+        .gte("time", start_time_ms)
+        .lte("time", end_time_ms)
+        .order("time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_runs ---
+
+
+def insert_backtest_run(
+    symbols: list[str],
+    start_date: Date,
+    end_date: Date,
+    warmup_buffer_days: int,
+    starting_capital: float,
+    params_json: dict,
+    use_llm_signal_agent: bool = False,
+    source_adaptive_strategy_version_id: int | None = None,
+    name: str | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("backtest_runs")
+        .insert(
+            {
+                "name": name,
+                "symbols": symbols,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "warmup_buffer_days": warmup_buffer_days,
+                "starting_capital": starting_capital,
+                "params_json": params_json,
+                "use_llm_signal_agent": use_llm_signal_agent,
+                "source_adaptive_strategy_version_id": source_adaptive_strategy_version_id,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def update_backtest_run_status(run_id: int, status: str, completed_at: datetime | None = None) -> None:
+    update = {"status": status}
+    if completed_at is not None:
+        update["completed_at"] = completed_at.isoformat()
+    get_client().table("backtest_runs").update(update).eq("id", run_id).execute()
+
+
+def get_backtest_run(run_id: int) -> dict | None:
+    res = get_client().table("backtest_runs").select("*").eq("id", run_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_backtest_runs(status: str | None = None) -> list[dict]:
+    query = get_client().table("backtest_runs").select("*")
+    if status is not None:
+        query = query.eq("status", status)
+    return query.order("created_at", desc=True).execute().data
+
+
+# --- backtest_trades ---
+
+
+def insert_backtest_trade(run_id: int, trade: dict) -> dict:
+    res = get_client().table("backtest_trades").insert({"run_id": run_id, **trade}).execute()
+    return res.data[0]
+
+
+def get_backtest_trades(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_trades")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("entry_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_portfolio_snapshots ---
+
+
+def insert_backtest_portfolio_snapshots(run_id: int, snapshots: list[dict]) -> None:
+    """Batch insert — a multi-month equity curve is thousands of points,
+    one-row-per-network-call would be needlessly slow."""
+    if not snapshots:
+        return
+    rows = [{"run_id": run_id, **s} for s in snapshots]
+    get_client().table("backtest_portfolio_snapshots").insert(rows).execute()
+
+
+def get_backtest_portfolio_snapshots(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_portfolio_snapshots")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("snapshot_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_execution_history ---
+
+
+def insert_backtest_execution_events(run_id: int, events: list[dict]) -> None:
+    if not events:
+        return
+    rows = [{"run_id": run_id, **e} for e in events]
+    get_client().table("backtest_execution_history").insert(rows).execute()
+
+
+def get_backtest_execution_history(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_execution_history")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("event_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_performance_metrics ---
+
+
+def insert_backtest_performance_metrics(run_id: int, metrics: dict) -> dict:
+    res = (
+        get_client()
+        .table("backtest_performance_metrics")
+        .insert({"run_id": run_id, "metrics": metrics})
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_performance_metrics(run_id: int) -> dict | None:
+    res = (
+        get_client()
+        .table("backtest_performance_metrics")
+        .select("*")
+        .eq("run_id", run_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# --- backtest_walk_forward_folds ---
+
+
+def insert_backtest_walk_forward_fold(run_id: int, fold: dict) -> dict:
+    res = (
+        get_client()
+        .table("backtest_walk_forward_folds")
+        .insert({"run_id": run_id, **fold})
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_walk_forward_folds(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_walk_forward_folds")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("fold_number")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_strategy_comparisons ---
+
+
+def insert_backtest_strategy_comparison(
+    run_id_a: int,
+    run_id_b: int,
+    metrics_a: dict | None,
+    metrics_b: dict | None,
+    p_values: dict | None,
+    winner: str | None,
+    promotion_recommended: bool | None,
+) -> dict:
+    res = (
+        get_client()
+        .table("backtest_strategy_comparisons")
+        .insert(
+            {
+                "run_id_a": run_id_a,
+                "run_id_b": run_id_b,
+                "metrics_a": metrics_a,
+                "metrics_b": metrics_b,
+                "p_values": p_values,
+                "winner": winner,
+                "promotion_recommended": promotion_recommended,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_strategy_comparisons() -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_strategy_comparisons")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+    )
     return res.data
 
 
@@ -560,3 +965,165 @@ def get_entry_evaluations_since(mode: str, since: datetime) -> list[dict]:
         .execute()
     )
     return res.data
+
+
+# --- data_quality_log (Market Data Quality Engine + Data Repair Engine,
+# PROJECT_SPEC.md §3d) ---
+
+
+def insert_data_quality_issues(rows: list[dict]) -> None:
+    if not rows:
+        return
+    get_client().table("data_quality_log").insert(rows).execute()
+
+
+def get_data_quality_log(pair: str | None = None, source: str | None = None, limit: int = 200) -> list[dict]:
+    query = get_client().table("data_quality_log").select("*")
+    if pair is not None:
+        query = query.eq("pair", pair)
+    if source is not None:
+        query = query.eq("source", source)
+    res = query.order("created_at", desc=True).limit(limit).execute()
+    return res.data
+
+
+# --- drift_alerts (Feature Drift Detection, PROJECT_SPEC.md §3d) ---
+
+
+def insert_drift_alert(
+    component: str,
+    drift_type: str,
+    severity: str,
+    baseline_value: float | None,
+    recent_value: float | None,
+    detail: dict | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("drift_alerts")
+        .insert(
+            {
+                "component": component,
+                "drift_type": drift_type,
+                "severity": severity,
+                "baseline_value": baseline_value,
+                "recent_value": recent_value,
+                "detail": detail or {},
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_drift_alerts(component: str | None = None, limit: int = 200) -> list[dict]:
+    query = get_client().table("drift_alerts").select("*")
+    if component is not None:
+        query = query.eq("component", component)
+    res = query.order("detected_at", desc=True).limit(limit).execute()
+    return res.data
+
+
+# --- strategy_health_scores (Strategy Health Engine, PROJECT_SPEC.md §3d) ---
+
+
+def insert_strategy_health_score(
+    strategy_version_id: int, health_score: float | None, tier: str, breakdown: dict
+) -> dict:
+    res = (
+        get_client()
+        .table("strategy_health_scores")
+        .insert(
+            {
+                "strategy_version_id": strategy_version_id,
+                "health_score": health_score,
+                "tier": tier,
+                "breakdown": breakdown,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_latest_strategy_health_score(strategy_version_id: int) -> dict | None:
+    res = (
+        get_client()
+        .table("strategy_health_scores")
+        .select("*")
+        .eq("strategy_version_id", strategy_version_id)
+        .order("computed_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def set_strategy_version_status(version_id: int, status: str) -> None:
+    """Status-only marking (active/suspended) — never a delete. A human can
+    always flip it back in Supabase; nothing in code reverses it the other
+    direction automatically."""
+    get_client().table("strategy_versions").update({"status": status}).eq("id", version_id).execute()
+
+
+def get_active_strategy_versions() -> list[dict]:
+    res = (
+        get_client()
+        .table("strategy_versions")
+        .select("*")
+        .neq("status", "suspended")
+        .order("version_number", desc=True)
+        .execute()
+    )
+    return res.data
+
+
+# --- system_metrics (Production Monitoring + Self-Diagnostics,
+# PROJECT_SPEC.md §3d) — one generic table, not N single-purpose ones,
+# matching the jsonb-bundle precedent elsewhere in this schema. ---
+
+
+def insert_system_metrics(rows: list[dict]) -> None:
+    if not rows:
+        return
+    get_client().table("system_metrics").insert(rows).execute()
+
+
+def get_recent_system_metrics(component: str | None = None, limit: int = 200) -> list[dict]:
+    query = get_client().table("system_metrics").select("*")
+    if component is not None:
+        query = query.eq("component", component)
+    res = query.order("recorded_at", desc=True).limit(limit).execute()
+    return res.data
+
+
+# --- circuit_breaker_state (src/resilience.py) ---
+
+
+def get_circuit_breaker_state(component: str) -> dict | None:
+    res = (
+        get_client()
+        .table("circuit_breaker_state")
+        .select("*")
+        .eq("component", component)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def upsert_circuit_breaker_state(component: str, consecutive_failures: int, tripped_until: int | None) -> None:
+    get_client().table("circuit_breaker_state").upsert(
+        {
+            "component": component,
+            "consecutive_failures": consecutive_failures,
+            "tripped_until": tripped_until,
+        },
+        on_conflict="component",
+    ).execute()
+
+
+def reset_circuit_breaker(component: str) -> None:
+    get_client().table("circuit_breaker_state").upsert(
+        {"component": component, "consecutive_failures": 0, "tripped_until": None},
+        on_conflict="component",
+    ).execute()

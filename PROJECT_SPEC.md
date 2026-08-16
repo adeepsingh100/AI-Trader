@@ -300,6 +300,384 @@ this is expected to be noisy until real trade history accumulates.
   `strong_bear` / `weak_bear`, derived from ADX + trend_score, no separate
   "trending" label (redundant with strong_bull/strong_bear).
 
+## 3b. Adaptive Strategy Intelligence Engine (`src/learning/`)
+
+Closes the loop from the Learning Engine's statistics into recommended
+parameter changes — walk-forward validated and simulated before a
+candidate is even created, then requiring explicit human approval before
+being treated as adopted. Two trust levels: everything that could change
+what the bot trades (weights, thresholds, avoid-symbol/avoid-regime)
+stays advisory, human-approved in Supabase, same as `recommendations`
+already worked before this. The one automatic piece is the confidence
+modifier chain, an extension of the already-automatic (and
+inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
+
+- **`feature_importance.py`** (extended): `compute_feature_importance`
+  now accepts a `timeframes` list (default `[PRIMARY_TIMEFRAME]`,
+  unchanged behavior) — passing `FEATURE_TIMEFRAMES` computes correlation
+  independently per timeframe using each trade's already-stored
+  multi-timeframe feature dump, zero new candle fetches. New
+  `compute_subscore_correlation_weights(mode)` correlates the 5
+  already-flat opportunity_evaluations sub-score columns against
+  win/loss, normalizes positive correlations into a weight distribution,
+  and caches them in `feature_importance` (`timeframe="blended"`) — read
+  back live (but cheaply, no recomputation) by
+  `trade_memory._feature_importance_weights`, which is no longer a
+  permanent no-op stub. New `score_separation_p_value(trades, weights)`
+  recomputes each trade's opportunity score under a candidate weight set
+  and z-tests whether winners and losers separate significantly better
+  than under the current weights.
+- **`statistics.py`** (extended): `streaks()` (moved from `reports.py`,
+  now also returns the *current* streak, not just the longest, since the
+  live confidence chain needs it every cycle) and stdlib-only two-sample
+  z-test helpers (`z_test_two_proportions`, `z_test_two_means`, normal
+  approximation via `math.erf`) — used for both a recommendation's stated
+  confidence and its walk-forward pass/fail gate.
+- **`recommendations.py`** (extended, `generate_recommendations` itself
+  unchanged): `generate_weight_recommendations` (candidate
+  `OPPORTUNITY_WEIGHT_*` values, accepted only if they separate
+  winners/losers better than the live weights), `generate_regime_recommendations`
+  ("avoid regime X" plus regime-conditioned weight recommendations),
+  `generate_symbol_recommendations` ("avoid symbol X" plus a per-symbol
+  optimal-threshold sweep for confidence/opportunity_score/stop_distance/
+  volatility, via a generalized `_find_optimal_threshold` shared with the
+  original sweep). Every generator: only ever re-evaluates trades already
+  taken (no counterfactual discovery — that would need a real
+  candle-replay backtester, out of scope), and is idempotent the same way
+  the original threshold sweep already was.
+- **`simulation.py`** (new): walk-forward validation — a recommendation
+  is regenerated using only the older TRAIN fraction of
+  `LEARNING_HISTORY_WINDOW_DAYS`, then evaluated only against the newer
+  TEST fraction, never touched during generation. On a statistically
+  significant pass (`SIGNIFICANCE_THRESHOLD`), lazily creates an
+  `adaptive_strategy_versions` candidate row — only for proposals that
+  clear the bar, so that table only ever holds genuine candidates.
+  Currently simulates the mode-wide weight recommendation and the
+  mode-wide `MIN_OPPORTUNITY_SCORE` threshold recommendation; regime-/
+  symbol-scoped recommendations stay recommend-only (each already needs
+  the full sample floor per bucket just to be generated once).
+- **`adaptive_strategy_engine.py`** (new): `AdaptiveStrategyEngine.analyze(mode)`
+  — the single composed entry point, calling every generator above plus
+  the simulations, then logging a summary. Never executes a trade, never
+  writes to `config.py` or any trading table. Runs as its own nightly
+  step in `evolution.yml` (after `evolution_agent`, no new workflow) —
+  deliberately NOT called from `run_evolution()` itself, so
+  `evolution_agent.py`'s existing `generate_recommendations`/
+  `compute_feature_importance` calls stay untouched.
+- **Adaptive confidence chain** (`confidence_calibration.py`, extended):
+  `calibrate_confidence` gains optional `regime_modifier`/
+  `symbol_modifier`/`recent_performance_modifier` params — each a bounded
+  adjustment (`BUCKET_MODIFIER_SENSITIVITY`/`BUCKET_MODIFIER_CAP` for
+  regime/symbol, based on that bucket's win rate vs. the active version's
+  overall win rate; `RECENT_STREAK_WIN_MODIFIER_CAP`/
+  `RECENT_STREAK_LOSS_MODIFIER_CAP` for the current win/loss streak over
+  the last `RECENT_PERFORMANCE_LOOKBACK_TRADES` closed trades), summed
+  onto the existing AI+historical blend and clamped to 0-100. Computed
+  once per cycle in `orchestrator.py` (not once per candidate), gated on
+  each bucket clearing `RECOMMENDATION_MIN_SAMPLE_SIZE`. No live
+  per-trade timeframe modifier — a trade blends across
+  `FEATURE_TIMEFRAMES`, so there's no single per-trade timeframe bucket
+  to look up the way there is for symbol/regime; that signal lives in
+  `feature_importance`'s per-timeframe correlation instead.
+- **`reports.py`** (extended): `generate_adaptive_strategy_report_html`,
+  wired into `reporting_agent.py` as one more section — best/accepted/
+  rejected recommendations, simulation results, candidate/approved
+  adaptive strategy versions.
+
+## 3c. Event-Driven Backtesting & Walk-Forward Validation Engine (`src/backtest/`)
+
+Fills the gap §3a/§3b's own docstrings openly admit to: neither ever
+replays candles or discovers a trade that wasn't actually taken — "a real
+backtester (candle replay) would be a much bigger feature and isn't being
+built here." This is that feature. Purely additive; `orchestrator.py`'s
+live `run_cycle` is untouched. Confirmed live (via a direct API check, not
+assumed) that CoinDCX's public candles endpoint accepts `startTime`/
+`endTime` even though `coindcx_client.py`'s wrapper never exposes them —
+real historical replay is possible, capped at 500 candles/call, walked
+backward via pagination in `data_provider.py`. Candle `time` is bar-OPEN
+time (the most-recent no-range-filter candle is always still forming),
+which pins the no-look-ahead rule exactly: a bar is visible at simulated
+time `t` only if `open_time + interval_duration <= t`.
+
+**What's reused unchanged** (this is where "same trading logic in both
+modes" is actually honored, not `run_cycle` itself — see below):
+`feature_engine.compute_multi_timeframe_features`, `opportunity_scorer.
+score_opportunity`/`select_top_candidates`, `risk_manager.evaluate`/
+`exit_reason`/`circuit_breaker_triggered`, `execution/paper.py`'s `fees`
+formula (made public), and `learning/statistics.py`'s Sharpe/Sortino/
+Calmar/win-rate/profit-factor/expectancy/z-tests. **What's new**: the
+event-reactor loop itself, because `run_cycle` is a live-polling shell
+(Supabase writes and `get_ticker()` on every call) fundamentally
+incompatible with "replay chronologically, no network calls in the hot
+loop." Two cadences kept deliberately separate from the tick granularity:
+`BACKTEST_DECISION_CYCLE_MINUTES` (mirrors `trading_cycle.yml`'s 10-min
+cron) and `BACKTEST_RISK_CHECK_MINUTES` (mirrors `risk_check.yml`'s 5-min
+cron) — ticking the decision pass on every candle would simulate a bot
+checking 5-10x more often than the live one ever does.
+
+- **`events.py`**: `MarketEvent/SignalEvent/OrderEvent/FillEvent/
+  PositionEvent/PortfolioEvent/RiskEvent/TimeEvent` + `EventQueue`.
+- **`simulation_clock.py`**: `is_bar_closed` is the no-look-ahead rule's
+  single source of truth; `SimulationClock` derives its own day boundary
+  for daily-PnL bucketing (never imports `risk_manager.today_ist()`, which
+  is real wall-clock time).
+- **`data_provider.py`**: paginated historical fetch (network, only ever
+  called by `ingest_data.py`) + `CandleStore`, an in-memory, closed-bar-only
+  reader loaded once per run — zero network/DB calls in the hot loop.
+- **`order_manager.py` / `execution_simulator.py`**: `OrderType` (market/
+  limit/stop/stop_limit/trailing_stop) + realistic fill simulation
+  (spread/slippage/partial fills/rejections/expiry) — commission reuses
+  `execution/paper.py`'s exact fee formula. Live only ever issues market
+  orders (CoinDCX spot has no exchange-side resting order); the richer
+  types are a real, generic capability, not something the default parity
+  backtest of the current live strategy exercises. Fully in-memory —
+  never imports `src.db.models` or `src.coindcx_client`, so a backtest run
+  can never leak into live Supabase state.
+- **`portfolio_manager.py`**: cash/equity/positions/realized+unrealized
+  PnL/exposure, mark-to-market equity curve — genuinely new (the only
+  existing drawdown, `evolution_agent._max_drawdown_pct`, walks the
+  trade-pnl sequence, not an intraday equity curve). Spot-only like live —
+  no margin/leverage machinery.
+- **`engine.py`**: `BacktestEngine` — the reactor loop. Replicates all
+  **three** circuit-breaker checkpoints `run_cycle` has (top-of-decision-
+  pass, post-SL/TP-sweep, per-candidate). Symbol universe is an explicit,
+  user-supplied list, never reconstructed from a live turnover ranking —
+  CoinDCX has no historical ticker/turnover series to replay, so
+  defaulting to "today's top-N over history" would be survivorship bias;
+  every report says this. LLM signal-agent validation is real but
+  **opt-in, off by default** (`BACKTEST_USE_LLM_SIGNAL_AGENT`) — quant-only
+  is the deterministic default that actually satisfies "everything must be
+  deterministic" (the live LLM call is temperature-sampled); when enabled,
+  the historical-confidence/regime/symbol blend is deliberately NOT
+  reused, since that queries LIVE current trades/learning_statistics and
+  would leak years of future information into a historical decision —
+  LLM-mode confidence is the raw AI verdict only, labeled non-reproducible.
+  `ingest_data.py` (CLI) backfills `historical_candles` for
+  `[start_date - BACKTEST_WARMUP_BUFFER_DAYS, end_date]`, never just the
+  requested window — `FEATURE_CANDLE_LIMIT`/`EMA_TREND_PERIOD_4` need up
+  to ~200 closed daily bars before scores stop being `None`, so without
+  the buffer every run would silently find zero candidates for its first
+  ~200 days.
+- **`performance_analyzer.py`**: reuses `statistics.compute_bucket_statistics`
+  directly; adds gross profit/loss, Omega ratio, Ulcer index, rolling
+  Sharpe/volatility/drawdown, monthly/annual returns, exposure time,
+  capital utilization. Recovery factor is computed at report time only,
+  never stored — numerically identical to Calmar, same "don't store one
+  fact under two names" precedent as §3b.
+- **`trade_analysis.py`**: per-trade MFE/MAE/slippage/commission/return/
+  risk-reward/exit-reason/confidence/opportunity-score/regime.
+- **`walk_forward_validator.py`**: real rolling multi-fold validation
+  (train window → test window, never overlapping, stepped forward) —
+  distinct from and doesn't modify `simulation.py`'s existing single-split
+  trade-repartition logic (different question: would this parameter set
+  have made money on a historical period it never saw, vs. does a weight
+  recommendation separate already-observed outcomes better).
+- **`strategy_comparison.py`**: pairwise run comparison reusing
+  `z_test_two_proportions`/`z_test_two_means` directly — "only recommend
+  promotion if statistically superior" means the test rejects the null in
+  B's favor, not just that B's raw number is bigger.
+- **`statistical_validation.py`**: confidence intervals via **seeded
+  bootstrap resampling**, not a parametric t-interval — this codebase has
+  zero numpy/scipy, and a hand-rolled regularized-incomplete-beta
+  implementation for a real t-CDF is real numerical bug surface for little
+  gain over the existing z-test at backtest sample sizes; bootstrap needs
+  no distributional assumption at all, arguably the more honest answer for
+  small fold sizes. Plus Monte Carlo trade-order resampling (drawdown
+  path-dependency) and a parameter-stability sweep. All randomness draws
+  from a local `random.Random(BACKTEST_RANDOM_SEED)` instance, never the
+  global `random` module — reruns are bit-identical.
+- **`overfitting_detection.py`**: aggregates walk-forward fold results +
+  parameter stability into a verdict (`robust`/`marginal`/`overfit`).
+  "Reject weak strategies automatically" means automatic **status
+  marking** only, never automatic deletion or live application — same
+  human-approval precedent as `recommendations`/`adaptive_strategy_versions`.
+- **`report.py`**: HTML (reusing `reporting_agent._table`) + CSV/JSON via
+  stdlib. No PDF — the HTML report is already print-to-PDF-ready in any
+  browser, and this codebase's zero-non-essential-dependency discipline
+  (no numpy/scipy despite far heavier justification) argues against adding
+  one just for PDF rendering. Standalone per-run artifact, not wired into
+  `reporting_agent.py`'s live dashboard report.
+
+No new GitHub Actions workflow — on-demand CLI (`python -m
+src.backtest.engine`/`ingest_data`), same precedent as `seed_config.py`,
+not a recurring job.
+
+## 3d. Institutional Reliability Layer
+
+Everything §3a-§3c built is trading intelligence; this is production
+reliability on top of it — data quality, portfolio-aware risk, execution
+quality, drift/health monitoring, observability, and fault tolerance.
+Confirmed via research before building: none of it existed anywhere in
+this repo, not even partially, except order types already simulating
+correctly in `src/backtest/` (nothing chose between them yet) and LLM
+calls already having retry/backoff/fallback (`groq_client.py`, nothing
+else did). Architecturally different from §3a-§3c: those were purely
+additive; several pieces here **must** touch the live trading hot path
+(`risk_manager.py`, `orchestrator.py`, `coindcx_client.py`, `db/models.py`)
+to mean anything — done narrowly, with every touched function keeping its
+existing signature and default behavior.
+
+**Market Data Quality Engine + Data Repair Engine** (`src/data_quality/`):
+`validator.py`'s `MarketDataValidator` checks every candle for missing
+bars/duplicates/negative or invalid OHLC/out-of-order timestamps/gaps/
+zero-volume/extreme spikes/exchange outages/clock drift (live-fetch path
+only)/symbol mismatch/timeframe changes, each mapped to a configurable
+`ignore|warn|reject|quarantine` severity. `repair.py`'s `DataRepairEngine`
+auto-fixes only what's safely fixable (small gaps ≤`DATA_REPAIR_MAX_GAP_BARS`
+via linear interpolation, exact-duplicate merges, reordering) — a
+reject/quarantine-severity issue is never silently repaired, and every
+repair returns a logged entry (`data_quality_log`), never a silent
+mutation. One shared entry point for both live (`data_agent.py`, right
+after `get_candles()`) and backtest (`data_provider.py::ingest`, once at
+ingest time) — not forked per pipeline.
+
+**Portfolio Intelligence Engine** (`src/portfolio/intelligence.py`): pure
+functions, no DB/network access — the caller supplies `positions` and a
+`price_history` dict **already truncated to the caller's current point in
+time** (the module never windows/slices beyond what it's handed, the fix
+for a real look-ahead trap a design review caught: a careless backtest
+call site could otherwise hand it a future-inclusive series "for
+convenience"). Computes correlation matrix + rolling correlation, sector/
+coin-category exposure (via a configurable `COIN_CATEGORY_MAP`, unmapped
+symbols fall into `"uncategorized"` — no external crypto taxonomy exists
+to query), stablecoin allocation, exchange exposure (always 100% —
+single-exchange bot), max concentration, net/gross exposure (equal by
+construction, spot-only/no shorting), beta (vs. `PORTFOLIO_BETA_PROXY_SYMBOL`,
+default BTC), risk contribution, portfolio volatility, historical VaR/
+Expected Shortfall (sorted-return percentile method, no distributional
+assumption — same reasoning as §3c's bootstrap-over-parametric choice),
+diversification score (1 − Herfindahl index). All hand-rolled stdlib math
+(Python 3.9 compatible — deliberately not `statistics.covariance`/
+`correlation`, 3.10+ only), same "no numpy/scipy" discipline as
+`learning/statistics.py`'s z-tests.
+
+Concentration caps scale with `capital_config.max_concurrent_positions`
+(`100/max_concurrent_positions × MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE`)
+rather than a fixed institutional-style percentage — a real bug an
+integration test caught: a flat 25% cap blocked nearly every first trade
+in this bot's actual 2-5-position range, since one position in a small
+book is structurally 100% of it. `risk_manager.evaluate()` gained new
+**optional** kwargs (`symbol`, `portfolio_positions`, `price_history`) —
+omitted, behavior is byte-identical to before; supplied, a concentration
+gate runs before the existing capital-limit check.
+
+**Capital Allocation Engine** (`src/portfolio/capital_allocation.py`): the
+highest-risk piece — replaces the flat `capital_to_use × position_size_pct
+/ 100` formula with a multiplicative blend of independently configurable
+factors (correlation/volatility/drawdown/exposure/strategy-performance/
+regime/confidence, each clamped, the combined product clamped again).
+**Rollout is paper-first, not automatic**: migration `0008` adds
+`capital_config.sizing_mode text default 'flat'` — `'flat'` is today's
+exact formula (byte-identical, verified by a regression test), `'dynamic'`
+calls the new engine. Nothing in code flips this column; a human sets
+paper's row to `'dynamic'` in Supabase after reviewing behavior, real's row
+stays `'flat'` until they choose otherwise — the same "human edits a row
+directly, no auto-promotion" invariant `paused`/`promoted_to_real` already
+run on. The dynamic result still flows through the unchanged
+`committed_capital(open_trades) + trade_capital > capital_to_use` ceiling —
+the multiplier feeds that gate, never bypasses it.
+
+**Execution Optimizer** (`src/execution_optimizer/optimizer.py`): pure
+recommendation engine (MARKET vs. LIMIT, reusing `src/backtest/
+order_manager.py`'s `OrderType` — no duplicate enum) estimating fill
+probability/cost/delay/slippage from spread/liquidity/volatility/order-size/
+recent-fill-rate. `RealExecutionAgent` stays fully untouched (market-only,
+per its own documented unverified/inert status). `PaperExecutionAgent`
+gained an optional, config-gated (`EXECUTION_OPTIMIZER_ENABLED`, default
+false) path to act on a LIMIT recommendation same-cycle — modeled as
+filling at a half-spread-improved price with probability
+`estimated_fill_probability`, an explicit single-shot simplification since
+paper trading has no cross-cycle resting-order infrastructure (that's what
+`order_manager.py` is for, built for the backtest engine's multi-tick event
+loop, not this synchronous per-cycle call).
+
+**Feature Drift Detection** (`src/learning/drift_detection.py`): hand-rolled
+Population Stability Index for feature-value distribution drift, a
+correlation-magnitude delta for feature-importance trend, and
+`z_test_two_proportions`-based (reused) win-rate/confidence-calibration/
+opportunity-score-accuracy drift — baseline window vs. recent window, only
+flags a *statistically significant worsening*, never an improvement or
+noise. Runs as its own independent step in `evolution.yml` (never merged
+into `evolution_agent.run_evolution()` or `adaptive_strategy_engine.py` —
+the same "don't couple independent learning steps" rule those two already
+follow). Writes to `drift_alerts` — advisory only, same as every other
+`src/learning/` output.
+
+**Strategy Health Engine** (`src/learning/strategy_health.py`): health
+score (0-100, `Excellent/Good/Warning/Critical`) per `strategy_version`
+from rolling Sharpe/drawdown/win-rate/profit-factor (`learning/statistics.py`,
+reused), recent-vs-historical performance (z-tests, reused), and
+walk-forward pass rate where a backtest exists for that version (omitted,
+never fabricated, otherwise). Migration `0008` adds
+`strategy_versions.status text default 'active'` — the same mutable-flag
+pattern `promoted_to_real` already uses on this table. **A design review
+caught a real silent-no-op risk here**: `get_latest_version()`/
+`get_latest_promoted_version()` were unfiltered `ORDER BY version_number
+DESC LIMIT 1` queries — both now filter `status != 'suspended'`, and
+paper mode's prior hard crash on "no version" now distinguishes "never
+bootstrapped" (still a crash) from "every version suspended" (a graceful
+no-op, since a crash-loop every 10 minutes is a worse outcome). Suspension
+is **status-only, never a delete** — reversible in Supabase at any time —
+and only fires when `STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED` (default true)
+and the trade count clears `RECOMMENDATION_MIN_SAMPLE_SIZE`.
+
+**Production Monitoring + Self-Diagnostics** (`src/monitoring/`): scoped
+to what's real for stateless ~10-minute GitHub Actions cron invocations
+(Supabase as the only durable state), not invented long-running-server
+metaphors. `metrics.py`'s `track()` context manager wraps timing/success
+capture around `orchestrator.run_cycle`'s market-snapshot fetch, writing to
+one generic `system_metrics` table (jsonb-bundle pattern, not N
+single-purpose tables); `resource_snapshot()` is a stdlib `resource`/
+`shutil.disk_usage` read of the runner's own process, the closest
+meaningful thing to "CPU/memory/disk" for a script that runs seconds and
+exits. `diagnostics.py`'s `run_health_check()` checks DB reachability,
+market-feed freshness, learning-engine freshness, execution-engine
+configuration, portfolio-position sanity, and recommendation-engine
+reachability — added as a new step in `risk_check.yml` (already the
+finest-grained cron, 5 min) rather than a 4th workflow file, which itself
+risks silently going stale unnoticed.
+
+**Audit System** — reuse first, not a new write path. `opportunity_evaluations`/
+`confidence_calibration`/`trades` already capture every decision point in
+`run_cycle` today (timestamp/component/input/decision/output/reason/
+strategy-version/confidence/trade-id). `src/audit/trail.py::get_decision_trail()`
+is a **read** function joining those three into one chronological timeline.
+Only two genuinely missing fields became new columns on an existing table:
+`opportunity_evaluations.config_version` (`trail.py::config_version()`, a
+short hash of the live scoring/threshold constants, for reproducibility)
+and `.market_regime` (already computed by the opportunity scorer, just not
+persisted before). A design review flagged that layering new write calls
+into the same hot loop being hardened by per-symbol isolation (below) would
+work against that hardening — this sidesteps it entirely.
+
+**Resilience** (`src/resilience.py`): `retry_with_backoff()` — the same
+backoff shape `groq_client.py` already used for LLM calls, now the one
+shared implementation — wraps every **read** call in `coindcx_client.py`
+and the handful of hot-path reads in `db/models.py` that gate whether a
+cycle can start at all (`get_capital_config`/`get_latest_version`/
+`get_latest_promoted_version`/`get_daily_pnl`/`get_open_trades`).
+`create_order` is deliberately **never** retried — a failed request whose
+response was lost but which actually succeeded server-side would place a
+second order on retry, a real double-submission risk a plain re-read
+doesn't carry (the reason a full mechanical retry-every-`.execute()`-call
+retrofit across all ~55 `db/models.py` functions was rejected in favor of
+this narrower, correctness-checked set — writes get retried only where they
+use `.upsert()`, which is naturally idempotent). A DB-backed circuit
+breaker (`circuit_breaker_state` table: `coindcx_api`/`supabase`/`llm`,
+consecutive-failure count, cooldown) survives across cron invocations and
+fails **open** on its own write errors (a Supabase outage can't block
+itself from being recorded as a Supabase outage). Per-symbol
+`try/except` isolation was added to `orchestrator.run_cycle`'s Pass 2 loop
+— a confirmed real gap: one symbol's exception used to abort every
+remaining symbol in the cycle even though the cycle is otherwise safe to
+retry from a clean DB-read state; this is the actual root-cause fix for
+"crash recovery" in a stateless cron architecture, not new checkpointing
+infrastructure (there's no persistent daemon to checkpoint).
+
+No new dependency of any kind — everything above is stdlib plus this
+repo's own existing modules, matching the zero-numpy/scipy discipline the
+codebase already prides itself on.
+
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
 - Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
@@ -474,19 +852,26 @@ learning_statistics (
   unique (mode, dimension_type, dimension_value)
 )
 
--- feature_importance: point-biserial correlation, primary timeframe only
+-- feature_importance: point-biserial correlation. timeframe added in
+-- 0006_adaptive_strategy_engine.sql — raw Feature Engine keys use their
+-- own timeframe, the 5 opportunity-scorer sub-scores always use the
+-- explicit sentinel 'blended' (see §3b)
 feature_importance (
   id                bigserial primary key,
   mode              text not null,
-  feature_name      text not null,             -- a Feature Engine FEATURE_KEYS entry
+  feature_name      text not null,             -- a Feature Engine FEATURE_KEYS entry, or a sub-score name (trend_score, ...)
+  timeframe         text not null,             -- '1m' | '15m' | '1h' | '1d' | 'blended'
   correlation_score numeric,
   sample_count      int not null default 0,
   computed_at       timestamptz not null default now(),
-  unique (mode, feature_name)
+  unique (mode, feature_name, timeframe)
 )
 
 -- confidence_calibration: audit log, one row per entry-validation call
--- (not aggregate stats — what was actually applied to a specific decision)
+-- (not aggregate stats — what was actually applied to a specific decision).
+-- *_modifier columns added in 0006_adaptive_strategy_engine.sql (§3b's
+-- adaptive confidence chain) so every stage, not just final_confidence,
+-- is individually auditable.
 confidence_calibration (
   id                        bigserial primary key,
   opportunity_evaluation_id bigint not null references opportunity_evaluations(id),
@@ -496,11 +881,17 @@ confidence_calibration (
   historical_weight         numeric,
   final_confidence          numeric,
   similar_trades_count      int not null default 0,
+  regime_modifier           numeric,
+  symbol_modifier           numeric,
+  recent_performance_modifier numeric,
   created_at                timestamptz not null default now()
 )
 
 -- recommendations: advisory only, human approval required, never
 -- auto-applied. Append-only (idempotency enforced in application code).
+-- category/confidence/evidence/batch_id added in
+-- 0006_adaptive_strategy_engine.sql (§3b) so weight/regime/symbol
+-- recommendations share this table rather than duplicating it.
 recommendations (
   id                bigserial primary key,
   mode              text not null,
@@ -509,7 +900,11 @@ recommendations (
   recommended_value numeric,
   rationale         text,
   sample_size       int not null default 0,
-  status            text not null default 'pending',  -- 'pending' | 'reviewed' | 'dismissed'
+  status            text not null default 'pending',  -- 'pending' | 'reviewed' | 'approved' | 'dismissed'
+  category          text not null default 'threshold', -- 'threshold' | 'weight' | 'regime' | 'symbol'
+  confidence        numeric,                    -- (1 - p_value) * 100 from the walk-forward z-test
+  evidence          jsonb,                       -- supporting trade ids / affected bucket refs, variable per category
+  batch_id          uuid,                        -- groups co-generated rows (e.g. the 5 weight recommendations from one call)
   created_at        timestamptz not null default now()
 )
 
@@ -526,11 +921,92 @@ trade_evaluations (
   target_assessment             text,           -- 'realistic' | 'too_ambitious' | null
   evaluated_at                  timestamptz not null default now()
 )
+
+-- strategy_simulations: walk-forward train/test result for one
+-- recommendation batch (0006_adaptive_strategy_engine.sql, §3b) — this
+-- table IS "Walk Forward Results" too, same computation reported
+-- together, not a second artifact.
+strategy_simulations (
+  id                      bigserial primary key,
+  recommendation_batch_id uuid,
+  mode                    text not null,
+  train_window_start      timestamptz not null,
+  train_window_end        timestamptz not null,
+  test_window_start       timestamptz not null,
+  test_window_end         timestamptz not null,
+  baseline_metrics        jsonb,
+  candidate_metrics       jsonb,
+  p_value                 numeric,
+  passed                  boolean not null,
+  created_at              timestamptz not null default now()
+)
+
+-- adaptive_strategy_versions: versions QUANTITATIVE PARAMETERS (a
+-- params_json snapshot of tunable adaptive constants) — orthogonal to
+-- strategy_versions above, which versions LLM PROMPT TEXT. Created
+-- lazily, only for simulations that pass. No separate "currently active"
+-- table — `WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
+-- answers that; auto-deploy is out of scope, a human still copies
+-- approved values into env vars by hand.
+adaptive_strategy_versions (
+  id                             bigserial primary key,
+  mode                           text not null,
+  version_number                 int not null,
+  params_json                    jsonb not null,
+  source_recommendation_batch_id uuid,
+  source_simulation_id           bigint references strategy_simulations(id),
+  status                         text not null default 'candidate',  -- 'candidate' | 'approved' | 'rolled_back'
+  notes                          text,
+  created_at                     timestamptz not null default now()
+)
 ```
 
 No separate `market_regimes` table — `learning_statistics WHERE
 dimension_type='market_regime'` already is that data; a second table
-would duplicate it under a different name.
+would duplicate it under a different name. Likewise no separate "Adaptive
+Strategies" table for a currently-active parameter set (§3b) and no
+separate "Feature Weight History"/"Threshold History" tables —
+`recommendations WHERE category = ...` (append-only) already is that
+history.
+
+**Backtesting Engine (§3c), 8 new tables** — genuinely more new tables
+than §3b needed, honestly: `historical_candles` (raw OHLCV cache, unique
+on `pair, interval, time`), `backtest_runs` (run config snapshot,
+`source_adaptive_strategy_version_id` nullable FK — the link for
+backtesting a pending §3b candidate before approving it), `backtest_trades`
+(deliberately separate from live `trades` — a backtest re-runs the SAME
+historical period many times under different params, which `trades` has
+no `run_id` concept for, and conflating them risks simulated data leaking
+into live dashboards/risk state), `backtest_portfolio_snapshots`
+(mark-to-market equity curve, genuinely new — no existing intraday-equity
+drawdown), `backtest_execution_history` (order-lifecycle events —
+submitted/filled/partial/rejected/expired, a different grain from
+`backtest_trades`' round-trip outcomes), `backtest_performance_metrics`
+(`run_id` unique + `metrics jsonb`, same bundle-not-wide-columns pattern
+as `strategy_simulations`), `backtest_walk_forward_folds` (real multi-fold
+results, deliberately parallel to but separate from `strategy_simulations`
+— that one is single-split trade-repartition, this one is genuinely
+rolling candle-replay), `backtest_strategy_comparisons` (pairwise run
+comparison + p-values + `promotion_recommended`, automatic status marking
+only, never automatic deletion/live application). No "Simulation Reports"
+table — a report is generated on demand from the above, same precedent as
+§3b's report having no storage table of its own.
+
+**Institutional Reliability Layer (§3d), migration `0008`** — 5 new tables
++ 4 new columns, all with safe defaults that preserve today's exact
+behavior until a human opts in: `data_quality_log` (one row per issue
+found, live or backtest ingestion), `drift_alerts`, `strategy_health_scores`
+(a history per version, not just latest-value), `system_metrics` (one
+generic table, matching the jsonb-bundle precedent rather than N
+single-purpose tables), `circuit_breaker_state` (DB-backed so a trip
+survives across cron invocations). New columns:
+`capital_config.sizing_mode` (default `'flat'`), `strategy_versions.status`
+(default `'active'`), `opportunity_evaluations.config_version` +
+`.market_regime`. Unique among this repo's migrations: `get_latest_version()`/
+`get_latest_promoted_version()` now filter on `strategy_versions.status`,
+so unlike every prior migration (which only left a *new* feature dark
+until run), **this one must be applied before its corresponding code
+deploys** — those two functions gate every live trading cycle.
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
@@ -545,11 +1021,20 @@ GitHub Actions (cron */10) ─┬─> orchestrator.py --mode=paper ─┐
                              └─> orchestrator.py --mode=real  ─┤
                                  (no-op if nothing promoted)   │
                                                                 ▼
-GitHub Actions (daily cron) ──> evolution_agent.py ──┐    Supabase (Postgres)
-                                                       └──────────▲
-                                                                  │
-Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ──┘
+GitHub Actions (daily cron) ──> evolution_agent.py ────┐  Supabase (Postgres)
+                             └─> adaptive_strategy_engine.py ┤◄──────▲
+                                 (same job, after evolution_agent)   │
+                                                                      │
+Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ──────┘
 ```
+
+The Backtesting Engine (§3c) is deliberately absent from this diagram — it
+runs on demand (`python -m src.backtest.engine`/`ingest_data`), never on a
+schedule, same precedent as `seed_config.py`. The Institutional Reliability
+Layer (§3d) IS in this diagram, but as new steps inside the existing three
+jobs, not new nodes: `src.monitoring.diagnostics` joins `risk_check.yml`
+(*/5 min), `src.learning.drift_detection`/`strategy_health` join
+`evolution.yml` (daily) — no 4th workflow file.
 
 ## 8. Dashboard (Next.js on Vercel)
 
@@ -620,13 +1105,47 @@ funds exist, before trusting it beyond the promotion gate.
 │   ├── features/                    # deterministic, zero-LLM scoring pipeline
 │   │   ├── feature_engine.py
 │   │   └── opportunity_scorer.py    # includes classify_market_regime
-│   ├── learning/                    # Trade Memory + Learning Engine, see §3a
+│   ├── learning/                    # Trade Memory + Learning Engine (§3a) + Adaptive Strategy Engine (§3b)
 │   │   ├── statistics.py
 │   │   ├── trade_memory.py
 │   │   ├── confidence_calibration.py
 │   │   ├── feature_importance.py
 │   │   ├── recommendations.py
-│   │   └── reports.py
+│   │   ├── simulation.py            # walk-forward validation, §3b
+│   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b
+│   │   ├── reports.py
+│   │   ├── drift_detection.py       # Feature Drift Detection, §3d
+│   │   └── strategy_health.py       # Strategy Health Engine, §3d
+│   ├── backtest/                    # Event-Driven Backtesting Engine (§3c) — on-demand CLI, not scheduled
+│   │   ├── events.py
+│   │   ├── simulation_clock.py
+│   │   ├── data_provider.py
+│   │   ├── order_manager.py
+│   │   ├── execution_simulator.py
+│   │   ├── portfolio_manager.py
+│   │   ├── engine.py                # BacktestEngine, the reactor loop
+│   │   ├── performance_analyzer.py
+│   │   ├── trade_analysis.py
+│   │   ├── walk_forward_validator.py
+│   │   ├── strategy_comparison.py
+│   │   ├── statistical_validation.py
+│   │   ├── overfitting_detection.py
+│   │   ├── report.py
+│   │   └── ingest_data.py           # CLI: backfills historical_candles
+│   ├── data_quality/                # Market Data Quality Engine + Data Repair Engine (§3d)
+│   │   ├── validator.py             # MarketDataValidator
+│   │   └── repair.py                # DataRepairEngine
+│   ├── portfolio/                   # Portfolio Intelligence + Capital Allocation (§3d)
+│   │   ├── intelligence.py
+│   │   └── capital_allocation.py
+│   ├── execution_optimizer/         # Execution Optimizer (§3d)
+│   │   └── optimizer.py
+│   ├── monitoring/                  # Production Monitoring + Self-Diagnostics (§3d)
+│   │   ├── metrics.py
+│   │   └── diagnostics.py
+│   ├── audit/                       # Audit System (§3d) — read-only decision-trail join
+│   │   └── trail.py
+│   ├── resilience.py                # retry/backoff + DB-backed circuit breaker (§3d)
 │   └── db/
 │       ├── models.py
 │       └── migrations/
@@ -634,7 +1153,10 @@ funds exist, before trusting it beyond the promotion gate.
 │           ├── 0002_rls.sql
 │           ├── 0003_pause_flag.sql
 │           ├── 0004_opportunity_evaluations.sql
-│           └── 0005_learning_engine.sql
+│           ├── 0005_learning_engine.sql
+│           ├── 0006_adaptive_strategy_engine.sql
+│           ├── 0007_backtesting_engine.sql
+│           └── 0008_reliability_layer.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

@@ -181,5 +181,292 @@ CONFIDENCE_BUCKET_WIDTH = float(os.getenv("CONFIDENCE_BUCKET_WIDTH", "10"))
 # recommendations (Step 8, advisory only, never auto-applied) and
 # feature_importance both need enough samples before a suggestion/correlation
 # means anything rather than reading noise as signal — same floor, one knob.
+# Also reused (deliberately, not duplicated) as the "trust this bucket"
+# floor for the adaptive confidence modifiers below.
 RECOMMENDATION_MIN_IMPROVEMENT_PCT = float(os.getenv("RECOMMENDATION_MIN_IMPROVEMENT_PCT", "15"))
 RECOMMENDATION_MIN_SAMPLE_SIZE = int(os.getenv("RECOMMENDATION_MIN_SAMPLE_SIZE", "20"))
+# Absolute expectancy-delta floor, alongside the relative-percent check
+# above — needed once recommendations get generated per symbol/regime
+# bucket, where a near-zero baseline expectancy makes the relative-percent
+# check trivially pass on a meaningless swing.
+MIN_EXPECTANCY_DELTA = float(os.getenv("MIN_EXPECTANCY_DELTA", "1.0"))
+
+# --- Adaptive Strategy Intelligence Engine -----------------------------------
+# Closes the loop from the Learning Engine's statistics back into advisory
+# recommendations — never auto-applied to config/live scoring (human
+# approves in Supabase, same as `recommendations` already works). The one
+# automatic piece is the confidence-modifier chain below, which extends the
+# already-automatic (and inert-by-default, MIN_FINAL_CONFIDENCE=0)
+# calibrate_confidence gate. Pure statistics throughout — no ML/RL.
+
+# Walk-forward validation: generate a recommendation using only the older
+# TRAIN fraction of LEARNING_HISTORY_WINDOW_DAYS, evaluate it only against
+# the newer TEST fraction — never touched during generation.
+ADAPTIVE_TRAIN_TEST_SPLIT_PCT = float(os.getenv("ADAPTIVE_TRAIN_TEST_SPLIT_PCT", "0.7"))
+# p-value threshold (two-sample z-test, normal approximation) below which a
+# simulated improvement counts as statistically significant, not noise.
+SIGNIFICANCE_THRESHOLD = float(os.getenv("SIGNIFICANCE_THRESHOLD", "0.05"))
+
+# Adaptive confidence chain: base (AI+historical, unchanged) + regime +
+# symbol + recent-performance modifiers, each capped and gated on sample
+# size. Regime/symbol share one formula and one pair of constants since
+# both are "this bucket's win rate vs. the overall baseline".
+BUCKET_MODIFIER_SENSITIVITY = float(os.getenv("BUCKET_MODIFIER_SENSITIVITY", "20"))
+BUCKET_MODIFIER_CAP = float(os.getenv("BUCKET_MODIFIER_CAP", "10"))
+RECENT_PERFORMANCE_LOOKBACK_TRADES = int(os.getenv("RECENT_PERFORMANCE_LOOKBACK_TRADES", "10"))
+# Deliberately asymmetric defaults — a losing streak can suppress
+# confidence more than a winning streak inflates it (standard
+# risk-management practice), but both are independently configurable.
+RECENT_STREAK_WIN_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_WIN_MODIFIER_CAP", "5"))
+RECENT_STREAK_LOSS_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_LOSS_MODIFIER_CAP", "15"))
+
+# --- Event-Driven Backtesting & Walk-Forward Validation Engine --------------
+# Replays real historical OHLCV (CoinDCX's public candles endpoint supports
+# startTime/endTime even though src/coindcx_client.py's live wrapper doesn't
+# expose them) through the same pure pipeline functions live trading uses
+# (feature engine, opportunity scorer, risk manager) — see PROJECT_SPEC.md
+# §3c. On-demand CLI only (python -m src.backtest.engine), not a cron job.
+
+# Finest granularity the SimulationClock ticks at — governs candle
+# visibility/no-look-ahead ONLY, not how often scoring/risk logic fires
+# (that's the two cadences below, kept deliberately separate). Must be one
+# of FEATURE_TIMEFRAMES.
+BACKTEST_TICK_TIMEFRAME = os.getenv("BACKTEST_TICK_TIMEFRAME") or "1m"
+# Mirrors trading_cycle.yml's */10 cron — when the full scoring+risk+entry/
+# exit pass fires.
+BACKTEST_DECISION_CYCLE_MINUTES = int(os.getenv("BACKTEST_DECISION_CYCLE_MINUTES", "10"))
+# Mirrors risk_check.yml's */5 cron — when the stop-loss/take-profit sweep
+# fires, independent of the decision cycle above (same polling-gap
+# limitation as live: not continuous, see PROJECT_SPEC.md §2).
+BACKTEST_RISK_CHECK_MINUTES = int(os.getenv("BACKTEST_RISK_CHECK_MINUTES", "5"))
+# Historical candles are ingested from (start_date - this many days) so
+# FEATURE_CANDLE_LIMIT/EMA_TREND_PERIOD_4's ~200-bar warm-up requirement is
+# satisfied BEFORE the requested backtest window starts — otherwise every
+# run would silently find zero candidates for its first ~200 days.
+BACKTEST_WARMUP_BUFFER_DAYS = int(os.getenv("BACKTEST_WARMUP_BUFFER_DAYS", "260"))
+
+BACKTEST_STARTING_CAPITAL = float(os.getenv("BACKTEST_STARTING_CAPITAL", "100000"))
+BACKTEST_POSITION_SIZE_PCT = float(os.getenv("BACKTEST_POSITION_SIZE_PCT", "10"))
+BACKTEST_MAX_CONCURRENT_POSITIONS = int(os.getenv("BACKTEST_MAX_CONCURRENT_POSITIONS", "5"))
+
+# Execution simulation. Independent of execution/paper.py's own hardcoded
+# SLIPPAGE_BPS (that module's live behavior is untouched) — commission
+# reuses paper.py's exact fee formula directly, everything else here is new.
+BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "5"))
+# Synthetic half-spread cost — CoinDCX exposes no historical order-book
+# snapshots (get_orderbook is live-only, never called historically), so
+# real book-depth replay isn't possible; this is a documented approximation.
+BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "10"))
+BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME = float(os.getenv("BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME", "10"))
+BACKTEST_FILL_DELAY_BARS = int(os.getenv("BACKTEST_FILL_DELAY_BARS", "0"))
+BACKTEST_ORDER_EXPIRY_BARS = int(os.getenv("BACKTEST_ORDER_EXPIRY_BARS", "20"))
+BACKTEST_MAX_RETRY_ATTEMPTS = int(os.getenv("BACKTEST_MAX_RETRY_ATTEMPTS", "3"))
+# Mirrors CoinDCX's real ~₹100 min_notional (see README's real-execution
+# caveat) as a rejection floor for simulated orders.
+BACKTEST_MIN_NOTIONAL_INR = float(os.getenv("BACKTEST_MIN_NOTIONAL_INR", "100"))
+
+# All resampling (bootstrap CI, Monte Carlo trade-order shuffling) draws
+# from a local random.Random(BACKTEST_RANDOM_SEED) instance, never the
+# global `random` module — reruns are bit-identical, satisfying
+# "everything must be deterministic."
+BACKTEST_RANDOM_SEED = int(os.getenv("BACKTEST_RANDOM_SEED", "42"))
+BACKTEST_BOOTSTRAP_ITERATIONS = int(os.getenv("BACKTEST_BOOTSTRAP_ITERATIONS", "1000"))
+BACKTEST_MONTE_CARLO_ITERATIONS = int(os.getenv("BACKTEST_MONTE_CARLO_ITERATIONS", "1000"))
+
+BACKTEST_WALK_FORWARD_N_FOLDS = int(os.getenv("BACKTEST_WALK_FORWARD_N_FOLDS", "5"))
+BACKTEST_WALK_FORWARD_TRAIN_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TRAIN_DAYS", "90"))
+BACKTEST_WALK_FORWARD_TEST_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TEST_DAYS", "30"))
+# RECOMMENDATION_MIN_SAMPLE_SIZE and SIGNIFICANCE_THRESHOLD (above) are
+# reused directly for the fold-sample-size gate and pass/fail checks — no
+# duplicate constants. Below that per-fold sample floor, folds report
+# "insufficient sample" (None) rather than a hand-rolled Student's-t
+# p-value — this codebase has zero numpy/scipy, and a parametric t-test
+# needs a regularized-incomplete-beta implementation that's real numerical
+# bug surface for little gain over the existing z-test at this sample size;
+# small-n confidence intervals are answered by the seeded bootstrap above
+# instead, which needs no distributional assumption at all.
+
+# Off by default: quant-only (feature engine + opportunity scorer + risk
+# manager) is the deterministic default that actually satisfies "everything
+# must be deterministic" — the live LLM signal agent is temperature-sampled.
+# When enabled, validate_opportunity() is reused as-is for realism, but the
+# historical-confidence/regime/symbol blend is deliberately NOT reused (it
+# queries LIVE current trades/learning_statistics, which would leak
+# present-day trade history into a historical decision) — LLM-mode
+# confidence is the raw AI verdict only, and is labeled non-reproducible in
+# reports rather than fed into PerformanceAnalyzer's trusted default metrics.
+BACKTEST_USE_LLM_SIGNAL_AGENT = (os.getenv("BACKTEST_USE_LLM_SIGNAL_AGENT") or "false").strip().lower() == "true"
+
+# CoinDCX's public candles endpoint caps at 500 rows per call regardless of
+# the requested startTime/endTime range (confirmed empirically) — named
+# here so pagination logic has no magic number.
+BACKTEST_CANDLE_PAGE_SIZE = int(os.getenv("BACKTEST_CANDLE_PAGE_SIZE", "500"))
+
+# --- Market Data Quality Engine + Data Repair Engine ------------------------
+# src/data_quality/validator.py + repair.py. One shared entry point for both
+# live (data_agent.py, right after get_candles()) and backtest (data_provider
+# .py::ingest, once at ingest time) — see PROJECT_SPEC.md §3d. Each check
+# maps to a severity; "reject" drops the offending candle(s) from what
+# reaches the Feature Engine, "quarantine" drops the whole symbol for that
+# fetch, "warn" logs but passes through, "ignore" doesn't even log.
+DATA_QUALITY_SEVERITY_MISSING_CANDLE = os.getenv("DATA_QUALITY_SEVERITY_MISSING_CANDLE") or "warn"
+DATA_QUALITY_SEVERITY_DUPLICATE = os.getenv("DATA_QUALITY_SEVERITY_DUPLICATE") or "warn"
+DATA_QUALITY_SEVERITY_NEGATIVE_PRICE = os.getenv("DATA_QUALITY_SEVERITY_NEGATIVE_PRICE") or "reject"
+DATA_QUALITY_SEVERITY_INVALID_OHLC = os.getenv("DATA_QUALITY_SEVERITY_INVALID_OHLC") or "reject"
+DATA_QUALITY_SEVERITY_OUT_OF_ORDER = os.getenv("DATA_QUALITY_SEVERITY_OUT_OF_ORDER") or "warn"
+DATA_QUALITY_SEVERITY_TIMESTAMP_GAP = os.getenv("DATA_QUALITY_SEVERITY_TIMESTAMP_GAP") or "warn"
+DATA_QUALITY_SEVERITY_ZERO_VOLUME = os.getenv("DATA_QUALITY_SEVERITY_ZERO_VOLUME") or "warn"
+DATA_QUALITY_SEVERITY_PRICE_SPIKE = os.getenv("DATA_QUALITY_SEVERITY_PRICE_SPIKE") or "warn"
+DATA_QUALITY_SEVERITY_EXCHANGE_OUTAGE = os.getenv("DATA_QUALITY_SEVERITY_EXCHANGE_OUTAGE") or "reject"
+DATA_QUALITY_SEVERITY_CLOCK_DRIFT = os.getenv("DATA_QUALITY_SEVERITY_CLOCK_DRIFT") or "warn"
+DATA_QUALITY_SEVERITY_SYMBOL_MISMATCH = os.getenv("DATA_QUALITY_SEVERITY_SYMBOL_MISMATCH") or "reject"
+DATA_QUALITY_SEVERITY_TIMEFRAME_CHANGE = os.getenv("DATA_QUALITY_SEVERITY_TIMEFRAME_CHANGE") or "warn"
+# Pct jump vs. the prior close (same-timeframe) beyond which a candle counts
+# as an extreme spike, not ordinary volatility.
+DATA_QUALITY_PRICE_SPIKE_PCT_THRESHOLD = float(os.getenv("DATA_QUALITY_PRICE_SPIKE_PCT_THRESHOLD", "20"))
+# Live-fetch path only (candle time vs. wall clock) — meaningless on
+# historical/backtest data, which is never "now".
+DATA_QUALITY_CLOCK_DRIFT_SECONDS_THRESHOLD = int(
+    os.getenv("DATA_QUALITY_CLOCK_DRIFT_SECONDS_THRESHOLD", "300")
+)
+# A gap this many bars or fewer gets linearly interpolated by the repair
+# engine; wider gaps are left rejected — repairing a large hole would
+# fabricate market data, not recover from a blip.
+DATA_REPAIR_MAX_GAP_BARS = int(os.getenv("DATA_REPAIR_MAX_GAP_BARS", "3"))
+
+# --- Portfolio Intelligence Engine ------------------------------------------
+# src/portfolio/intelligence.py. Pure functions — no DB/network access; the
+# caller (live risk_manager or the backtest engine) supplies positions and
+# an already-as-of-truncated price_history. See PROJECT_SPEC.md §3d.
+
+# "SYMBOL:category,SYMBOL:category" — no external crypto-category taxonomy
+# exists for this bot to query, so this is a manually maintained mapping.
+# Unmapped symbols fall into "uncategorized", never a guessed category.
+COIN_CATEGORY_MAP = {
+    sym.strip().upper(): category.strip()
+    for sym, category in (
+        pair.split(":") for pair in (os.getenv("COIN_CATEGORY_MAP") or "").split(",") if pair.strip()
+    )
+}
+PORTFOLIO_VAR_CONFIDENCE_PCT = float(os.getenv("PORTFOLIO_VAR_CONFIDENCE_PCT", "95"))
+# Rolling-correlation / beta window width, in bars of whatever price_history
+# the caller supplied (daily closes for a live snapshot, backtest ticks for
+# a backtest run) — not a separate data fetch.
+PORTFOLIO_CORRELATION_LOOKBACK_BARS = int(os.getenv("PORTFOLIO_CORRELATION_LOOKBACK_BARS", "30"))
+# Market proxy for beta regression — no broad crypto index exists on
+# CoinDCX, BTC is the closest thing to a market benchmark.
+PORTFOLIO_BETA_PROXY_SYMBOL = os.getenv("PORTFOLIO_BETA_PROXY_SYMBOL") or "BTCINR"
+# Concentration caps scale with capital_config.max_concurrent_positions
+# rather than a fixed institutional-style percentage: an equal-weighted
+# N-position book has each position at 1/N already, so a flat 25% cap
+# would block nearly every trade in this bot's actual 2-5-position range
+# (a real bug a test caught — the very first position in a 2-slot book is
+# structurally 100% concentrated, which isn't "too concentrated", it's
+# just what one position looks like). "Equal share" = 100/max_concurrent_
+# positions; the cap is that share times this multiple.
+MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE = float(
+    os.getenv("MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE", "2.0")
+)
+MAX_SECTOR_CONCENTRATION_MULT_OF_EQUAL_SHARE = float(
+    os.getenv("MAX_SECTOR_CONCENTRATION_MULT_OF_EQUAL_SHARE", "2.5")
+)
+
+# --- Capital Allocation Engine ----------------------------------------------
+# src/portfolio/capital_allocation.py. Only used when capital_config.
+# sizing_mode='dynamic' — the DB row default is 'flat' (today's exact flat
+# capital_to_use*position_size_pct/100 formula, byte-identical), so this
+# whole block is inert until a human flips a mode's row in Supabase. Each
+# factor is an independent multiplier clamped to its own MIN/MAX, and the
+# combined product is clamped again — no single factor or their product can
+# blow sizing out unboundedly. See PROJECT_SPEC.md §3d.
+CAPITAL_ALLOC_CORRELATION_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_CORRELATION_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_CORRELATION_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_CORRELATION_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_VOLATILITY_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_VOLATILITY_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_VOLATILITY_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_VOLATILITY_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_DRAWDOWN_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_DRAWDOWN_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_DRAWDOWN_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_DRAWDOWN_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_EXPOSURE_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_EXPOSURE_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_EXPOSURE_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_EXPOSURE_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MIN_MULT = float(
+    os.getenv("CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MIN_MULT", "0.5")
+)
+CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MAX_MULT = float(
+    os.getenv("CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MAX_MULT", "1.5")
+)
+CAPITAL_ALLOC_REGIME_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_REGIME_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_REGIME_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_REGIME_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_CONFIDENCE_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_CONFIDENCE_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_CONFIDENCE_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_CONFIDENCE_MAX_MULT", "1.5"))
+# Clamp on the product of every factor above, the final safety rail before
+# the result still has to clear risk_manager's existing committed_capital
+# ceiling unchanged.
+CAPITAL_ALLOC_TOTAL_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_TOTAL_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MAX_MULT", "1.5"))
+
+# --- Execution Optimizer ----------------------------------------------------
+# src/execution_optimizer/optimizer.py. Real trades: recommendation is
+# computed and audit-logged only, RealExecutionAgent stays market-only
+# (unverified/inert, see PROJECT_SPEC.md §2). Paper trades: config-gated
+# opt-in to actually act on a recommended order type via the existing
+# backtest execution_simulator's fill logic (paper is simulated — safe to
+# exercise). Off by default.
+EXECUTION_OPTIMIZER_ENABLED = (os.getenv("EXECUTION_OPTIMIZER_ENABLED") or "false").strip().lower() == "true"
+# Spread above this favors a limit order (avoid crossing a wide synthetic
+# spread) over a market order, when the estimated fill probability clears
+# the floor below.
+EXECUTION_OPTIMIZER_SPREAD_BPS_LIMIT_THRESHOLD = float(
+    os.getenv("EXECUTION_OPTIMIZER_SPREAD_BPS_LIMIT_THRESHOLD", "15")
+)
+EXECUTION_OPTIMIZER_MIN_FILL_PROBABILITY = float(
+    os.getenv("EXECUTION_OPTIMIZER_MIN_FILL_PROBABILITY", "0.7")
+)
+
+# --- Feature Drift Detection -------------------------------------------------
+# src/learning/drift_detection.py. Runs as its own independent nightly step
+# in evolution.yml (never merged into evolution_agent.run_evolution() or
+# adaptive_strategy_engine — same "don't couple independent learning steps"
+# rule those two already follow). Advisory only, writes to drift_alerts;
+# nothing here touches config.py or scoring weights.
+DRIFT_BASELINE_WINDOW_DAYS = int(os.getenv("DRIFT_BASELINE_WINDOW_DAYS", "90"))
+DRIFT_RECENT_WINDOW_DAYS = int(os.getenv("DRIFT_RECENT_WINDOW_DAYS", "14"))
+# Population Stability Index (hand-rolled bucketed frequency ratio, no
+# scipy) — <0.1 stable, 0.1-0.25 warning, >=0.25 critical, an industry-
+# standard convention for this metric.
+DRIFT_PSI_WARNING_THRESHOLD = float(os.getenv("DRIFT_PSI_WARNING_THRESHOLD", "0.1"))
+DRIFT_PSI_CRITICAL_THRESHOLD = float(os.getenv("DRIFT_PSI_CRITICAL_THRESHOLD", "0.25"))
+DRIFT_PSI_BUCKET_COUNT = int(os.getenv("DRIFT_PSI_BUCKET_COUNT", "10"))
+
+# --- Strategy Health Engine --------------------------------------------------
+# src/learning/strategy_health.py. Health-score tiers, checked in descending
+# order (>=EXCELLENT -> Excellent, >=GOOD -> Good, >=WARNING -> Warning,
+# else Critical). Auto-suspension marks strategy_versions.status='suspended'
+# only (never a delete) — reversible in Supabase at any time.
+STRATEGY_HEALTH_EXCELLENT_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_EXCELLENT_THRESHOLD", "80"))
+STRATEGY_HEALTH_GOOD_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_GOOD_THRESHOLD", "60"))
+STRATEGY_HEALTH_WARNING_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_WARNING_THRESHOLD", "40"))
+STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED = (
+    os.getenv("STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED") or "true"
+).strip().lower() == "true"
+# RECOMMENDATION_MIN_SAMPLE_SIZE (above) is reused directly as the "trust
+# this health score" trade-count floor — no duplicate constant.
+
+# --- Production Monitoring & Self-Diagnostics -------------------------------
+# src/monitoring/. Scoped to what's real for short-lived GitHub Actions cron
+# invocations (stateless, Supabase as the only durable state) rather than
+# invented long-running-server metaphors. diagnostics runs as a new step in
+# risk_check.yml (every 5 min, already the finest-grained cron) — no new
+# workflow file. See PROJECT_SPEC.md §3d.
+SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES = int(os.getenv("SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES", "30"))
+SYSTEM_METRICS_LEARNING_STALE_HOURS = int(os.getenv("SYSTEM_METRICS_LEARNING_STALE_HOURS", "48"))
+
+# --- Resilience --------------------------------------------------------------
+# src/resilience.py. retry_with_backoff() wraps coindcx_client.py's requests
+# calls and db/models.py's Supabase calls (both zero-retry before this) —
+# same backoff shape groq_client.py already used for LLM calls, now the one
+# shared implementation. The circuit breaker is DB-backed (survives across
+# cron invocations) and fails OPEN on its own write errors — a Supabase
+# outage can't block itself from being recorded as a Supabase outage.
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE_DELAY_SECONDS = float(os.getenv("RETRY_BASE_DELAY_SECONDS", "1"))
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "300"))
