@@ -205,29 +205,99 @@ because scoring is pure math.
   version — versions are immutable once created).
 - Checks promotion criteria (§2) for the current paper version and sets
   `promoted_to_real` when met.
+- Also runs the Learning Engine's periodic passes (§3a): `compute_feature_importance`
+  and `generate_recommendations` — piggybacked on this existing nightly
+  cron rather than a new workflow, since both are batch statistical
+  passes over a growing dataset, not per-cycle work.
 
 ### Reporting Agent (`src/agents/reporting_agent.py`)
 - Generates an HTML report covering both modes side by side: PnL vs
   target, trade log, current strategy version + changelog, model
-  fallback stats (from `model_usage`).
+  fallback stats (from `model_usage`), and a Learning Insights section
+  (§3a) — best/worst regimes, symbols, score ranges, most-profitable
+  hour/weekday, longest win/loss streak.
 
 ### Orchestrator (`src/orchestrator.py`)
 - Single script invocation, one full cycle, then exit. Invoked per mode
   (paper, real) — real invocation is a no-op if no version is promoted.
 - Sequence: check circuit-breaker state for today → stop-loss/take-profit
-  sweep (`_sweep_stop_loss_take_profit`, zero LLM) → circuit-breaker
-  recheck → Data Agent → **Pass 1** (pure, no LLM): Feature Engine +
-  Opportunity Scorer score every scanned symbol, split into
-  not-held/held, `select_top_candidates` picks the entry candidate set →
-  **Pass 2**: for each scanned symbol, circuit-breaker check (same
-  position as before every buy, preserved from the original design) →
-  entry candidates and score-deteriorated held positions go to Signal
-  Agent validation → accepted entries go through Risk Manager → Execution
-  Agent → every symbol reaching Pass 2 gets exactly one
-  `opportunity_evaluations` row logged regardless of outcome (most with
-  `llm_decision = null` — the checkable proof LLM call volume actually
-  dropped), plus `trades` / `daily_pnl` / `agent_logs` / `model_usage` as
-  before.
+  sweep (`_sweep_stop_loss_take_profit`, zero LLM, also updates MFE/MAE
+  for every open trade — §3a) → circuit-breaker recheck → Data Agent →
+  **Pass 1** (pure, no LLM): Feature Engine + Opportunity Scorer score
+  every scanned symbol (now including a `market_regime` classification),
+  split into not-held/held, `select_top_candidates` picks the entry
+  candidate set → **Pass 2**: for each scanned symbol, circuit-breaker
+  check (same position as before every buy, preserved from the original
+  design) → entry candidates: `find_similar_trades` (§3a) first, its
+  result feeds both the Signal Agent's prompt and, after the LLM
+  responds, `calibrate_confidence` blends the LLM's own confidence with
+  the historical figure — a `MIN_FINAL_CONFIDENCE` gate (default 0,
+  permissive) sits alongside the existing Risk Manager check before
+  `place_order` → score-deteriorated held positions go straight to Signal
+  Agent exit validation (no similarity search on exits — the SL/TP sweep
+  and `EXIT_SCORE_THRESHOLD` already cover that path) → every symbol
+  reaching Pass 2 gets exactly one `opportunity_evaluations` row logged
+  regardless of outcome (most with `llm_decision = null` — the checkable
+  proof LLM call volume actually dropped), plus `trades` / `daily_pnl` /
+  `agent_logs` / `model_usage` as before → `process_closed_trades` (§3a)
+  runs once at the end, catching up self-evaluation/statistics for any
+  trade closed since the last pass, regardless of which path closed it.
+
+## 3a. Trade Memory + Learning Engine (`src/learning/`)
+
+Pure statistics over closed trades — no ML/RL, no external libraries.
+Every completed trade's entry-time context is captured (`trades` +
+`opportunity_evaluations`, linked via `opportunity_evaluations.trade_id`)
+so later cycles can learn from it. Outputs are only as reliable as trade
+volume allows — every ratio/correlation below returns `None` (or skips
+writing entirely) rather than fabricating a number from too little data;
+this is expected to be noisy until real trade history accumulates.
+
+- **`statistics.py`**: `compute_bucket_statistics` extends
+  `evolution_agent.compute_metrics` (win_rate/avg_win/avg_loss/
+  cumulative_pnl/max_drawdown_pct — imported, not reimplemented) with
+  Sharpe (`mean/stdev` of `pnl/capital_to_use` per trade), Sortino
+  (deviation from zero over *all* trades, not the stdev of losses alone —
+  a different, non-standard statistic), Calmar
+  (`cumulative_pnl_pct / max_drawdown_pct`, both percent-normalized),
+  expectancy, and profit factor. `process_closed_trades(mode)` is the
+  path-independent catch-up entry point: finds closed trades without a
+  `trade_evaluations` row yet (Python-side diff, not a DB join — no
+  precedent for embedded Supabase queries in this codebase), regardless
+  of whether they closed via the SL/TP sweep, an LLM-validated exit, or a
+  circuit-breaker flatten, self-evaluates each, and upserts every
+  `learning_statistics` bucket (symbol / market_regime /
+  opportunity_score_bucket / confidence_bucket / strategy_version /
+  weekday / hour — IST-converted) it belongs to, bounded by
+  `LEARNING_HISTORY_WINDOW_DAYS`.
+- **`trade_memory.py`**: `find_similar_trades` — Euclidean distance over
+  the 5 already-computed sub-scores (not raw candles) against a bounded,
+  time-windowed pool of past entries with known outcomes, filtered by
+  `SIMILARITY_MAX_DISTANCE` then requiring `MIN_SIMILAR_TRADES` survivors
+  before returning a historical win rate at all.
+- **`confidence_calibration.py`**: `calibrate_confidence` blends the
+  LLM's own stated confidence (new `confidence` field in
+  `validate_opportunity`'s JSON contract) with the historical win rate,
+  configurable weights, collapsing to AI-only when history is thin.
+- **`feature_importance.py`**: point-biserial correlation (hand-rolled
+  sums — `statistics.correlation` needs Python 3.10+, this repo's local
+  dev interpreter is 3.9) between each raw Feature Engine value (primary
+  timeframe) and win/loss outcome, gated behind a minimum sample size.
+- **`recommendations.py`**: advisory-only threshold suggestions (e.g.
+  "trades scoring ≥82 outperform the current `MIN_OPPORTUNITY_SCORE=60`
+  by X%") — never auto-applied to config, human approval required, no
+  dashboard surface yet (inspect the `recommendations` table directly).
+  Idempotent by construction: skipped if not materially different from
+  the latest existing recommendation for that metric.
+- **`reports.py`**: `generate_learning_report_html`, wired into
+  `reporting_agent.py`'s existing report as one more section, not a
+  parallel report.
+- Market regime classification lives in `src/features/opportunity_scorer.py`
+  (`classify_market_regime`, folded into `score_opportunity`'s return —
+  reuses `score_trend`, already computed) rather than a separate module:
+  `sideways` / `high_volatility` / `strong_bull` / `weak_bull` /
+  `strong_bear` / `weak_bear`, derived from ADX + trend_score, no separate
+  "trending" label (redundant with strong_bull/strong_bear).
 
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
@@ -303,20 +373,27 @@ strategy_versions (
 
 -- trades: one row per position, paper or real
 trades (
-  id             bigserial primary key,
-  mode           text not null,              -- 'paper' | 'real'
-  version_id     bigint not null references strategy_versions(id),
-  symbol         text not null,              -- e.g. 'BTCINR'
-  side           text not null,              -- 'buy' | 'sell'
-  qty            numeric not null,
-  entry_price    numeric not null,
-  exit_price     numeric,
-  pnl            numeric,
-  fees           numeric not null default 0,
-  status         text not null,              -- 'open' | 'closed' | 'flattened'
-  opened_at      timestamptz not null default now(),
-  closed_at      timestamptz,
-  reasoning_text text                        -- full LLM reasoning for this trade
+  id                  bigserial primary key,
+  mode                text not null,              -- 'paper' | 'real'
+  version_id          bigint not null references strategy_versions(id),
+  symbol              text not null,              -- e.g. 'BTCINR'
+  side                text not null,              -- 'buy' | 'sell'
+  qty                 numeric not null,
+  entry_price         numeric not null,
+  exit_price          numeric,
+  pnl                 numeric,
+  fees                numeric not null default 0,
+  status              text not null,              -- 'open' | 'closed' | 'flattened'
+  opened_at           timestamptz not null default now(),
+  closed_at           timestamptz,
+  reasoning_text      text,                       -- full LLM reasoning for this trade
+  stop_loss_price     numeric,                    -- entry-time dollar level, 0005_learning_engine.sql
+  take_profit_price   numeric,
+  entry_slippage_pct  numeric,                    -- signed, vs. market["last_price"] at decision time
+  mfe_pct             numeric not null default 0, -- running max favorable excursion, updated by the SL/TP sweep
+  mae_pct             numeric not null default 0, -- running max adverse excursion
+  exit_reason         text,                       -- 'stop_loss' | 'take_profit' | 'ai_exit' | 'circuit_breaker'
+  market_regime       text                        -- entry-time classification, see §3a
 )
 
 -- daily_pnl: one row per (date, mode)
@@ -370,9 +447,89 @@ opportunity_evaluations (
   llm_raw_response    jsonb,                   -- full parsed verdict, null when no LLM call
   risk_manager_result text,                    -- 'size' | 'block_circuit_breaker' | 'block_max_positions' | 'block_capital_limit' | null
   final_decision      text not null,           -- 'buy' | 'sell' | 'hold' | 'circuit_breaker'
-  reason              text
+  reason              text,
+  trade_id            bigint references trades(id)  -- 0005_learning_engine.sql; one trade can have 2 rows (entry + an LLM-validated exit)
+)
+
+-- learning_statistics: EAV-style bucketed stats, upserted in place on
+-- recompute (0005_learning_engine.sql, see §3a)
+learning_statistics (
+  id                      bigserial primary key,
+  mode                    text not null,
+  dimension_type          text not null,        -- symbol | market_regime | opportunity_score_bucket | confidence_bucket | strategy_version | weekday | hour
+  dimension_value         text not null,
+  trades_count            int not null default 0,
+  win_rate                numeric,
+  avg_profit              numeric,
+  avg_loss                numeric,
+  profit_factor           numeric,
+  expectancy              numeric,
+  avg_holding_time_seconds numeric,
+  max_drawdown_pct        numeric,
+  sharpe_ratio            numeric,
+  sortino_ratio           numeric,
+  calmar_ratio            numeric,
+  computed_at             timestamptz not null default now(),
+  unique (mode, dimension_type, dimension_value)
+)
+
+-- feature_importance: point-biserial correlation, primary timeframe only
+feature_importance (
+  id                bigserial primary key,
+  mode              text not null,
+  feature_name      text not null,             -- a Feature Engine FEATURE_KEYS entry
+  correlation_score numeric,
+  sample_count      int not null default 0,
+  computed_at       timestamptz not null default now(),
+  unique (mode, feature_name)
+)
+
+-- confidence_calibration: audit log, one row per entry-validation call
+-- (not aggregate stats — what was actually applied to a specific decision)
+confidence_calibration (
+  id                        bigserial primary key,
+  opportunity_evaluation_id bigint not null references opportunity_evaluations(id),
+  ai_confidence             numeric,
+  historical_confidence     numeric,
+  ai_weight                 numeric,
+  historical_weight         numeric,
+  final_confidence          numeric,
+  similar_trades_count      int not null default 0,
+  created_at                timestamptz not null default now()
+)
+
+-- recommendations: advisory only, human approval required, never
+-- auto-applied. Append-only (idempotency enforced in application code).
+recommendations (
+  id                bigserial primary key,
+  mode              text not null,
+  metric_name       text not null,
+  current_value     numeric,
+  recommended_value numeric,
+  rationale         text,
+  sample_size       int not null default 0,
+  status            text not null default 'pending',  -- 'pending' | 'reviewed' | 'dismissed'
+  created_at        timestamptz not null default now()
+)
+
+-- trade_evaluations: 1:1 self-evaluation child of trades
+trade_evaluations (
+  trade_id                      bigint primary key references trades(id),
+  predicted_confidence          numeric,
+  predicted_opportunity_score   numeric,
+  actual_outcome_won            boolean not null,
+  confidence_was_accurate       boolean,
+  opportunity_score_was_accurate boolean,
+  risk_assessment               text,           -- 'appropriate' | 'too_aggressive'
+  stop_loss_assessment          text,           -- 'appropriate' | 'too_tight' | null
+  target_assessment             text,           -- 'realistic' | 'too_ambitious' | null
+  evaluated_at                  timestamptz not null default now()
 )
 ```
+
+No separate `market_regimes` table — `learning_statistics WHERE
+dimension_type='market_regime'` already is that data; a second table
+would duplicate it under a different name.
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
@@ -461,14 +618,22 @@ funds exist, before trusting it beyond the promotion gate.
 │   │       └── real.py
 │   ├── features/                    # deterministic, zero-LLM scoring pipeline
 │   │   ├── feature_engine.py
-│   │   └── opportunity_scorer.py
+│   │   └── opportunity_scorer.py    # includes classify_market_regime
+│   ├── learning/                    # Trade Memory + Learning Engine, see §3a
+│   │   ├── statistics.py
+│   │   ├── trade_memory.py
+│   │   ├── confidence_calibration.py
+│   │   ├── feature_importance.py
+│   │   ├── recommendations.py
+│   │   └── reports.py
 │   └── db/
 │       ├── models.py
 │       └── migrations/
 │           ├── 0001_init.sql
 │           ├── 0002_rls.sql
 │           ├── 0003_pause_flag.sql
-│           └── 0004_opportunity_evaluations.sql
+│           ├── 0004_opportunity_evaluations.sql
+│           └── 0005_learning_engine.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

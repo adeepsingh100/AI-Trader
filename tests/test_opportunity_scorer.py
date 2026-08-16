@@ -3,6 +3,7 @@ from unittest.mock import patch
 import pytest
 
 from src.features.opportunity_scorer import (
+    classify_market_regime,
     score_momentum,
     score_opportunity,
     score_risk,
@@ -185,3 +186,49 @@ def test_select_top_candidates_excludes_none_without_raising():
 
 def test_select_top_candidates_empty_input():
     assert select_top_candidates([], top_n=5, min_score=60) == []
+
+
+# --- classify_market_regime ---
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+@patch("src.features.opportunity_scorer.REGIME_ADX_TREND_THRESHOLD", 20)
+def test_classify_market_regime_sideways_on_low_adx():
+    features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=10, volatility_regime="low")
+    assert classify_market_regime(features) == "sideways"
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+@patch("src.features.opportunity_scorer.REGIME_ADX_TREND_THRESHOLD", 20)
+def test_classify_market_regime_high_volatility_overrides_trend():
+    features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=30, volatility_regime="high")
+    assert classify_market_regime(features) == "high_volatility"
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+@patch("src.features.opportunity_scorer.REGIME_ADX_TREND_THRESHOLD", 20)
+@patch("src.features.opportunity_scorer.REGIME_STRONG_TREND_SCORE_MIN", 75)
+def test_classify_market_regime_strong_bull_on_full_bullish_stack():
+    features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=30, volatility_regime="medium")
+    assert classify_market_regime(features) == "strong_bull"
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+@patch("src.features.opportunity_scorer.REGIME_ADX_TREND_THRESHOLD", 20)
+@patch("src.features.opportunity_scorer.REGIME_STRONG_TREND_SCORE_MIN", 75)
+def test_classify_market_regime_strong_bear_on_full_bearish_stack():
+    features = _by_tf(close=70, ema_20=80, ema_50=90, ema_100=100, ema_200=110, adx=30, volatility_regime="medium")
+    assert classify_market_regime(features) == "strong_bear"
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+def test_classify_market_regime_none_when_adx_unavailable():
+    features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=None)
+    assert classify_market_regime(features) is None
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+def test_score_opportunity_includes_market_regime():
+    features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=30, volatility_regime="medium")
+    result = score_opportunity(features)
+    assert "market_regime" in result

@@ -129,6 +129,10 @@ def open_trade(
     entry_price: float,
     fees: float,
     reasoning_text: str,
+    stop_loss_price: float | None = None,
+    take_profit_price: float | None = None,
+    entry_slippage_pct: float | None = None,
+    market_regime: str | None = None,
 ) -> dict:
     res = (
         get_client()
@@ -144,6 +148,10 @@ def open_trade(
                 "fees": fees,
                 "status": "open",
                 "reasoning_text": reasoning_text,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
+                "entry_slippage_pct": entry_slippage_pct,
+                "market_regime": market_regime,
             }
         )
         .execute()
@@ -151,19 +159,47 @@ def open_trade(
     return res.data[0]
 
 
-def close_trade(trade_id: int, exit_price: float, pnl: float, status: str = "closed") -> None:
+def close_trade(
+    trade_id: int, exit_price: float, pnl: float, status: str = "closed", exit_reason: str | None = None
+) -> None:
     get_client().table("trades").update(
         {
             "exit_price": exit_price,
             "pnl": pnl,
             "status": status,
+            "exit_reason": exit_reason,
             "closed_at": datetime.now(timezone.utc).isoformat(),
         }
     ).eq("id", trade_id).execute()
 
 
+def update_trade_excursion(trade_id: int, mfe_pct: float, mae_pct: float) -> None:
+    get_client().table("trades").update({"mfe_pct": mfe_pct, "mae_pct": mae_pct}).eq(
+        "id", trade_id
+    ).execute()
+
+
 def get_open_trades(mode: str) -> list[dict]:
     res = get_client().table("trades").select("*").eq("mode", mode).eq("status", "open").execute()
+    return res.data
+
+
+def get_recently_closed_trades(mode: str, since: datetime) -> list[dict]:
+    """Closed/flattened trades since `since` — mode-scoped, not
+    version-scoped (unlike get_closed_trades), since strategy versions
+    rotate and the learning engine's catch-up pass needs to see across
+    versions. Bounded by the caller's `since` (LEARNING_CATCHUP_LOOKBACK_HOURS
+    for process_closed_trades, LEARNING_HISTORY_WINDOW_DAYS for stats
+    bucket recompute) so this never becomes a full-table scan."""
+    res = (
+        get_client()
+        .table("trades")
+        .select("*")
+        .eq("mode", mode)
+        .in_("status", ["closed", "flattened"])
+        .gte("closed_at", since.isoformat())
+        .execute()
+    )
     return res.data
 
 
@@ -295,24 +331,232 @@ def log_opportunity_evaluation(
     risk_manager_result: str | None,
     final_decision: str,
     reason: str | None,
-) -> None:
-    get_client().table("opportunity_evaluations").insert(
+    trade_id: int | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("opportunity_evaluations")
+        .insert(
+            {
+                "mode": mode,
+                "symbol": symbol,
+                "version_id": version_id,
+                "features": features,
+                "trend_score": trend_score,
+                "momentum_score": momentum_score,
+                "volume_score": volume_score,
+                "volatility_score": volatility_score,
+                "risk_score": risk_score,
+                "opportunity_score": opportunity_score,
+                "llm_decision": llm_decision,
+                "llm_reasoning": llm_reasoning,
+                "llm_raw_response": llm_raw_response,
+                "risk_manager_result": risk_manager_result,
+                "final_decision": final_decision,
+                "reason": reason,
+                "trade_id": trade_id,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+# --- learning_statistics ---
+
+
+def upsert_learning_statistics(mode: str, dimension_type: str, dimension_value: str, stats: dict) -> None:
+    get_client().table("learning_statistics").upsert(
         {
             "mode": mode,
-            "symbol": symbol,
-            "version_id": version_id,
-            "features": features,
-            "trend_score": trend_score,
-            "momentum_score": momentum_score,
-            "volume_score": volume_score,
-            "volatility_score": volatility_score,
-            "risk_score": risk_score,
-            "opportunity_score": opportunity_score,
-            "llm_decision": llm_decision,
-            "llm_reasoning": llm_reasoning,
-            "llm_raw_response": llm_raw_response,
-            "risk_manager_result": risk_manager_result,
-            "final_decision": final_decision,
-            "reason": reason,
+            "dimension_type": dimension_type,
+            "dimension_value": dimension_value,
+            **stats,
+        },
+        on_conflict="mode,dimension_type,dimension_value",
+    ).execute()
+
+
+def get_learning_statistics(mode: str, dimension_type: str | None = None) -> list[dict]:
+    query = get_client().table("learning_statistics").select("*").eq("mode", mode)
+    if dimension_type is not None:
+        query = query.eq("dimension_type", dimension_type)
+    return query.execute().data
+
+
+# --- feature_importance ---
+
+
+def upsert_feature_importance(mode: str, feature_name: str, correlation_score: float, sample_count: int) -> None:
+    get_client().table("feature_importance").upsert(
+        {
+            "mode": mode,
+            "feature_name": feature_name,
+            "correlation_score": correlation_score,
+            "sample_count": sample_count,
+        },
+        on_conflict="mode,feature_name",
+    ).execute()
+
+
+def get_feature_importance(mode: str) -> list[dict]:
+    res = get_client().table("feature_importance").select("*").eq("mode", mode).execute()
+    return res.data
+
+
+def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
+    res = (
+        get_client()
+        .table("opportunity_evaluations")
+        .select("*")
+        .eq("trade_id", trade_id)
+        .eq("final_decision", "buy")
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# --- confidence_calibration ---
+
+
+def get_confidence_calibration_for_evaluation(opportunity_evaluation_id: int) -> dict | None:
+    res = (
+        get_client()
+        .table("confidence_calibration")
+        .select("*")
+        .eq("opportunity_evaluation_id", opportunity_evaluation_id)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def log_confidence_calibration(
+    opportunity_evaluation_id: int,
+    ai_confidence: float | None,
+    historical_confidence: float | None,
+    ai_weight: float,
+    historical_weight: float,
+    final_confidence: float | None,
+    similar_trades_count: int,
+) -> None:
+    get_client().table("confidence_calibration").insert(
+        {
+            "opportunity_evaluation_id": opportunity_evaluation_id,
+            "ai_confidence": ai_confidence,
+            "historical_confidence": historical_confidence,
+            "ai_weight": ai_weight,
+            "historical_weight": historical_weight,
+            "final_confidence": final_confidence,
+            "similar_trades_count": similar_trades_count,
         }
     ).execute()
+
+
+# --- recommendations ---
+
+
+def get_latest_recommendation(mode: str, metric_name: str) -> dict | None:
+    res = (
+        get_client()
+        .table("recommendations")
+        .select("*")
+        .eq("mode", mode)
+        .eq("metric_name", metric_name)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def insert_recommendation(
+    mode: str,
+    metric_name: str,
+    current_value: float,
+    recommended_value: float,
+    rationale: str,
+    sample_size: int,
+) -> None:
+    get_client().table("recommendations").insert(
+        {
+            "mode": mode,
+            "metric_name": metric_name,
+            "current_value": current_value,
+            "recommended_value": recommended_value,
+            "rationale": rationale,
+            "sample_size": sample_size,
+        }
+    ).execute()
+
+
+def get_recommendations(mode: str, status: str | None = None) -> list[dict]:
+    query = get_client().table("recommendations").select("*").eq("mode", mode)
+    if status is not None:
+        query = query.eq("status", status)
+    return query.order("created_at", desc=True).execute().data
+
+
+# --- trade_evaluations ---
+
+
+def upsert_trade_evaluation(
+    trade_id: int,
+    predicted_confidence: float | None,
+    predicted_opportunity_score: float | None,
+    actual_outcome_won: bool,
+    confidence_was_accurate: bool | None,
+    opportunity_score_was_accurate: bool | None,
+    risk_assessment: str | None,
+    stop_loss_assessment: str | None,
+    target_assessment: str | None,
+) -> None:
+    get_client().table("trade_evaluations").upsert(
+        {
+            "trade_id": trade_id,
+            "predicted_confidence": predicted_confidence,
+            "predicted_opportunity_score": predicted_opportunity_score,
+            "actual_outcome_won": actual_outcome_won,
+            "confidence_was_accurate": confidence_was_accurate,
+            "opportunity_score_was_accurate": opportunity_score_was_accurate,
+            "risk_assessment": risk_assessment,
+            "stop_loss_assessment": stop_loss_assessment,
+            "target_assessment": target_assessment,
+        },
+        on_conflict="trade_id",
+    ).execute()
+
+
+def get_trade_evaluation_ids(trade_ids: list[int]) -> set[int]:
+    if not trade_ids:
+        return set()
+    res = get_client().table("trade_evaluations").select("trade_id").in_("trade_id", trade_ids).execute()
+    return {row["trade_id"] for row in res.data}
+
+
+def get_trades_by_ids(trade_ids: list[int]) -> list[dict]:
+    if not trade_ids:
+        return []
+    res = get_client().table("trades").select("*").in_("id", trade_ids).execute()
+    return res.data
+
+
+def get_entry_evaluations_since(mode: str, since: datetime) -> list[dict]:
+    """Entry-time opportunity_evaluations rows (final_decision='buy', so
+    trade_id is always set) since `since` — the candidate pool
+    find_similar_trades() ranks by distance. No embedded join to `trades`
+    for the outcome (pnl/closed_at) — this codebase has no precedent for
+    PostgREST embeds anywhere in models.py; callers fetch outcomes
+    separately via get_trades_by_ids() and match in Python, same pattern
+    as process_closed_trades()'s diff."""
+    res = (
+        get_client()
+        .table("opportunity_evaluations")
+        .select("*")
+        .eq("mode", mode)
+        .eq("final_decision", "buy")
+        .gte("timestamp", since.isoformat())
+        .execute()
+    )
+    return res.data

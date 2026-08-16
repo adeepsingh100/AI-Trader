@@ -9,6 +9,7 @@ import html
 
 from src.agents.risk_manager import today_ist
 from src.db import models
+from src.learning.reports import generate_learning_report_html
 
 MODES = ["paper", "real"]
 
@@ -125,6 +126,8 @@ def _mode_section_html(section: dict) -> str:
       <p>Circuit breaker: {'TRIGGERED' if breaker else 'clear'}</p>
       <h3>Trade log</h3>
       {_trade_log_html(section['trades'])}
+      <h3>Learning insights</h3>
+      {generate_learning_report_html(mode)}
     </section>
     """
 

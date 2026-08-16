@@ -135,4 +135,5 @@ def test_flatten_all_closes_every_open_trade(mock_models, mock_place_order):
 
     mock_place_order.assert_called_once_with("ETHINR", "sell", 0.005, price=186000)
     mock_models.close_trade.assert_called_once()
+    assert mock_models.close_trade.call_args.kwargs["exit_reason"] == "circuit_breaker"
     assert closed == [held]

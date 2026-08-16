@@ -18,6 +18,10 @@ from src.db import models
 from src.groq_client import AllModelsFailedError, chat
 from src.lenient_json import parse_llm_json
 
+# Local imports (inside run_evolution, not here) — both learning-engine
+# modules import compute_metrics from this file, so importing them at
+# module level here would be circular.
+
 
 def compute_metrics(trades: list[dict], capital_to_use: float) -> dict:
     closed = [t for t in trades if t.get("pnl") is not None]
@@ -143,13 +147,32 @@ def run_evolution(mode: str = "paper") -> dict:
         models.promote_version(version["id"])
         promoted = True
 
+    # Batch/periodic learning-engine passes — piggyback on this nightly
+    # cron rather than adding a new workflow. Both are no-ops (empty list)
+    # below their own sample-size floors, so this is cheap and safe on a
+    # young dataset. Imported here, not at module level — both modules
+    # import compute_metrics from this file, so a module-level import
+    # here would be circular.
+    from src.learning.feature_importance import compute_feature_importance
+    from src.learning.recommendations import generate_recommendations
+
+    feature_importance = compute_feature_importance(mode)
+    recommendations = generate_recommendations(mode)
+
     models.log_agent_event(
         "evolution_agent",
         "info",
-        f"metrics={metrics} promoted={promoted} new_version={new_version['version_number']}",
+        f"metrics={metrics} promoted={promoted} new_version={new_version['version_number']} "
+        f"feature_importance_rows={len(feature_importance)} recommendations={len(recommendations)}",
     )
 
-    return {"metrics": metrics, "new_version": new_version, "promoted": promoted}
+    return {
+        "metrics": metrics,
+        "new_version": new_version,
+        "promoted": promoted,
+        "feature_importance": feature_importance,
+        "recommendations": recommendations,
+    }
 
 
 if __name__ == "__main__":

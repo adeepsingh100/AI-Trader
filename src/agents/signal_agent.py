@@ -28,9 +28,13 @@ _EXIT_QUESTION = (
 )
 
 _RESPONSE_FORMAT = (
-    'Respond as JSON only: {"decision": "accept|reject", "reasoning": "...", '
-    '"risks": "...", "confidence_delta": -1 to 1, "expected_duration": "...", '
-    '"invalidation_point": "..."}'
+    'Respond as JSON only: {"decision": "accept|reject", "confidence": 0-100, '
+    '"reasoning": "...", "risks": "...", "confidence_delta": -1 to 1, '
+    '"expected_duration": "...", "invalidation_point": "..."}. "confidence" is '
+    "your own numeric confidence in this decision (0=no confidence, 100=certain) — "
+    "it is blended with this symbol's historical win rate (see historical_context "
+    "in the data above, when present) to produce the final trade confidence, so "
+    "answer it independently of whatever historical_context already shows."
 )
 
 

@@ -145,9 +145,15 @@ def test_propose_next_version_carries_forward_when_all_models_fail():
 # --- run_evolution ---
 
 
+@patch("src.learning.recommendations.generate_recommendations")
+@patch("src.learning.feature_importance.compute_feature_importance")
 @patch("src.agents.evolution_agent.models")
 @patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_inserts_next_version_and_promotes_when_ready(mock_propose, mock_models):
+def test_run_evolution_inserts_next_version_and_promotes_when_ready(
+    mock_propose, mock_models, mock_feature_importance, mock_recommendations
+):
+    mock_feature_importance.return_value = []
+    mock_recommendations.return_value = []
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20)
     version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})
@@ -169,9 +175,15 @@ def test_run_evolution_inserts_next_version_and_promotes_when_ready(mock_propose
     assert result["new_version"] == {"id": 2, "version_number": 4}
 
 
+@patch("src.learning.recommendations.generate_recommendations")
+@patch("src.learning.feature_importance.compute_feature_importance")
 @patch("src.agents.evolution_agent.models")
 @patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_does_not_promote_when_criteria_unmet(mock_propose, mock_models):
+def test_run_evolution_does_not_promote_when_criteria_unmet(
+    mock_propose, mock_models, mock_feature_importance, mock_recommendations
+):
+    mock_feature_importance.return_value = []
+    mock_recommendations.return_value = []
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=2)  # too young
     version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})
@@ -186,9 +198,15 @@ def test_run_evolution_does_not_promote_when_criteria_unmet(mock_propose, mock_m
     assert result["promoted"] is False
 
 
+@patch("src.learning.recommendations.generate_recommendations")
+@patch("src.learning.feature_importance.compute_feature_importance")
 @patch("src.agents.evolution_agent.models")
 @patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_skips_promotion_check_for_real_mode(mock_propose, mock_models):
+def test_run_evolution_skips_promotion_check_for_real_mode(
+    mock_propose, mock_models, mock_feature_importance, mock_recommendations
+):
+    mock_feature_importance.return_value = []
+    mock_recommendations.return_value = []
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20, promoted=True)
     version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})

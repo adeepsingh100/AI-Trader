@@ -19,6 +19,8 @@ from src.config import (
     OPPORTUNITY_WEIGHT_TREND,
     OPPORTUNITY_WEIGHT_VOLATILITY,
     OPPORTUNITY_WEIGHT_VOLUME,
+    REGIME_ADX_TREND_THRESHOLD,
+    REGIME_STRONG_TREND_SCORE_MIN,
     RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE,
     RSI_SCORE_CEIL,
     RSI_SCORE_FLOOR,
@@ -29,6 +31,11 @@ from src.config import (
     VOLATILITY_SCORE_EXTREME,
     VOLUME_SCORE_SCALE,
 )
+
+# Same timeframe score_opportunity() itself trusts most (highest configured
+# weight) — used for the point-in-time context (ADX/volatility_regime)
+# regime classification needs but can't blend across timeframes.
+PRIMARY_TIMEFRAME = max(TIMEFRAME_WEIGHTS, key=TIMEFRAME_WEIGHTS.get)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -134,6 +141,39 @@ def score_risk(features_by_tf: dict[str, dict]) -> float | None:
     return _blend_across_timeframes({tf: _score_risk_for_timeframe(f) for tf, f in features_by_tf.items()})
 
 
+def classify_market_regime(features_by_tf: dict[str, dict]) -> str | None:
+    """Deterministic composite label, reusing score_trend() (already
+    computed) plus the primary timeframe's ADX/volatility_regime — not a
+    separate indicator pass. None if either input is unavailable (short
+    history), never a guessed label.
+
+    sideways: ADX below REGIME_ADX_TREND_THRESHOLD (no real trend to
+    classify direction of). high_volatility: overrides the trend label
+    when the primary timeframe's volatility bucket is "high" — an
+    unpredictable market matters more than its direction. Otherwise
+    strong/weak bull or bear, split symmetrically around trend_score=50
+    (neutral) by REGIME_STRONG_TREND_SCORE_MIN and its mirror. No separate
+    "trending" label — that's what strong_bull/strong_bear already encode.
+    """
+    trend = score_trend(features_by_tf)
+    primary = features_by_tf.get(PRIMARY_TIMEFRAME) or {}
+    adx = primary.get("adx")
+    if trend is None or adx is None:
+        return None
+
+    if adx < REGIME_ADX_TREND_THRESHOLD:
+        return "sideways"
+    if primary.get("volatility_regime") == "high":
+        return "high_volatility"
+    if trend >= REGIME_STRONG_TREND_SCORE_MIN:
+        return "strong_bull"
+    if trend >= 50:
+        return "weak_bull"
+    if trend <= 100 - REGIME_STRONG_TREND_SCORE_MIN:
+        return "strong_bear"
+    return "weak_bear"
+
+
 def score_opportunity(features_by_tf: dict[str, dict]) -> dict:
     sub_scores = {
         "trend": score_trend(features_by_tf),
@@ -156,6 +196,7 @@ def score_opportunity(features_by_tf: dict[str, dict]) -> dict:
         "volatility_score": sub_scores["volatility"],
         "risk_score": sub_scores["risk"],
         "opportunity_score": _weighted_average(sub_scores, weights),
+        "market_regime": classify_market_regime(features_by_tf),
     }
 
 

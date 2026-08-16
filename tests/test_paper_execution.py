@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from src.agents.execution.paper import (
     GST_PCT_ON_FEE,
     SELL_TDS_PCT,
@@ -44,3 +46,19 @@ def test_sell_fees_exceed_buy_fees_at_same_notional_due_to_tds():
     buy = agent.place_order("BTCINR", "buy", qty=0.01, price=1_000_000)
     sell = agent.place_order("BTCINR", "sell", qty=0.01, price=1_000_000)
     assert sell["fees"] > buy["fees"]
+
+
+@patch("src.db.models")
+@patch("src.coindcx_client.get_ticker")
+def test_flatten_all_closes_every_open_trade_with_circuit_breaker_reason(mock_ticker, mock_models):
+    held = {"id": 7, "symbol": "ETHINR", "qty": 0.5, "entry_price": 200_000, "fees": 1.0}
+    mock_ticker.return_value = [{"market": "ETHINR", "last_price": 199_000}]
+    mock_models.get_open_trades.return_value = [held]
+
+    agent = PaperExecutionAgent()
+    closed = agent.flatten_all("paper")
+
+    mock_models.close_trade.assert_called_once()
+    assert mock_models.close_trade.call_args.kwargs["exit_reason"] == "circuit_breaker"
+    assert mock_models.close_trade.call_args.kwargs["status"] == "flattened"
+    assert closed == [held]

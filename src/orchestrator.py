@@ -33,24 +33,42 @@ from src.agents.risk_manager import (
 )
 from src.agents.signal_agent import validate_opportunity
 from src.coindcx_client import get_ticker
-from src.config import EXIT_SCORE_THRESHOLD, TIMEFRAME_WEIGHTS
+from src.config import EXIT_SCORE_THRESHOLD, MIN_FINAL_CONFIDENCE
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
-from src.features.opportunity_scorer import score_opportunity, select_top_candidates
+from src.features.opportunity_scorer import (
+    PRIMARY_TIMEFRAME,
+    score_opportunity,
+    select_top_candidates,
+)
+from src.learning.confidence_calibration import calibrate_confidence
+from src.learning.statistics import process_closed_trades
+from src.learning.trade_memory import find_similar_trades
 
 MODE = "paper"
-
-# The blend across timeframes weights every configured timeframe, but a
-# few point-in-time context fields in the LLM summary (support/resistance,
-# volatility label, ADX) can't be blended — they're read from whichever
-# configured timeframe carries the most weight, since that's the one the
-# scoring itself trusts most. Dynamic, not hardcoded to a specific string,
-# so re-weighting TIMEFRAME_WEIGHTS in config also moves this.
-_PRIMARY_TIMEFRAME = max(TIMEFRAME_WEIGHTS, key=TIMEFRAME_WEIGHTS.get)
 
 
 def _empty_daily_pnl() -> dict:
     return {"realized_pnl": 0, "trades_count": 0, "circuit_breaker_triggered": False}
+
+
+def _update_excursion(open_trades: list[dict], prices: dict) -> None:
+    """Running max-favorable/max-adverse-excursion, updated with whatever
+    ticker prices this sweep already fetched (zero new API calls). Writes
+    only when a max actually moved. Runs on both cadences this function
+    is called from (run_cycle 10 min, run_risk_check 5 min)."""
+    for trade in open_trades:
+        price = prices.get(trade["symbol"])
+        entry = trade.get("entry_price")
+        if price is None or not entry:
+            continue
+        favorable_pct = max(0.0, (price - entry) / entry * 100)
+        adverse_pct = max(0.0, (entry - price) / entry * 100)
+        prior_mfe, prior_mae = trade.get("mfe_pct") or 0, trade.get("mae_pct") or 0
+        new_mfe, new_mae = max(prior_mfe, favorable_pct), max(prior_mae, adverse_pct)
+        if new_mfe != prior_mfe or new_mae != prior_mae:
+            models.update_trade_excursion(trade["id"], new_mfe, new_mae)
+            trade["mfe_pct"], trade["mae_pct"] = new_mfe, new_mae
 
 
 def _sweep_stop_loss_take_profit(
@@ -66,6 +84,7 @@ def _sweep_stop_loss_take_profit(
         return [], daily_pnl
 
     prices = {t["market"]: float(t["last_price"]) for t in get_ticker()}
+    _update_excursion(open_trades, prices)
     params_json = version.get("params_json") or {}
 
     closed = []
@@ -78,7 +97,7 @@ def _sweep_stop_loss_take_profit(
             continue
 
         fill = execution_agent.place_order(trade["symbol"], "sell", trade["qty"], price)
-        _, daily_pnl = _record_close(mode, capital_config, trade, fill, daily_pnl)
+        _, daily_pnl = _record_close(mode, capital_config, trade, fill, daily_pnl, exit_reason_value=reason)
         models.log_agent_event("orchestrator", "info", f"{reason} exit {trade['symbol']}")
         closed.append(trade)
         open_trades.remove(trade)
@@ -87,11 +106,11 @@ def _sweep_stop_loss_take_profit(
     return closed, daily_pnl
 
 
-def _opportunity_summary(record: dict, held: dict | None = None) -> dict:
+def _opportunity_summary(record: dict, held: dict | None = None, historical_context: dict | None = None) -> dict:
     """Curated digest for the LLM — never the raw multi-timeframe feature
     dump (160+ floats), which would strain the token budget for no gain
     over what a human/LLM actually needs to judge the call."""
-    primary = record["features_by_tf"].get(_PRIMARY_TIMEFRAME) or {}
+    primary = record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}
     summary = {
         "symbol": record["symbol"],
         "last_price": record["market"]["last_price"],
@@ -120,12 +139,22 @@ def _opportunity_summary(record: dict, held: dict | None = None) -> dict:
             "qty": held["qty"],
             "unrealized_pnl_pct": (last_price - entry_price) / entry_price * 100 if entry_price else None,
         }
+    if historical_context is not None:
+        summary["historical_context"] = {
+            "similar_trades_count": historical_context["count"],
+            "win_rate": historical_context["win_rate"],
+            "avg_profit_pct": historical_context["avg_profit_pct"],
+            "avg_loss_pct": historical_context["avg_loss_pct"],
+            "avg_holding_time_seconds": historical_context["avg_holding_time_seconds"],
+        }
     return summary
 
 
-def _record_close(mode: str, capital_config: dict, trade: dict, fill: dict, daily_pnl: dict):
+def _record_close(
+    mode: str, capital_config: dict, trade: dict, fill: dict, daily_pnl: dict, exit_reason_value: str | None = None
+):
     pnl = (fill["fill_price"] - trade["entry_price"]) * trade["qty"] - fill["fees"] - trade["fees"]
-    models.close_trade(trade["id"], fill["fill_price"], pnl)
+    models.close_trade(trade["id"], fill["fill_price"], pnl, exit_reason=exit_reason_value)
 
     updated = {
         "realized_pnl": daily_pnl["realized_pnl"] + pnl,
@@ -227,37 +256,65 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
         llm_decision = llm_reasoning = llm_raw_response = risk_manager_result = None
         final_decision, reason = "hold", None
+        trade_id = None
+        calibration_to_log = None
 
         if held is None and symbol in candidate_symbols:
-            summary = _opportunity_summary(record)
+            similar = find_similar_trades(record, market_regime=record["market_regime"], mode=mode)
+            summary = _opportunity_summary(record, historical_context=similar)
             verdict, usage_events = validate_opportunity(summary, version["prompt_text"], context="entry")
             models.log_model_usage(usage_events)
             llm_decision = verdict.get("decision")
             llm_reasoning = verdict.get("reasoning")
             llm_raw_response = verdict
 
-            if llm_decision == "accept":
+            historical_confidence = similar["win_rate"] * 100 if similar["win_rate"] is not None else None
+            calibrated = calibrate_confidence(verdict.get("confidence"), historical_confidence, similar["count"])
+            calibration_to_log = {
+                "ai_confidence": verdict.get("confidence"),
+                "historical_confidence": historical_confidence,
+                "ai_weight": calibrated["ai_weight_used"],
+                "historical_weight": calibrated["historical_weight_used"],
+                "final_confidence": calibrated["final_confidence"],
+                "similar_trades_count": similar["count"],
+            }
+            confidence_cleared = (
+                calibrated["final_confidence"] is None or calibrated["final_confidence"] >= MIN_FINAL_CONFIDENCE
+            )
+
+            if llm_decision == "accept" and confidence_cleared:
                 decision = evaluate(capital_config, daily_pnl, open_trades, market["last_price"])
                 risk_manager_result = decision.action
                 if decision.action == "size":
                     fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
+                    params_json = version.get("params_json") or {}
+                    stop_loss_pct = params_json.get("stop_loss_pct")
+                    take_profit_pct = params_json.get("take_profit_pct")
+                    entry_price = fill["fill_price"]
+                    last_price = market["last_price"]
                     trade = models.open_trade(
                         mode=mode,
                         version_id=version["id"],
                         symbol=symbol,
                         side="buy",
                         qty=decision.qty,
-                        entry_price=fill["fill_price"],
+                        entry_price=entry_price,
                         fees=fill["fees"],
                         reasoning_text=llm_reasoning,
+                        stop_loss_price=entry_price * (1 - stop_loss_pct) if stop_loss_pct else None,
+                        take_profit_price=entry_price * (1 + take_profit_pct) if take_profit_pct else None,
+                        entry_slippage_pct=(entry_price - last_price) / last_price * 100 if last_price else None,
+                        market_regime=record["market_regime"],
                     )
                     models.log_agent_event("orchestrator", "info", f"opened buy {symbol}")
                     opened.append(trade)
                     open_trades.append(trade)
                     open_by_symbol[symbol] = trade
-                    final_decision, reason = "buy", llm_reasoning
+                    final_decision, reason, trade_id = "buy", llm_reasoning, trade["id"]
                 else:
                     reason = f"risk_manager blocked: {decision.action}"
+            elif llm_decision == "accept":
+                reason = f"confidence gated: {calibrated['final_confidence']:.1f} < {MIN_FINAL_CONFIDENCE}"
             else:
                 reason = llm_reasoning or "llm rejected entry"
 
@@ -271,17 +328,17 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
             if llm_decision == "accept":
                 fill = execution_agent.place_order(symbol, "sell", held["qty"], market["last_price"])
-                _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl)
+                _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl, exit_reason_value="ai_exit")
                 closed.append(held)
                 open_trades.remove(held)
                 del open_by_symbol[symbol]
-                final_decision, reason = "sell", llm_reasoning
+                final_decision, reason, trade_id = "sell", llm_reasoning, held["id"]
             else:
                 reason = llm_reasoning or "llm rejected exit"
         else:
             reason = "not_a_candidate" if held is None else "score_above_exit_threshold_or_unavailable"
 
-        models.log_opportunity_evaluation(
+        evaluation_row = models.log_opportunity_evaluation(
             mode=mode,
             symbol=symbol,
             version_id=version["id"],
@@ -298,7 +355,14 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             risk_manager_result=risk_manager_result,
             final_decision=final_decision,
             reason=reason,
+            trade_id=trade_id,
         )
+        if calibration_to_log is not None:
+            models.log_confidence_calibration(
+                opportunity_evaluation_id=evaluation_row["id"], **calibration_to_log
+            )
+
+    process_closed_trades(mode)
 
     return {
         "opened": opened,

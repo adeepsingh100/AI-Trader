@@ -105,6 +105,8 @@ class RealExecutionAgent(ExecutionAgent):
             pnl = (fill["fill_price"] - trade["entry_price"]) * trade["qty"] - fill[
                 "fees"
             ] - trade["fees"]
-            models.close_trade(trade["id"], fill["fill_price"], pnl, status="flattened")
+            models.close_trade(
+                trade["id"], fill["fill_price"], pnl, status="flattened", exit_reason="circuit_breaker"
+            )
             closed.append(trade)
         return closed

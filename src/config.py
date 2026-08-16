@@ -122,3 +122,62 @@ if EXIT_SCORE_THRESHOLD >= MIN_OPPORTUNITY_SCORE:
         "EXIT_SCORE_THRESHOLD must be < MIN_OPPORTUNITY_SCORE "
         f"(got {EXIT_SCORE_THRESHOLD} >= {MIN_OPPORTUNITY_SCORE})"
     )
+
+# --- Market regime classification -------------------------------------------
+# Folded into score_opportunity()'s output (src/features/opportunity_scorer.py)
+# — reuses trend_score/ADX/volatility_regime, no separate computation pass.
+REGIME_ADX_TREND_THRESHOLD = float(os.getenv("REGIME_ADX_TREND_THRESHOLD", "20"))
+REGIME_STRONG_TREND_SCORE_MIN = float(os.getenv("REGIME_STRONG_TREND_SCORE_MIN", "75"))
+
+# --- Trade Memory / Learning Engine ------------------------------------------
+# Every completed trade is stored with full entry-time context, statistically
+# analyzed per bucket, and searched for similarity before the next entry —
+# see PROJECT_SPEC.md §3a. Pure statistics, no ML/RL. Outputs here are only
+# as reliable as trade volume allows; the zero-denominator guards throughout
+# src/learning/ exist so thin history degrades to "unknown", never a faked
+# number.
+
+# Shared by similarity search AND learning_statistics bucket recompute — one
+# dial, not two, so both look at the same "current" window as trade history
+# grows and old strategy-version-era trades age out.
+LEARNING_HISTORY_WINDOW_DAYS = int(os.getenv("LEARNING_HISTORY_WINDOW_DAYS", "180"))
+# How far back process_closed_trades() looks for trades it hasn't evaluated
+# yet — generous margin so a missed cron run still gets caught up.
+LEARNING_CATCHUP_LOOKBACK_HOURS = int(os.getenv("LEARNING_CATCHUP_LOOKBACK_HOURS", "72"))
+
+MAX_SIMILAR_TRADES_SCANNED = int(os.getenv("MAX_SIMILAR_TRADES_SCANNED", "500"))
+MIN_SIMILAR_TRADES = int(os.getenv("MIN_SIMILAR_TRADES", "5"))
+SIMILARITY_TOP_N = int(os.getenv("SIMILARITY_TOP_N", "10"))
+# Euclidean distance over 5 sub-scores each 0-100 -> max possible ~224
+# (100*sqrt(5)). 30 ~= 13.4 pts average per-dimension divergence, a fairly
+# tight band given the sub-scores are themselves coarse weighted averages.
+SIMILARITY_MAX_DISTANCE = float(os.getenv("SIMILARITY_MAX_DISTANCE", "30"))
+
+# Minimum acceptable return for Sortino's downside deviation (0 = any loss
+# counts as downside).
+SORTINO_MAR_PCT = float(os.getenv("SORTINO_MAR_PCT", "0"))
+
+# Final confidence = ai_confidence*AI_WEIGHT + historical_confidence*HISTORICAL_WEIGHT,
+# renormalized defensively like OPPORTUNITY_WEIGHT_*. Collapses to AI-only
+# when history is too thin (see MIN_SIMILAR_TRADES).
+CONFIDENCE_AI_WEIGHT = float(os.getenv("CONFIDENCE_AI_WEIGHT", "0.6"))
+CONFIDENCE_HISTORICAL_WEIGHT = float(os.getenv("CONFIDENCE_HISTORICAL_WEIGHT", "0.4"))
+# Hard gate before place_order, alongside the existing risk_manager check.
+# Default 0 = permissive/inert until deliberately tightened once enough
+# trade history exists to trust calibrated confidence.
+MIN_FINAL_CONFIDENCE = float(os.getenv("MIN_FINAL_CONFIDENCE", "0"))
+
+# Self-evaluation (trade_evaluations): was the predicted confidence/score
+# actually right, checked against these midpoints after the fact.
+CONFIDENCE_ACCURACY_MIDPOINT = float(os.getenv("CONFIDENCE_ACCURACY_MIDPOINT", "50"))
+
+# learning_statistics bucket widths for the opportunity_score/confidence
+# dimensions (e.g. width 10 -> buckets "60-70", "70-80", ...).
+OPPORTUNITY_SCORE_BUCKET_WIDTH = float(os.getenv("OPPORTUNITY_SCORE_BUCKET_WIDTH", "10"))
+CONFIDENCE_BUCKET_WIDTH = float(os.getenv("CONFIDENCE_BUCKET_WIDTH", "10"))
+
+# recommendations (Step 8, advisory only, never auto-applied) and
+# feature_importance both need enough samples before a suggestion/correlation
+# means anything rather than reading noise as signal — same floor, one knob.
+RECOMMENDATION_MIN_IMPROVEMENT_PCT = float(os.getenv("RECOMMENDATION_MIN_IMPROVEMENT_PCT", "15"))
+RECOMMENDATION_MIN_SAMPLE_SIZE = int(os.getenv("RECOMMENDATION_MIN_SAMPLE_SIZE", "20"))

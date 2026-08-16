@@ -86,7 +86,9 @@ def test_mode_section_html_handles_missing_capital_config():
     assert "No capital_config set" in out
 
 
-def test_mode_section_html_handles_no_daily_pnl_row_yet():
+@patch("src.agents.reporting_agent.generate_learning_report_html")
+def test_mode_section_html_handles_no_daily_pnl_row_yet(mock_learning_html):
+    mock_learning_html.return_value = "<section></section>"
     section = {
         "mode": "paper",
         "capital_config": {
@@ -105,8 +107,10 @@ def test_mode_section_html_handles_no_daily_pnl_row_yet():
 # --- full build + render, mocked DB ---
 
 
+@patch("src.agents.reporting_agent.generate_learning_report_html")
 @patch("src.agents.reporting_agent.models")
-def test_build_report_data_and_render_html_smoke(mock_models):
+def test_build_report_data_and_render_html_smoke(mock_models, mock_learning_html):
+    mock_learning_html.return_value = "<section></section>"
     mock_models.get_capital_config.return_value = {
         "capital_to_use": 10000,
         "total_capital": 10000,
