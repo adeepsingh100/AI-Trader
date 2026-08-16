@@ -1,0 +1,40 @@
+name: Risk check
+
+# Stop-loss/take-profit + circuit-breaker sweep only — no LLM calls, no
+# market snapshot. Runs on GitHub Actions' shortest cron interval (5 min)
+# so an open position isn't sitting unwatched for the full 10-minute gap
+# between trading_cycle.yml runs. See src/orchestrator.py:run_risk_check.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m src.orchestrator --mode=paper --risk-only
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+  real:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # No-ops cleanly until a version is promoted — see src/orchestrator.py.
+      - run: python -m src.orchestrator --mode=real --risk-only
+        env:
+          COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
+          COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

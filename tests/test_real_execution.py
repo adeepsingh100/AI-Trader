@@ -81,6 +81,7 @@ def test_place_order_buy_rounds_qty_and_fills(
     fill = agent.place_order("ETHINR", "buy", 0.0053516, price=186900)
 
     assert mock_create.call_args.kwargs["total_quantity"] == 0.005
+    # buy: fee_amount passed through as-is, no TDS added
     assert fill == {"fill_price": 186900.0, "fees": 1.2}
 
 
@@ -114,7 +115,9 @@ def test_place_order_sell_skips_balance_check(mock_details, mock_create, mock_st
     agent = RealExecutionAgent()
     fill = agent.place_order("ETHINR", "sell", 0.005, price=186000)
 
-    assert fill == {"fill_price": 186000.0, "fees": 0.9}
+    # sell: fee_amount + 1% TDS on notional (186000 * 0.005 * 0.01 = 9.3),
+    # since TDS isn't documented as part of fee_amount
+    assert fill == {"fill_price": 186000.0, "fees": pytest.approx(0.9 + 9.3)}
 
 
 # --- flatten_all ---

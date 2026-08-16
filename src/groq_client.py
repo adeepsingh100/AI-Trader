@@ -43,7 +43,13 @@ class ModelUsageEvent:
 
 
 class AllModelsFailedError(RuntimeError):
-    pass
+    """Carries the per-attempt events (with their fallback_reason chain)
+    so a caller that catches this to degrade gracefully can still log
+    the real failure reason to model_usage instead of losing it."""
+
+    def __init__(self, message: str, events: list[ModelUsageEvent]):
+        super().__init__(message)
+        self.events = events
 
 
 def _groq_completion(client: Groq, model: str, messages: list[dict], max_tokens: int) -> str:
@@ -104,4 +110,6 @@ def chat(
                 else:
                     fallback_reason = f"{model} failed: {e}"
 
-    raise AllModelsFailedError(f"all models in chain failed: {chain}")
+    raise AllModelsFailedError(
+        f"all models in chain failed: {chain} (last error: {fallback_reason})", events
+    )

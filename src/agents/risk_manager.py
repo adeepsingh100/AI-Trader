@@ -44,6 +44,27 @@ def committed_capital(open_trades: list[dict]) -> float:
     return sum(t["qty"] * t["entry_price"] for t in open_trades)
 
 
+def exit_reason(entry_price: float, last_price: float, params_json: dict) -> str | None:
+    """stop_loss_pct/take_profit_pct from the active strategy version's
+    params_json, as a decimal fraction of entry price (0.02 = 2%).
+    Absent or falsy = that leg isn't enforced. Checked independently of
+    the LLM signal so a hit exits immediately, not only when the LLM
+    happens to say "sell" for that symbol in a given cycle."""
+    if entry_price <= 0 or last_price <= 0:
+        return None
+    change = (last_price - entry_price) / entry_price
+
+    stop_loss_pct = params_json.get("stop_loss_pct")
+    if stop_loss_pct and change <= -abs(stop_loss_pct):
+        return "stop_loss"
+
+    take_profit_pct = params_json.get("take_profit_pct")
+    if take_profit_pct and change >= abs(take_profit_pct):
+        return "take_profit"
+
+    return None
+
+
 def evaluate(
     capital_config: dict,
     daily_pnl: dict | None,

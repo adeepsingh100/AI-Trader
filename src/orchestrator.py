@@ -5,15 +5,27 @@ Spot-only: a "sell" signal closes an existing held position for that
 symbol (there's no shorting on CoinDCX spot). A "buy" opens one if the
 Risk Manager clears it. Circuit breaker is checked before every buy,
 not just once at cycle start, since a loss realized earlier in the same
-cycle must stop later buys in that same cycle."""
+cycle must stop later buys in that same cycle.
+
+Stop-loss/take-profit (from the active version's params_json) is swept
+every cycle too, and doesn't wait on the LLM to say "sell" — see
+run_risk_check() below, which does only that sweep with no LLM calls,
+meant for a tighter cron than the full LLM signal cycle."""
 
 from __future__ import annotations
 
 from src.agents.data_agent import get_market_snapshot
 from src.agents.execution.paper import PaperExecutionAgent
 from src.agents.execution.real import RealExecutionAgent
-from src.agents.risk_manager import circuit_breaker_triggered, evaluate, target_hit, today_ist
+from src.agents.risk_manager import (
+    circuit_breaker_triggered,
+    evaluate,
+    exit_reason,
+    target_hit,
+    today_ist,
+)
 from src.agents.signal_agent import get_signal
+from src.coindcx_client import get_ticker
 from src.db import models
 
 MODE = "paper"
@@ -21,6 +33,40 @@ MODE = "paper"
 
 def _empty_daily_pnl() -> dict:
     return {"realized_pnl": 0, "trades_count": 0, "circuit_breaker_triggered": False}
+
+
+def _sweep_stop_loss_take_profit(
+    mode: str,
+    capital_config: dict,
+    version: dict,
+    open_trades: list[dict],
+    open_by_symbol: dict,
+    daily_pnl: dict,
+    execution_agent,
+) -> tuple[list[dict], dict]:
+    if not open_trades:
+        return [], daily_pnl
+
+    prices = {t["market"]: float(t["last_price"]) for t in get_ticker()}
+    params_json = version.get("params_json") or {}
+
+    closed = []
+    for trade in list(open_trades):
+        price = prices.get(trade["symbol"])
+        if price is None:
+            continue
+        reason = exit_reason(trade["entry_price"], price, params_json)
+        if reason is None:
+            continue
+
+        fill = execution_agent.place_order(trade["symbol"], "sell", trade["qty"], price)
+        _, daily_pnl = _record_close(mode, capital_config, trade, fill, daily_pnl)
+        models.log_agent_event("orchestrator", "info", f"{reason} exit {trade['symbol']}")
+        closed.append(trade)
+        open_trades.remove(trade)
+        del open_by_symbol[trade["symbol"]]
+
+    return closed, daily_pnl
 
 
 def _record_close(mode: str, capital_config: dict, trade: dict, fill: dict, daily_pnl: dict):
@@ -87,9 +133,19 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
     open_trades = models.get_open_trades(mode)
     open_by_symbol = {t["symbol"]: t for t in open_trades}
-    snapshot = get_market_snapshot(n_symbols)
 
     opened, closed = [], []
+    stopped, daily_pnl = _sweep_stop_loss_take_profit(
+        mode, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
+    )
+    closed.extend(stopped)
+
+    if circuit_breaker_triggered(daily_pnl, capital_config):
+        execution_agent.flatten_all(mode)
+        return {"opened": opened, "closed": closed, "circuit_breaker": True}
+
+    snapshot = get_market_snapshot(n_symbols)
+
     for market in snapshot:
         if circuit_breaker_triggered(daily_pnl, capital_config):
             execution_agent.flatten_all(mode)
@@ -142,10 +198,48 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
     }
 
 
+def run_risk_check(mode: str = MODE, execution_agent=None) -> dict:
+    """No LLM calls, no market snapshot — just the circuit breaker and
+    the stop-loss/take-profit sweep. Meant to run on a tighter cron than
+    run_cycle (which is throttled by LLM budget), so a bad move gets cut
+    off sooner than a full 10-minute wait."""
+    capital_config = models.get_capital_config(mode)
+    if capital_config is None or capital_config.get("paused"):
+        return {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}
+
+    version = (
+        models.get_latest_promoted_version() if mode == "real" else models.get_latest_version()
+    )
+    if version is None:
+        return {"closed": [], "circuit_breaker": False, "skipped": "no_version"}
+
+    if execution_agent is None:
+        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
+
+    daily_pnl = models.get_daily_pnl(today_ist(), mode) or _empty_daily_pnl()
+
+    if circuit_breaker_triggered(daily_pnl, capital_config):
+        execution_agent.flatten_all(mode)
+        return {"closed": [], "circuit_breaker": True}
+
+    open_trades = models.get_open_trades(mode)
+    open_by_symbol = {t["symbol"]: t for t in open_trades}
+    closed, daily_pnl = _sweep_stop_loss_take_profit(
+        mode, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
+    )
+
+    return {"closed": closed, "circuit_breaker": circuit_breaker_triggered(daily_pnl, capital_config)}
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default=MODE, choices=["paper", "real"])
+    parser.add_argument(
+        "--risk-only",
+        action="store_true",
+        help="stop-loss/take-profit + circuit-breaker sweep only, no LLM calls",
+    )
     args = parser.parse_args()
-    print(run_cycle(mode=args.mode))
+    print(run_risk_check(mode=args.mode) if args.risk_only else run_cycle(mode=args.mode))

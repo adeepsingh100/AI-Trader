@@ -7,6 +7,7 @@ from src.agents.evolution_agent import (
     propose_next_version,
     run_evolution,
 )
+from src.groq_client import AllModelsFailedError, ModelUsageEvent
 
 
 def _trade(pnl, closed_at):
@@ -123,6 +124,22 @@ def test_propose_next_version_falls_back_on_bad_json():
     assert proposal["prompt_text"] == "old prompt"
     assert proposal["params_json"] == {"y": 2}
     assert "unparseable" in proposal["notes"]
+
+
+def test_propose_next_version_carries_forward_when_all_models_fail():
+    # a total LLM outage must not crash the nightly evolution run — carry
+    # the current prompt/params forward, same as the bad-JSON fallback
+    failure_events = [ModelUsageEvent("model-a", None, 50, False)]
+    with patch(
+        "src.agents.evolution_agent.chat",
+        side_effect=AllModelsFailedError("all models in chain failed: [...]", failure_events),
+    ):
+        proposal, returned_events = propose_next_version({}, "old prompt", {"y": 2})
+
+    assert proposal["prompt_text"] == "old prompt"
+    assert proposal["params_json"] == {"y": 2}
+    assert "LLM call failed" in proposal["notes"]
+    assert returned_events == failure_events
 
 
 # --- run_evolution ---

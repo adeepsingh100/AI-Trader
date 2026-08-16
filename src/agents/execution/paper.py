@@ -2,15 +2,29 @@ from __future__ import annotations
 
 from src.agents.execution.base import ExecutionAgent
 
-TAKER_FEE_PCT = 0.1
+# CoinDCX spot: 0.5% trading fee on trade value (both sides), +18% GST on
+# that fee. Sells additionally carry 1% TDS (Income Tax Act s.194S) on
+# trade value — a separate tax deduction, not something GST applies to,
+# and not charged on buys (no "transfer" of the asset on acquisition).
+TRADING_FEE_PCT = 0.5
+GST_PCT_ON_FEE = 18
+SELL_TDS_PCT = 1
 SLIPPAGE_BPS = 5
+
+
+def _fees(notional: float, side: str) -> float:
+    trading_fee = notional * (TRADING_FEE_PCT / 100)
+    total = trading_fee + trading_fee * (GST_PCT_ON_FEE / 100)
+    if side == "sell":
+        total += notional * (SELL_TDS_PCT / 100)
+    return total
 
 
 class PaperExecutionAgent(ExecutionAgent):
     def place_order(self, symbol: str, side: str, qty: float, price: float) -> dict:
         slip = price * (SLIPPAGE_BPS / 10_000)
         fill_price = price + slip if side == "buy" else price - slip
-        fees = fill_price * qty * (TAKER_FEE_PCT / 100)
+        fees = _fees(fill_price * qty, side)
         return {"fill_price": fill_price, "fees": fees}
 
     def flatten_all(self, mode: str) -> list[dict]:

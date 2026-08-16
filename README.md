@@ -35,7 +35,7 @@ real order once funds exist, before trusting it for real money.
 
 ## GitHub Actions
 
-Two scheduled workflows call the same code as local runs — set these as
+Three scheduled workflows call the same code as local runs — set these as
 repo secrets (Settings → Secrets and variables → Actions) so they can:
 
 - `GROQ_API_KEY`, `GROQ_MODEL_CHAIN`
@@ -46,6 +46,17 @@ repo secrets (Settings → Secrets and variables → Actions) so they can:
   while on Groq (default)
 
 `.github/workflows/trading_cycle.yml` runs every 10 minutes (paper and
-real, in parallel — real no-ops until a strategy is promoted).
+real, in parallel — real no-ops until a strategy is promoted). Full LLM
+signal cycle, throttled by LLM budget/rate limits.
+
+`.github/workflows/risk_check.yml` runs every 5 minutes (GitHub Actions'
+shortest supported interval) — stop-loss/take-profit + circuit-breaker
+sweep only, no LLM call. This is what actually bounds how long a losing
+position can run before it's cut, independent of the 10-minute signal
+cycle above. **Not a hard guarantee**: CoinDCX spot has no exchange-side
+stop order, so this is polling, not exchange-watched — and free-tier
+cron delivery can itself slip past 5 minutes under load. See
+PROJECT_SPEC.md §2.
+
 `.github/workflows/evolution.yml` runs nightly, just after the IST
 trading-day rollover.

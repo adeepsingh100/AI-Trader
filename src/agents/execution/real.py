@@ -11,6 +11,14 @@ balance at build time, under CoinDCX's ₹100 min_notional, so no order
 could be placed to confirm the response shape end-to-end. Confirm with
 one small real order once funds exist and before relying on this beyond
 the promotion gate.
+
+Fees: `fee_amount` on the order response is taken as CoinDCX's actual
+trading-fee charge (assumed GST-inclusive, since that's a statutory
+add-on to the fee itself). The 1% TDS on a sell (Income Tax Act s.194S)
+is NOT documented anywhere on the order response, so it's added here
+explicitly rather than assumed included — UNVERIFIED, same as the fill
+shape above. Confirm the actual INR credited on a real sell matches
+`fill_price * qty - fee_amount - tds` before trusting this number.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from src.db import models
 
 FILL_POLL_INTERVAL_SECONDS = 1.0
 FILL_POLL_ATTEMPTS = 10
+SELL_TDS_PCT = 1
 
 
 def _inr_balance() -> float:
@@ -83,7 +92,11 @@ class RealExecutionAgent(ExecutionAgent):
 
         order = _extract_order(create_order(market=symbol, side=side, total_quantity=qty))
         fill = _wait_for_fill(order["id"])
-        return {"fill_price": float(fill["avg_price"]), "fees": float(fill["fee_amount"])}
+        fill_price = float(fill["avg_price"])
+        fees = float(fill["fee_amount"])
+        if side == "sell":
+            fees += fill_price * qty * (SELL_TDS_PCT / 100)
+        return {"fill_price": fill_price, "fees": fees}
 
     def flatten_all(self, mode: str) -> list[dict]:
         closed = []

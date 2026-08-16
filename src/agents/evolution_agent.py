@@ -15,7 +15,7 @@ from src.config import (
     PROMOTION_MIN_PAPER_DAYS,
 )
 from src.db import models
-from src.groq_client import chat
+from src.groq_client import AllModelsFailedError, chat
 from src.lenient_json import parse_llm_json
 
 
@@ -71,7 +71,12 @@ def propose_next_version(metrics: dict, current_prompt: str, current_params: dic
             "content": (
                 "You are tuning a crypto trading strategy prompt based on its "
                 "recent paper-trading performance. Propose an improved prompt "
-                "and params. Respond as JSON only: "
+                "and params. params_json.stop_loss_pct and take_profit_pct, if "
+                "set, are enforced automatically as decimal fractions of entry "
+                "price (0.02 means 2%) — a position is closed the moment the "
+                "price moves against or in favor of entry by that fraction, "
+                "independent of your own buy/sell signals. Omit either key to "
+                "leave that side unenforced. Respond as JSON only: "
                 '{"prompt_text": "...", "params_json": {...}, "notes": "..."}'
             ),
         },
@@ -89,7 +94,15 @@ def propose_next_version(metrics: dict, current_prompt: str, current_params: dic
     # A rewritten strategy prompt + params + notes runs longer than a
     # signal's one-line reasoning — more headroom than chat()'s default,
     # still well inside the 8K total budget alongside this call's small input.
-    content, events = chat(messages, max_tokens=2048)
+    try:
+        content, events = chat(messages, max_tokens=2048)
+    except AllModelsFailedError as e:
+        return {
+            "prompt_text": current_prompt,
+            "params_json": current_params,
+            "notes": f"LLM call failed, carried forward unchanged: {e}",
+        }, e.events
+
     try:
         proposal = parse_llm_json(content)
     except (json.JSONDecodeError, TypeError):

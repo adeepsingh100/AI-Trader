@@ -3,6 +3,7 @@ from src.agents.risk_manager import (
     circuit_breaker_triggered,
     committed_capital,
     evaluate,
+    exit_reason,
     target_hit,
 )
 
@@ -129,3 +130,36 @@ def test_evaluate_blocks_on_invalid_price():
 def test_evaluate_qty_scales_with_price():
     decision = evaluate(_capital_config(position_size_pct=10), None, [], last_price=1000)
     assert decision.qty == 1.0  # 10% of 10000 = 1000; 1000 / 1000 price = 1.0
+
+
+# --- exit_reason: stop-loss / take-profit, decimal-fraction params_json ---
+
+
+def test_exit_reason_none_when_neither_leg_configured():
+    assert exit_reason(100, 90, {}) is None
+
+
+def test_exit_reason_stop_loss_hit():
+    assert exit_reason(100, 98, {"stop_loss_pct": 0.02}) == "stop_loss"
+
+
+def test_exit_reason_stop_loss_not_yet_hit():
+    assert exit_reason(100, 99, {"stop_loss_pct": 0.02}) is None
+
+
+def test_exit_reason_take_profit_hit():
+    assert exit_reason(100, 103, {"take_profit_pct": 0.03}) == "take_profit"
+
+
+def test_exit_reason_take_profit_not_yet_hit():
+    assert exit_reason(100, 102, {"take_profit_pct": 0.03}) is None
+
+
+def test_exit_reason_ignores_missing_leg():
+    # only take_profit_pct configured — a big drop isn't a stop-loss exit
+    assert exit_reason(100, 50, {"take_profit_pct": 0.03}) is None
+
+
+def test_exit_reason_none_for_invalid_prices():
+    assert exit_reason(0, 100, {"stop_loss_pct": 0.02}) is None
+    assert exit_reason(100, 0, {"stop_loss_pct": 0.02}) is None

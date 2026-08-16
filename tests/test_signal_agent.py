@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from src.agents.signal_agent import get_signal
-from src.groq_client import ModelUsageEvent
+from src.groq_client import AllModelsFailedError, ModelUsageEvent
 
 
 def _market():
@@ -26,3 +26,19 @@ def test_get_signal_falls_back_to_flat_on_bad_json():
 
     assert signal["direction"] == "flat"
     assert signal["confidence"] == 0.0
+
+
+def test_get_signal_falls_back_to_flat_when_all_models_fail():
+    # a total LLM outage (rate limit, bad key, network) must degrade this
+    # one symbol to flat, not raise out of get_signal and crash the cycle
+    failure_events = [ModelUsageEvent("model-a", None, 50, False)]
+    with patch(
+        "src.agents.signal_agent.chat",
+        side_effect=AllModelsFailedError("all models in chain failed: [...]", failure_events),
+    ):
+        signal, returned_events = get_signal(_market(), "system prompt")
+
+    assert signal["direction"] == "flat"
+    assert signal["confidence"] == 0.0
+    assert "all models failed" in signal["reasoning"]
+    assert returned_events == failure_events

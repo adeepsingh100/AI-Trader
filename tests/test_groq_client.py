@@ -37,8 +37,14 @@ def test_all_models_failed_raises(monkeypatch):
     client = Mock()
     client.chat.completions.create.side_effect = RuntimeError("boom")
 
-    with pytest.raises(AllModelsFailedError):
+    with pytest.raises(AllModelsFailedError) as exc_info:
         chat([{"role": "user", "content": "hi"}], model_chain=["model-a"], client=client)
+
+    # the real failure reason must survive on the exception, not just the
+    # generic "all models failed" — this is what a caller logs for diagnosis
+    assert "boom" in str(exc_info.value)
+    assert len(exc_info.value.events) == 3
+    assert all(e.success is False for e in exc_info.value.events)
 
 
 def test_chat_bounds_output_with_max_tokens_by_default():
@@ -145,5 +151,8 @@ def test_ollama_all_models_failed_raises(monkeypatch):
     with patch("src.groq_client.requests.post") as mock_post:
         mock_post.side_effect = requests.ConnectionError("down")
 
-        with pytest.raises(AllModelsFailedError):
+        with pytest.raises(AllModelsFailedError) as exc_info:
             chat([{"role": "user", "content": "hi"}], model_chain=["model-a"])
+
+    assert "down" in str(exc_info.value)
+    assert len(exc_info.value.events) == 3

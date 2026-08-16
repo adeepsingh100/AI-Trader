@@ -84,15 +84,42 @@ runs to completion and exits — no long-running process (see §7).
   Agent to flatten when `max_daily_loss` is breached.
 - From the top-10 signals, only takes symbols with an open sizing slot
   and a non-flat signal; ties broken by signal confidence.
+- Per-trade stop-loss/take-profit (`exit_reason()`): the active strategy
+  version's `params_json.stop_loss_pct`/`take_profit_pct` (decimal
+  fraction of entry price, e.g. `0.02` = 2%) are enforced against every
+  open trade's live ticker price, independent of the LLM signal for that
+  cycle — a hit closes the position immediately rather than waiting for
+  the LLM to say "sell". Either key can be omitted to leave that side
+  unenforced. See `orchestrator.run_risk_check()` and §5.
+  **Not a guarantee, same caveat as the circuit breaker above**: CoinDCX's
+  spot API has no exchange-side stop order (confirmed against their docs —
+  `market_order`/`limit_order` only; stop-limit/take-profit exist solely
+  in their margin product, which this bot deliberately doesn't use — see
+  §1 spot-only). So this is enforced by polling, not by the exchange
+  watching the price continuously, and GitHub Actions free-tier cron is
+  best-effort — the actual gap between checks can exceed the nominal 5
+  minutes under platform load, with no hard ceiling. A fast, large move
+  can still realize a loss/gain past the configured percentage before the
+  next check fires. Closing this gap for real needs an always-on poller
+  (not cron-triggered), which is a deliberate scope decision not taken —
+  see if this ever actually bites before reaching for it.
 
 ### Execution Agent (`src/agents/execution/`)
 - Shared interface (`base.py`): `place_order`, `get_fill`, `flatten_all`.
 - `paper.py` — `PaperExecutionAgent`: simulates fills against live
-  orderbook data with **configurable** slippage/fee model (default: fee
-  = CoinDCX's published taker fee, slippage = a configurable bps
-  constant applied against best bid/ask).
+  orderbook data with **configurable** slippage/fee model (slippage = a
+  configurable bps constant applied against best bid/ask). Fee model
+  mirrors CoinDCX's actual charges: 0.5% trading fee on trade value on
+  both sides, +18% GST on that fee, and an additional 1% TDS (Income
+  Tax Act s.194S) on trade value on **sells only** (not levied on
+  buys — no "transfer" of the asset on acquisition). All three
+  constants live in `paper.py`, adjust if CoinDCX's fee schedule
+  changes.
 - `real.py` — `RealExecutionAgent`: calls CoinDCX's authenticated/signed
-  order endpoints. Only ever instantiated by the orchestrator when
+  order endpoints, adds the same 1% sell-side TDS on top of the
+  exchange-reported `fee_amount` since TDS isn't a documented field on
+  the order response (unverified against a real fill — see the module's
+  own caveat below). Only ever instantiated by the orchestrator when
   `strategy_versions.promoted_to_real = true` for the active version —
   this gate lives in the orchestrator, not just the execution agent, so
   there's no path that reaches real order placement with an unpromoted
@@ -150,6 +177,15 @@ runs to completion and exits — no long-running process (see §7).
   under platform load, runs can be delayed several minutes. The
   Risk Manager's daily bookkeeping must tolerate skipped/late cycles
   (it recomputes from `trades`/`daily_pnl`, not from cycle count).
+- Risk check: separate `risk_check.yml` workflow, `cron: '*/5 * * * *'`
+  (5 min is GitHub Actions' shortest supported schedule interval —
+  going tighter isn't possible on the free tier, and per-cycle LLM cost
+  is why the full trading cycle above stays at 10 min). Runs
+  `orchestrator.py --risk-only`: stop-loss/take-profit + circuit-breaker
+  sweep only, no LLM call and no market snapshot, so it's cheap enough
+  to run twice as often as the signal cycle. This is what actually
+  bounds how long a bad move can run unwatched — not the signal cycle's
+  interval, since exits no longer wait on the LLM to notice.
 - Evolution job: separate daily GH Actions workflow.
 - Database: Supabase free tier (Postgres).
 - Secrets: GitHub encrypted secrets for CI; `.env` (gitignored) for
