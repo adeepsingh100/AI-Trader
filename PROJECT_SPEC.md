@@ -384,6 +384,124 @@ inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
   rejected recommendations, simulation results, candidate/approved
   adaptive strategy versions.
 
+## 3c. Event-Driven Backtesting & Walk-Forward Validation Engine (`src/backtest/`)
+
+Fills the gap §3a/§3b's own docstrings openly admit to: neither ever
+replays candles or discovers a trade that wasn't actually taken — "a real
+backtester (candle replay) would be a much bigger feature and isn't being
+built here." This is that feature. Purely additive; `orchestrator.py`'s
+live `run_cycle` is untouched. Confirmed live (via a direct API check, not
+assumed) that CoinDCX's public candles endpoint accepts `startTime`/
+`endTime` even though `coindcx_client.py`'s wrapper never exposes them —
+real historical replay is possible, capped at 500 candles/call, walked
+backward via pagination in `data_provider.py`. Candle `time` is bar-OPEN
+time (the most-recent no-range-filter candle is always still forming),
+which pins the no-look-ahead rule exactly: a bar is visible at simulated
+time `t` only if `open_time + interval_duration <= t`.
+
+**What's reused unchanged** (this is where "same trading logic in both
+modes" is actually honored, not `run_cycle` itself — see below):
+`feature_engine.compute_multi_timeframe_features`, `opportunity_scorer.
+score_opportunity`/`select_top_candidates`, `risk_manager.evaluate`/
+`exit_reason`/`circuit_breaker_triggered`, `execution/paper.py`'s `fees`
+formula (made public), and `learning/statistics.py`'s Sharpe/Sortino/
+Calmar/win-rate/profit-factor/expectancy/z-tests. **What's new**: the
+event-reactor loop itself, because `run_cycle` is a live-polling shell
+(Supabase writes and `get_ticker()` on every call) fundamentally
+incompatible with "replay chronologically, no network calls in the hot
+loop." Two cadences kept deliberately separate from the tick granularity:
+`BACKTEST_DECISION_CYCLE_MINUTES` (mirrors `trading_cycle.yml`'s 10-min
+cron) and `BACKTEST_RISK_CHECK_MINUTES` (mirrors `risk_check.yml`'s 5-min
+cron) — ticking the decision pass on every candle would simulate a bot
+checking 5-10x more often than the live one ever does.
+
+- **`events.py`**: `MarketEvent/SignalEvent/OrderEvent/FillEvent/
+  PositionEvent/PortfolioEvent/RiskEvent/TimeEvent` + `EventQueue`.
+- **`simulation_clock.py`**: `is_bar_closed` is the no-look-ahead rule's
+  single source of truth; `SimulationClock` derives its own day boundary
+  for daily-PnL bucketing (never imports `risk_manager.today_ist()`, which
+  is real wall-clock time).
+- **`data_provider.py`**: paginated historical fetch (network, only ever
+  called by `ingest_data.py`) + `CandleStore`, an in-memory, closed-bar-only
+  reader loaded once per run — zero network/DB calls in the hot loop.
+- **`order_manager.py` / `execution_simulator.py`**: `OrderType` (market/
+  limit/stop/stop_limit/trailing_stop) + realistic fill simulation
+  (spread/slippage/partial fills/rejections/expiry) — commission reuses
+  `execution/paper.py`'s exact fee formula. Live only ever issues market
+  orders (CoinDCX spot has no exchange-side resting order); the richer
+  types are a real, generic capability, not something the default parity
+  backtest of the current live strategy exercises. Fully in-memory —
+  never imports `src.db.models` or `src.coindcx_client`, so a backtest run
+  can never leak into live Supabase state.
+- **`portfolio_manager.py`**: cash/equity/positions/realized+unrealized
+  PnL/exposure, mark-to-market equity curve — genuinely new (the only
+  existing drawdown, `evolution_agent._max_drawdown_pct`, walks the
+  trade-pnl sequence, not an intraday equity curve). Spot-only like live —
+  no margin/leverage machinery.
+- **`engine.py`**: `BacktestEngine` — the reactor loop. Replicates all
+  **three** circuit-breaker checkpoints `run_cycle` has (top-of-decision-
+  pass, post-SL/TP-sweep, per-candidate). Symbol universe is an explicit,
+  user-supplied list, never reconstructed from a live turnover ranking —
+  CoinDCX has no historical ticker/turnover series to replay, so
+  defaulting to "today's top-N over history" would be survivorship bias;
+  every report says this. LLM signal-agent validation is real but
+  **opt-in, off by default** (`BACKTEST_USE_LLM_SIGNAL_AGENT`) — quant-only
+  is the deterministic default that actually satisfies "everything must be
+  deterministic" (the live LLM call is temperature-sampled); when enabled,
+  the historical-confidence/regime/symbol blend is deliberately NOT
+  reused, since that queries LIVE current trades/learning_statistics and
+  would leak years of future information into a historical decision —
+  LLM-mode confidence is the raw AI verdict only, labeled non-reproducible.
+  `ingest_data.py` (CLI) backfills `historical_candles` for
+  `[start_date - BACKTEST_WARMUP_BUFFER_DAYS, end_date]`, never just the
+  requested window — `FEATURE_CANDLE_LIMIT`/`EMA_TREND_PERIOD_4` need up
+  to ~200 closed daily bars before scores stop being `None`, so without
+  the buffer every run would silently find zero candidates for its first
+  ~200 days.
+- **`performance_analyzer.py`**: reuses `statistics.compute_bucket_statistics`
+  directly; adds gross profit/loss, Omega ratio, Ulcer index, rolling
+  Sharpe/volatility/drawdown, monthly/annual returns, exposure time,
+  capital utilization. Recovery factor is computed at report time only,
+  never stored — numerically identical to Calmar, same "don't store one
+  fact under two names" precedent as §3b.
+- **`trade_analysis.py`**: per-trade MFE/MAE/slippage/commission/return/
+  risk-reward/exit-reason/confidence/opportunity-score/regime.
+- **`walk_forward_validator.py`**: real rolling multi-fold validation
+  (train window → test window, never overlapping, stepped forward) —
+  distinct from and doesn't modify `simulation.py`'s existing single-split
+  trade-repartition logic (different question: would this parameter set
+  have made money on a historical period it never saw, vs. does a weight
+  recommendation separate already-observed outcomes better).
+- **`strategy_comparison.py`**: pairwise run comparison reusing
+  `z_test_two_proportions`/`z_test_two_means` directly — "only recommend
+  promotion if statistically superior" means the test rejects the null in
+  B's favor, not just that B's raw number is bigger.
+- **`statistical_validation.py`**: confidence intervals via **seeded
+  bootstrap resampling**, not a parametric t-interval — this codebase has
+  zero numpy/scipy, and a hand-rolled regularized-incomplete-beta
+  implementation for a real t-CDF is real numerical bug surface for little
+  gain over the existing z-test at backtest sample sizes; bootstrap needs
+  no distributional assumption at all, arguably the more honest answer for
+  small fold sizes. Plus Monte Carlo trade-order resampling (drawdown
+  path-dependency) and a parameter-stability sweep. All randomness draws
+  from a local `random.Random(BACKTEST_RANDOM_SEED)` instance, never the
+  global `random` module — reruns are bit-identical.
+- **`overfitting_detection.py`**: aggregates walk-forward fold results +
+  parameter stability into a verdict (`robust`/`marginal`/`overfit`).
+  "Reject weak strategies automatically" means automatic **status
+  marking** only, never automatic deletion or live application — same
+  human-approval precedent as `recommendations`/`adaptive_strategy_versions`.
+- **`report.py`**: HTML (reusing `reporting_agent._table`) + CSV/JSON via
+  stdlib. No PDF — the HTML report is already print-to-PDF-ready in any
+  browser, and this codebase's zero-non-essential-dependency discipline
+  (no numpy/scipy despite far heavier justification) argues against adding
+  one just for PDF rendering. Standalone per-run artifact, not wired into
+  `reporting_agent.py`'s live dashboard report.
+
+No new GitHub Actions workflow — on-demand CLI (`python -m
+src.backtest.engine`/`ingest_data`), same precedent as `seed_config.py`,
+not a recurring job.
+
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
 - Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
@@ -675,6 +793,29 @@ separate "Feature Weight History"/"Threshold History" tables —
 `recommendations WHERE category = ...` (append-only) already is that
 history.
 
+**Backtesting Engine (§3c), 8 new tables** — genuinely more new tables
+than §3b needed, honestly: `historical_candles` (raw OHLCV cache, unique
+on `pair, interval, time`), `backtest_runs` (run config snapshot,
+`source_adaptive_strategy_version_id` nullable FK — the link for
+backtesting a pending §3b candidate before approving it), `backtest_trades`
+(deliberately separate from live `trades` — a backtest re-runs the SAME
+historical period many times under different params, which `trades` has
+no `run_id` concept for, and conflating them risks simulated data leaking
+into live dashboards/risk state), `backtest_portfolio_snapshots`
+(mark-to-market equity curve, genuinely new — no existing intraday-equity
+drawdown), `backtest_execution_history` (order-lifecycle events —
+submitted/filled/partial/rejected/expired, a different grain from
+`backtest_trades`' round-trip outcomes), `backtest_performance_metrics`
+(`run_id` unique + `metrics jsonb`, same bundle-not-wide-columns pattern
+as `strategy_simulations`), `backtest_walk_forward_folds` (real multi-fold
+results, deliberately parallel to but separate from `strategy_simulations`
+— that one is single-split trade-repartition, this one is genuinely
+rolling candle-replay), `backtest_strategy_comparisons` (pairwise run
+comparison + p-values + `promotion_recommended`, automatic status marking
+only, never automatic deletion/live application). No "Simulation Reports"
+table — a report is generated on demand from the above, same precedent as
+§3b's report having no storage table of its own.
+
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
 - Row-level security: dashboard's Supabase anon key is read-only across
@@ -694,6 +835,10 @@ GitHub Actions (daily cron) ──> evolution_agent.py ────┐  Supabase
                                                                       │
 Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ──────┘
 ```
+
+The Backtesting Engine (§3c) is deliberately absent from this diagram — it
+runs on demand (`python -m src.backtest.engine`/`ingest_data`), never on a
+schedule, same precedent as `seed_config.py`.
 
 ## 8. Dashboard (Next.js on Vercel)
 
@@ -773,6 +918,22 @@ funds exist, before trusting it beyond the promotion gate.
 │   │   ├── simulation.py            # walk-forward validation, §3b
 │   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b
 │   │   └── reports.py
+│   ├── backtest/                    # Event-Driven Backtesting Engine (§3c) — on-demand CLI, not scheduled
+│   │   ├── events.py
+│   │   ├── simulation_clock.py
+│   │   ├── data_provider.py
+│   │   ├── order_manager.py
+│   │   ├── execution_simulator.py
+│   │   ├── portfolio_manager.py
+│   │   ├── engine.py                # BacktestEngine, the reactor loop
+│   │   ├── performance_analyzer.py
+│   │   ├── trade_analysis.py
+│   │   ├── walk_forward_validator.py
+│   │   ├── strategy_comparison.py
+│   │   ├── statistical_validation.py
+│   │   ├── overfitting_detection.py
+│   │   ├── report.py
+│   │   └── ingest_data.py           # CLI: backfills historical_candles
 │   └── db/
 │       ├── models.py
 │       └── migrations/
@@ -781,7 +942,8 @@ funds exist, before trusting it beyond the promotion gate.
 │           ├── 0003_pause_flag.sql
 │           ├── 0004_opportunity_evaluations.sql
 │           ├── 0005_learning_engine.sql
-│           └── 0006_adaptive_strategy_engine.sql
+│           ├── 0006_adaptive_strategy_engine.sql
+│           └── 0007_backtesting_engine.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

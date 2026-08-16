@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1h&startTime=1700000000000&endTime=1700100000000\")",
+      "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1h&startTime=1600000000000&endTime=1700100000000\" -o /tmp/big.json -w \"http_code=%{http_code} size=%{size_download}\\\\n\")",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/tmp/big.json'\\)\\); print\\('count:', len\\(d\\)\\); print\\('first:', d[-1] if d else None\\); print\\('last:', d[0] if d else None\\)\")",
+      "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1d\" -o /tmp/nolim.json -w \"http_code=%{http_code}\\\\n\")",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/tmp/nolim.json'\\)\\); print\\('count:', len\\(d\\)\\)\")",
+      "Bash(python3 -c \"import time; print\\('now_ms:', int\\(time.time\\(\\)*1000\\)\\)\")",
+      "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1m&limit=2\")",
+      "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1h&limit=2\")",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

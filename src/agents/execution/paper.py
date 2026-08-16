@@ -12,7 +12,10 @@ SELL_TDS_PCT = 1
 SLIPPAGE_BPS = 5
 
 
-def _fees(notional: float, side: str) -> float:
+def fees(notional: float, side: str) -> float:
+    """Public — reused as-is by src/backtest/execution_simulator.py for
+    commission calc, same "make it public to reuse" precedent as
+    opportunity_scorer.weighted_average."""
     trading_fee = notional * (TRADING_FEE_PCT / 100)
     total = trading_fee + trading_fee * (GST_PCT_ON_FEE / 100)
     if side == "sell":
@@ -24,8 +27,8 @@ class PaperExecutionAgent(ExecutionAgent):
     def place_order(self, symbol: str, side: str, qty: float, price: float) -> dict:
         slip = price * (SLIPPAGE_BPS / 10_000)
         fill_price = price + slip if side == "buy" else price - slip
-        fees = _fees(fill_price * qty, side)
-        return {"fill_price": fill_price, "fees": fees}
+        fee_amount = fees(fill_price * qty, side)
+        return {"fill_price": fill_price, "fees": fee_amount}
 
     def flatten_all(self, mode: str) -> list[dict]:
         from src.coindcx_client import get_ticker

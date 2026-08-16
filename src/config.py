@@ -219,3 +219,85 @@ RECENT_PERFORMANCE_LOOKBACK_TRADES = int(os.getenv("RECENT_PERFORMANCE_LOOKBACK_
 # risk-management practice), but both are independently configurable.
 RECENT_STREAK_WIN_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_WIN_MODIFIER_CAP", "5"))
 RECENT_STREAK_LOSS_MODIFIER_CAP = float(os.getenv("RECENT_STREAK_LOSS_MODIFIER_CAP", "15"))
+
+# --- Event-Driven Backtesting & Walk-Forward Validation Engine --------------
+# Replays real historical OHLCV (CoinDCX's public candles endpoint supports
+# startTime/endTime even though src/coindcx_client.py's live wrapper doesn't
+# expose them) through the same pure pipeline functions live trading uses
+# (feature engine, opportunity scorer, risk manager) — see PROJECT_SPEC.md
+# §3c. On-demand CLI only (python -m src.backtest.engine), not a cron job.
+
+# Finest granularity the SimulationClock ticks at — governs candle
+# visibility/no-look-ahead ONLY, not how often scoring/risk logic fires
+# (that's the two cadences below, kept deliberately separate). Must be one
+# of FEATURE_TIMEFRAMES.
+BACKTEST_TICK_TIMEFRAME = os.getenv("BACKTEST_TICK_TIMEFRAME") or "1m"
+# Mirrors trading_cycle.yml's */10 cron — when the full scoring+risk+entry/
+# exit pass fires.
+BACKTEST_DECISION_CYCLE_MINUTES = int(os.getenv("BACKTEST_DECISION_CYCLE_MINUTES", "10"))
+# Mirrors risk_check.yml's */5 cron — when the stop-loss/take-profit sweep
+# fires, independent of the decision cycle above (same polling-gap
+# limitation as live: not continuous, see PROJECT_SPEC.md §2).
+BACKTEST_RISK_CHECK_MINUTES = int(os.getenv("BACKTEST_RISK_CHECK_MINUTES", "5"))
+# Historical candles are ingested from (start_date - this many days) so
+# FEATURE_CANDLE_LIMIT/EMA_TREND_PERIOD_4's ~200-bar warm-up requirement is
+# satisfied BEFORE the requested backtest window starts — otherwise every
+# run would silently find zero candidates for its first ~200 days.
+BACKTEST_WARMUP_BUFFER_DAYS = int(os.getenv("BACKTEST_WARMUP_BUFFER_DAYS", "260"))
+
+BACKTEST_STARTING_CAPITAL = float(os.getenv("BACKTEST_STARTING_CAPITAL", "100000"))
+BACKTEST_POSITION_SIZE_PCT = float(os.getenv("BACKTEST_POSITION_SIZE_PCT", "10"))
+BACKTEST_MAX_CONCURRENT_POSITIONS = int(os.getenv("BACKTEST_MAX_CONCURRENT_POSITIONS", "5"))
+
+# Execution simulation. Independent of execution/paper.py's own hardcoded
+# SLIPPAGE_BPS (that module's live behavior is untouched) — commission
+# reuses paper.py's exact fee formula directly, everything else here is new.
+BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "5"))
+# Synthetic half-spread cost — CoinDCX exposes no historical order-book
+# snapshots (get_orderbook is live-only, never called historically), so
+# real book-depth replay isn't possible; this is a documented approximation.
+BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "10"))
+BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME = float(os.getenv("BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME", "10"))
+BACKTEST_FILL_DELAY_BARS = int(os.getenv("BACKTEST_FILL_DELAY_BARS", "0"))
+BACKTEST_ORDER_EXPIRY_BARS = int(os.getenv("BACKTEST_ORDER_EXPIRY_BARS", "20"))
+BACKTEST_MAX_RETRY_ATTEMPTS = int(os.getenv("BACKTEST_MAX_RETRY_ATTEMPTS", "3"))
+# Mirrors CoinDCX's real ~₹100 min_notional (see README's real-execution
+# caveat) as a rejection floor for simulated orders.
+BACKTEST_MIN_NOTIONAL_INR = float(os.getenv("BACKTEST_MIN_NOTIONAL_INR", "100"))
+
+# All resampling (bootstrap CI, Monte Carlo trade-order shuffling) draws
+# from a local random.Random(BACKTEST_RANDOM_SEED) instance, never the
+# global `random` module — reruns are bit-identical, satisfying
+# "everything must be deterministic."
+BACKTEST_RANDOM_SEED = int(os.getenv("BACKTEST_RANDOM_SEED", "42"))
+BACKTEST_BOOTSTRAP_ITERATIONS = int(os.getenv("BACKTEST_BOOTSTRAP_ITERATIONS", "1000"))
+BACKTEST_MONTE_CARLO_ITERATIONS = int(os.getenv("BACKTEST_MONTE_CARLO_ITERATIONS", "1000"))
+
+BACKTEST_WALK_FORWARD_N_FOLDS = int(os.getenv("BACKTEST_WALK_FORWARD_N_FOLDS", "5"))
+BACKTEST_WALK_FORWARD_TRAIN_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TRAIN_DAYS", "90"))
+BACKTEST_WALK_FORWARD_TEST_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TEST_DAYS", "30"))
+# RECOMMENDATION_MIN_SAMPLE_SIZE and SIGNIFICANCE_THRESHOLD (above) are
+# reused directly for the fold-sample-size gate and pass/fail checks — no
+# duplicate constants. Below that per-fold sample floor, folds report
+# "insufficient sample" (None) rather than a hand-rolled Student's-t
+# p-value — this codebase has zero numpy/scipy, and a parametric t-test
+# needs a regularized-incomplete-beta implementation that's real numerical
+# bug surface for little gain over the existing z-test at this sample size;
+# small-n confidence intervals are answered by the seeded bootstrap above
+# instead, which needs no distributional assumption at all.
+
+# Off by default: quant-only (feature engine + opportunity scorer + risk
+# manager) is the deterministic default that actually satisfies "everything
+# must be deterministic" — the live LLM signal agent is temperature-sampled.
+# When enabled, validate_opportunity() is reused as-is for realism, but the
+# historical-confidence/regime/symbol blend is deliberately NOT reused (it
+# queries LIVE current trades/learning_statistics, which would leak
+# present-day trade history into a historical decision) — LLM-mode
+# confidence is the raw AI verdict only, and is labeled non-reproducible in
+# reports rather than fed into PerformanceAnalyzer's trusted default metrics.
+BACKTEST_USE_LLM_SIGNAL_AGENT = (os.getenv("BACKTEST_USE_LLM_SIGNAL_AGENT") or "false").strip().lower() == "true"
+
+# CoinDCX's public candles endpoint caps at 500 rows per call regardless of
+# the requested startTime/endTime range (confirmed empirically) — named
+# here so pagination logic has no magic number.
+BACKTEST_CANDLE_PAGE_SIZE = int(os.getenv("BACKTEST_CANDLE_PAGE_SIZE", "500"))

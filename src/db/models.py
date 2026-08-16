@@ -658,6 +658,256 @@ def get_trades_by_ids(trade_ids: list[int]) -> list[dict]:
     return res.data
 
 
+# --- historical_candles ---
+
+
+def upsert_historical_candles(pair: str, interval: str, candles: list[dict]) -> None:
+    """candles: list of {"time","open","high","low","close","volume"} dicts,
+    CoinDCX's own raw shape — caller passes them through unchanged."""
+    if not candles:
+        return
+    rows = [
+        {
+            "pair": pair,
+            "interval": interval,
+            "time": c["time"],
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+            "volume": c["volume"],
+        }
+        for c in candles
+    ]
+    get_client().table("historical_candles").upsert(rows, on_conflict="pair,interval,time").execute()
+
+
+def get_historical_candles(pair: str, interval: str, start_time_ms: int, end_time_ms: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("historical_candles")
+        .select("*")
+        .eq("pair", pair)
+        .eq("interval", interval)
+        .gte("time", start_time_ms)
+        .lte("time", end_time_ms)
+        .order("time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_runs ---
+
+
+def insert_backtest_run(
+    symbols: list[str],
+    start_date: Date,
+    end_date: Date,
+    warmup_buffer_days: int,
+    starting_capital: float,
+    params_json: dict,
+    use_llm_signal_agent: bool = False,
+    source_adaptive_strategy_version_id: int | None = None,
+    name: str | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("backtest_runs")
+        .insert(
+            {
+                "name": name,
+                "symbols": symbols,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "warmup_buffer_days": warmup_buffer_days,
+                "starting_capital": starting_capital,
+                "params_json": params_json,
+                "use_llm_signal_agent": use_llm_signal_agent,
+                "source_adaptive_strategy_version_id": source_adaptive_strategy_version_id,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def update_backtest_run_status(run_id: int, status: str, completed_at: datetime | None = None) -> None:
+    update = {"status": status}
+    if completed_at is not None:
+        update["completed_at"] = completed_at.isoformat()
+    get_client().table("backtest_runs").update(update).eq("id", run_id).execute()
+
+
+def get_backtest_run(run_id: int) -> dict | None:
+    res = get_client().table("backtest_runs").select("*").eq("id", run_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_backtest_runs(status: str | None = None) -> list[dict]:
+    query = get_client().table("backtest_runs").select("*")
+    if status is not None:
+        query = query.eq("status", status)
+    return query.order("created_at", desc=True).execute().data
+
+
+# --- backtest_trades ---
+
+
+def insert_backtest_trade(run_id: int, trade: dict) -> dict:
+    res = get_client().table("backtest_trades").insert({"run_id": run_id, **trade}).execute()
+    return res.data[0]
+
+
+def get_backtest_trades(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_trades")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("entry_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_portfolio_snapshots ---
+
+
+def insert_backtest_portfolio_snapshots(run_id: int, snapshots: list[dict]) -> None:
+    """Batch insert — a multi-month equity curve is thousands of points,
+    one-row-per-network-call would be needlessly slow."""
+    if not snapshots:
+        return
+    rows = [{"run_id": run_id, **s} for s in snapshots]
+    get_client().table("backtest_portfolio_snapshots").insert(rows).execute()
+
+
+def get_backtest_portfolio_snapshots(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_portfolio_snapshots")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("snapshot_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_execution_history ---
+
+
+def insert_backtest_execution_events(run_id: int, events: list[dict]) -> None:
+    if not events:
+        return
+    rows = [{"run_id": run_id, **e} for e in events]
+    get_client().table("backtest_execution_history").insert(rows).execute()
+
+
+def get_backtest_execution_history(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_execution_history")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("event_time")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_performance_metrics ---
+
+
+def insert_backtest_performance_metrics(run_id: int, metrics: dict) -> dict:
+    res = (
+        get_client()
+        .table("backtest_performance_metrics")
+        .insert({"run_id": run_id, "metrics": metrics})
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_performance_metrics(run_id: int) -> dict | None:
+    res = (
+        get_client()
+        .table("backtest_performance_metrics")
+        .select("*")
+        .eq("run_id", run_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# --- backtest_walk_forward_folds ---
+
+
+def insert_backtest_walk_forward_fold(run_id: int, fold: dict) -> dict:
+    res = (
+        get_client()
+        .table("backtest_walk_forward_folds")
+        .insert({"run_id": run_id, **fold})
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_walk_forward_folds(run_id: int) -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_walk_forward_folds")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("fold_number")
+        .execute()
+    )
+    return res.data
+
+
+# --- backtest_strategy_comparisons ---
+
+
+def insert_backtest_strategy_comparison(
+    run_id_a: int,
+    run_id_b: int,
+    metrics_a: dict | None,
+    metrics_b: dict | None,
+    p_values: dict | None,
+    winner: str | None,
+    promotion_recommended: bool | None,
+) -> dict:
+    res = (
+        get_client()
+        .table("backtest_strategy_comparisons")
+        .insert(
+            {
+                "run_id_a": run_id_a,
+                "run_id_b": run_id_b,
+                "metrics_a": metrics_a,
+                "metrics_b": metrics_b,
+                "p_values": p_values,
+                "winner": winner,
+                "promotion_recommended": promotion_recommended,
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_backtest_strategy_comparisons() -> list[dict]:
+    res = (
+        get_client()
+        .table("backtest_strategy_comparisons")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data
+
+
 def get_entry_evaluations_since(mode: str, since: datetime) -> list[dict]:
     """Entry-time opportunity_evaluations rows (final_decision='buy', so
     trade_id is always set) since `since` — the candidate pool
