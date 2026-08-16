@@ -74,7 +74,8 @@ because scoring is pure math.
 - Each cycle: fetches 24h ticker volume for all INR pairs, selects the
   **top 10 by volume** (Resolved decision — see §9: dynamic
   top-10-by-volume, not a fixed pair list), pulls candles for each of
-  `FEATURE_TIMEFRAMES` (**configurable**, default `5m,15m,1h,4h`) at
+  `FEATURE_TIMEFRAMES` (**configurable**, default `1m,15m,1h,1d` —
+  CoinDCX's candles API only accepts `1m`/`15m`/`1h`/`1d`, others 422) at
   `FEATURE_CANDLE_LIMIT` (default 250) candles per timeframe.
 - No orderbook fetch — nothing in the pipeline consumes book depth
   (`PaperExecutionAgent` uses a flat slippage bps, `RealExecutionAgent`

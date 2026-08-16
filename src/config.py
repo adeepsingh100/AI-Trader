@@ -41,16 +41,18 @@ PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15")
 # top candidates go to the LLM for accept/reject validation. Every knob
 # below is named and overridable so nothing in that path is a bare literal.
 
-# tf:weight pairs, e.g. "5m:0.15,15m:0.25,1h:0.30,4h:0.30" — weights used to
+# tf:weight pairs, e.g. "1m:0.15,15m:0.25,1h:0.30,1d:0.30" — weights used to
 # blend a per-timeframe score into one sub-score. Must sum to ~1.0 (scorer
 # renormalizes defensively regardless). FEATURE_TIMEFRAMES (which candles to
 # fetch) is derived from this dict's keys rather than a second env var, so
 # "which timeframes get fetched" and "which get weighted" can't drift apart.
+# CoinDCX's public candles API only accepts interval in {1m, 15m, 1h, 1d} —
+# any other value (e.g. 5m, 4h) 422s, so keys here must stay within that set.
 TIMEFRAME_WEIGHTS = {
     tf: float(weight)
     for tf, weight in (
         pair.split(":")
-        for pair in (os.getenv("TIMEFRAME_WEIGHTS") or "5m:0.15,15m:0.25,1h:0.30,4h:0.30").split(",")
+        for pair in (os.getenv("TIMEFRAME_WEIGHTS") or "1m:0.15,15m:0.25,1h:0.30,1d:0.30").split(",")
         if pair.strip()
     )
 }
