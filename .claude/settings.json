@@ -9,7 +9,21 @@
       "Bash(python3 -c \"import time; print\\('now_ms:', int\\(time.time\\(\\)*1000\\)\\)\")",
       "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1m&limit=2\")",
       "Bash(curl -s \"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1h&limit=2\")",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m pytest -q tests/test_execution_optimizer.py)",
+      "Bash(python3 -m pytest -q tests/test_paper_execution.py)",
+      "Bash(python3 -m pytest -q tests/test_drift_detection.py)",
+      "Bash(python3 -m pytest -q tests/test_strategy_health.py)",
+      "Bash(python3 -m pytest -q tests/test_monitoring_metrics.py)",
+      "Bash(python3 -m pytest -q tests/test_monitoring_diagnostics.py)",
+      "Bash(python3 -m pytest -q tests/test_audit_trail.py)",
+      "Bash(python3 -m pytest -q tests/test_orchestrator.py::test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols -x)",
+      "Bash(python3 -m pytest -q tests/test_db_models_reliability.py)",
+      "Bash(python3 -m pytest -q tests/test_coindcx_client.py)",
+      "Bash(python3 -m pytest -q tests/test_backtest_data_provider.py -v)",
+      "Bash(xargs python3 -m py_compile)",
+      "Bash(python3 /private/tmp/claude-501/-Users-amandeepsingh-Desktop-AI-Trader/5fc59ebf-97ec-4273-a652-361f8e594e66/scratchpad/reliability_smoke_test.py)",
+      "Bash(python3 -m pytest -q tests/test_portfolio_intelligence.py tests/test_risk_manager.py)"
     ]
   }
 }

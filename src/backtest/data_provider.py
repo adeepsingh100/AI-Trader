@@ -14,7 +14,12 @@ import requests
 
 from src.backtest.simulation_clock import timeframe_duration_ms
 from src.config import BACKTEST_CANDLE_PAGE_SIZE
+from src.data_quality.repair import DataRepairEngine
+from src.data_quality.validator import MarketDataValidator
 from src.db import models
+
+_validator = MarketDataValidator()
+_repairer = DataRepairEngine()
 
 CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 
@@ -50,12 +55,34 @@ def fetch_historical_candles_paginated(pair: str, interval: str, start_ms: int, 
 
 
 def ingest(pair: str, interval: str, start_ms: int, end_ms: int) -> int:
-    """Fetches + upserts into the historical_candles cache. Returns the
-    number of candles ingested. Only ever called by ingest_data.py, never
-    from inside a backtest run itself."""
+    """Fetches + validates/repairs + upserts into the historical_candles
+    cache. Returns the number of candles ingested. Only ever called by
+    ingest_data.py, never from inside a backtest run itself — validated
+    once here at ingest time (Market Data Quality Engine + Data Repair
+    Engine, PROJECT_SPEC.md §3d), never re-validated on every CandleStore
+    read, same "validate once, read many" shape as the warm-up buffer."""
     candles = fetch_historical_candles_paginated(pair, interval, start_ms, end_ms)
-    models.upsert_historical_candles(pair, interval, candles)
-    return len(candles)
+    report = _validator.validate(candles, pair, interval, expected_pair=pair, live_fetch=False)
+    repaired, repair_log = _repairer.repair(report.usable_candles, report, pair, interval)
+
+    if report.issues:
+        models.insert_data_quality_issues(
+            [
+                {
+                    "pair": pair,
+                    "interval": interval,
+                    "source": "backtest",
+                    "issue_type": i.issue_type,
+                    "severity": i.severity,
+                    "detail": i.detail,
+                    "repaired": any(r.candle_time == i.candle_time for r in repair_log),
+                }
+                for i in report.issues
+            ]
+        )
+
+    models.upsert_historical_candles(pair, interval, repaired)
+    return len(repaired)
 
 
 class CandleStore:

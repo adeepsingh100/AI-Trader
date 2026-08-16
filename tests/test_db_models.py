@@ -5,12 +5,13 @@ from src.groq_client import ModelUsageEvent
 
 
 def _fluent_mock(execute_result):
-    """A mock whose chained methods (select/eq/insert/update/upsert/order/
-    limit/in_/gte) all return itself, so call args land on the same mock
-    and .execute() returns a fixed result."""
+    """A mock whose chained methods (select/eq/neq/insert/update/upsert/
+    order/limit/in_/gte) all return itself, so call args land on the same
+    mock and .execute() returns a fixed result."""
     m = Mock()
     m.select.return_value = m
     m.eq.return_value = m
+    m.neq.return_value = m
     m.insert.return_value = m
     m.update.return_value = m
     m.upsert.return_value = m

@@ -1,0 +1,176 @@
+"""Strategy Health Engine (Step 7, PROJECT_SPEC.md §3d). Health score per
+strategy_version from rolling Sharpe/drawdown/win-rate/profit-factor
+(learning/statistics.py, reused), recent-vs-historical performance
+(z-tests, reused), and walk-forward pass rate where a backtest exists for
+that version — that factor is simply omitted (never fabricated) when none
+does. Maps to Excellent/Good/Warning/Critical; Critical auto-suspends the
+version (status-only, never a delete — reversible in Supabase any time).
+
+Runs in the same new independent nightly step as drift_detection.py (never
+inside evolution_agent.run_evolution() or adaptive_strategy_engine.py)."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+from src.config import (
+    RECOMMENDATION_MIN_SAMPLE_SIZE,
+    STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED,
+    STRATEGY_HEALTH_EXCELLENT_THRESHOLD,
+    STRATEGY_HEALTH_GOOD_THRESHOLD,
+    STRATEGY_HEALTH_WARNING_THRESHOLD,
+)
+from src.db import models
+from src.learning.statistics import compute_bucket_statistics, z_test_two_means
+
+# Each component contributes 0-100, weighted equally — a simple, explicit
+# blend rather than an opaque learned weighting (this whole learning
+# subsystem is pure statistics, never ML).
+_COMPONENT_WEIGHT = 1 / 4
+
+
+def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def _sharpe_component(sharpe_ratio: float | None) -> float | None:
+    if sharpe_ratio is None:
+        return None
+    # Sharpe of 2.0+ is excellent by conventional standards, 0 is neutral,
+    # negative is bad — maps [-1, 2] -> [0, 100].
+    return _clamp((sharpe_ratio + 1) / 3 * 100)
+
+
+def _drawdown_component(max_drawdown_pct: float | None) -> float | None:
+    if max_drawdown_pct is None:
+        return None
+    from src.config import PROMOTION_MAX_DRAWDOWN_PCT
+
+    # 0% drawdown -> 100, PROMOTION_MAX_DRAWDOWN_PCT (the existing
+    # "acceptable" bar) -> 0 — reused, not a second drawdown anchor.
+    return _clamp(100 - (max_drawdown_pct / PROMOTION_MAX_DRAWDOWN_PCT) * 100)
+
+
+def _win_rate_component(win_rate: float | None) -> float | None:
+    return _clamp(win_rate * 100) if win_rate is not None else None
+
+
+def _profit_factor_component(profit_factor: float | None) -> float | None:
+    if profit_factor is None:
+        return None
+    # profit_factor of 1.0 (breakeven) -> 50, 3.0+ -> 100, 0 -> 0.
+    return _clamp(profit_factor / 3 * 100)
+
+
+def _recent_vs_historical_component(recent_stats: dict, historical_stats: dict) -> float | None:
+    """Statistically significant IMPROVEMENT nudges this component up,
+    significant DEGRADATION nudges it down, no significant difference (or
+    insufficient sample) leaves it neutral at 50 — never fabricated from a
+    handful of trades."""
+    recent_n, historical_n = recent_stats.get("trades_count") or 0, historical_stats.get("trades_count") or 0
+    if recent_n < RECOMMENDATION_MIN_SAMPLE_SIZE or historical_n < RECOMMENDATION_MIN_SAMPLE_SIZE:
+        return None
+    recent_exp, historical_exp = recent_stats.get("expectancy"), historical_stats.get("expectancy")
+    if recent_exp is None or historical_exp is None:
+        return None
+    # Approximate each bucket's expectancy stdev from its Sharpe (stdev =
+    # mean/sharpe) — compute_bucket_statistics doesn't return raw stdev,
+    # and re-deriving the full return series here would duplicate that
+    # function's own work; this is a reasonable approximation, not exact.
+    recent_sharpe, historical_sharpe = recent_stats.get("sharpe_ratio"), historical_stats.get("sharpe_ratio")
+    if not recent_sharpe or not historical_sharpe:
+        return 50.0
+    recent_sd, historical_sd = abs(recent_exp / recent_sharpe), abs(historical_exp / historical_sharpe)
+    p_value = z_test_two_means(recent_exp, recent_sd, recent_n, historical_exp, historical_sd, historical_n)
+    if p_value is None:
+        return 50.0
+    from src.config import SIGNIFICANCE_THRESHOLD
+
+    if p_value >= SIGNIFICANCE_THRESHOLD:
+        return 50.0
+    return 75.0 if recent_exp > historical_exp else 25.0
+
+
+def _walk_forward_component(run_id: int | None) -> float | None:
+    if run_id is None:
+        return None
+    folds = models.get_backtest_walk_forward_folds(run_id)
+    if not folds:
+        return None
+    passed = [f for f in folds if f.get("passed") is not None]
+    if not passed:
+        return None
+    return _clamp(sum(1 for f in passed if f["passed"]) / len(passed) * 100)
+
+
+def _tier(score: float | None) -> str:
+    if score is None:
+        return "unknown"
+    if score >= STRATEGY_HEALTH_EXCELLENT_THRESHOLD:
+        return "excellent"
+    if score >= STRATEGY_HEALTH_GOOD_THRESHOLD:
+        return "good"
+    if score >= STRATEGY_HEALTH_WARNING_THRESHOLD:
+        return "warning"
+    return "critical"
+
+
+def compute_health_score(
+    mode: str, version: dict, capital_to_use: float, backtest_run_id: int | None = None
+) -> dict:
+    trades = models.get_closed_trades(mode, version["id"])
+    recent_since = datetime.now(timezone.utc) - timedelta(days=30)
+    recent_trades = [t for t in trades if t.get("closed_at") and t["closed_at"] >= recent_since.isoformat()]
+
+    overall_stats = compute_bucket_statistics(trades, capital_to_use)
+    recent_stats = compute_bucket_statistics(recent_trades, capital_to_use)
+
+    components = {
+        "sharpe": _sharpe_component(overall_stats["sharpe_ratio"]),
+        "drawdown": _drawdown_component(overall_stats["max_drawdown_pct"]),
+        "win_rate": _win_rate_component(overall_stats["win_rate"]),
+        "profit_factor": _profit_factor_component(overall_stats["profit_factor"]),
+    }
+    available = {k: v for k, v in components.items() if v is not None}
+    health_score = sum(available.values()) / len(available) if available else None
+
+    recent_vs_historical = _recent_vs_historical_component(recent_stats, overall_stats)
+    walk_forward = _walk_forward_component(backtest_run_id)
+
+    return {
+        "health_score": health_score,
+        "tier": _tier(health_score),
+        "breakdown": {
+            **components,
+            "recent_vs_historical": recent_vs_historical,
+            "walk_forward_pass_rate": walk_forward,
+            "trades_count": overall_stats["trades_count"],
+        },
+    }
+
+
+def run_strategy_health(mode: str = "paper") -> dict:
+    versions = models.get_active_strategy_versions()
+    capital_config = models.get_capital_config(mode)
+    capital_to_use = capital_config["capital_to_use"] if capital_config else 0
+
+    scored, suspended = [], []
+    for version in versions:
+        result = compute_health_score(mode, version, capital_to_use)
+        models.insert_strategy_health_score(
+            version["id"], result["health_score"], result["tier"], result["breakdown"]
+        )
+        scored.append({"version_id": version["id"], **result})
+        if (
+            STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED
+            and result["tier"] == "critical"
+            and result["breakdown"]["trades_count"] >= RECOMMENDATION_MIN_SAMPLE_SIZE
+        ):
+            models.set_strategy_version_status(version["id"], "suspended")
+            suspended.append(version["id"])
+
+    return {"scored": len(scored), "suspended": suspended}
+
+
+if __name__ == "__main__":
+    print(run_strategy_health())

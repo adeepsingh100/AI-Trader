@@ -163,3 +163,91 @@ def test_exit_reason_ignores_missing_leg():
 def test_exit_reason_none_for_invalid_prices():
     assert exit_reason(0, 100, {"stop_loss_pct": 0.02}) is None
     assert exit_reason(100, 0, {"stop_loss_pct": 0.02}) is None
+
+
+# --- sizing_mode + Portfolio Intelligence integration (PROJECT_SPEC.md §3d) ---
+# The single most important regression here: every EXISTING call shape
+# (no new kwargs supplied) must be byte-identical to pre-§3d behavior —
+# capital_config.sizing_mode defaults to 'flat' in the DB migration, and
+# these new kwargs default to None, so nothing changes unless a caller
+# opts in.
+
+
+def test_evaluate_flat_sizing_mode_matches_pre_existing_formula():
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0)
+    assert decision.action == "size"
+    assert decision.qty == (10000 * 0.10) / 100.0  # unchanged flat formula
+
+
+def test_evaluate_missing_sizing_mode_key_defaults_to_flat_behavior():
+    # capital_config dicts from before this migration ran have no
+    # 'sizing_mode' key at all — .get() must default to flat, not crash.
+    capital_config = _capital_config()
+    assert "sizing_mode" not in capital_config
+    decision = evaluate(capital_config, None, [], last_price=100.0)
+    assert decision.action == "size"
+
+
+def test_evaluate_dynamic_sizing_mode_uses_capital_allocation_engine():
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10, sizing_mode="dynamic")
+    base_qty = (10000 * 0.10) / 100.0
+
+    # Every factor maxed favorably (confidence=100, win_rate=1.0) should
+    # size UP relative to the flat formula.
+    decision = evaluate(
+        capital_config, None, [], last_price=100.0,
+        sizing_context={"confidence": 100.0, "strategy_win_rate": 1.0, "market_regime": "strong_bull"},
+    )
+    assert decision.action == "size"
+    assert decision.qty > base_qty
+
+
+def test_evaluate_dynamic_sizing_still_respects_committed_capital_ceiling():
+    # The dynamic multiplier must feed the SAME capital ceiling check as
+    # flat sizing, never bypass it — a maxed-out multiplier on an
+    # already-near-full book must still block, not oversize past the cap.
+    capital_config = _capital_config(capital_to_use=1000, position_size_pct=90, sizing_mode="dynamic")
+    open_trades = [{"qty": 1, "entry_price": 950}]  # 950 already committed of 1000
+    decision = evaluate(
+        capital_config, None, open_trades, last_price=100.0,
+        sizing_context={"confidence": 100.0, "strategy_win_rate": 1.0, "market_regime": "strong_bull"},
+    )
+    assert decision.action == "block_capital_limit"
+
+
+def test_evaluate_concentration_gate_blocks_oversized_single_position():
+    # position_size_pct=50 of a 10,000 pool -> a 5,000 candidate, 50% of
+    # total equity — a 20-slot book's fair share is 5% (cap 12.5% at the
+    # default 2.5x multiple), so this is a genuinely oversized single bet,
+    # not just "the only position that happens to exist" (that case is
+    # covered by the small-book test below and must NOT block).
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=50, max_concurrent_positions=20)
+    decision = evaluate(
+        capital_config, None, [], last_price=100.0,
+        symbol="BTCINR", portfolio_positions=[], price_history={},
+    )
+    assert decision.action == "block_concentration_limit"
+
+
+def test_evaluate_concentration_gate_allows_first_position_in_small_book():
+    # max_concurrent_positions=2 -> equal share 50%, cap = 2x that = 100% —
+    # the very first trade in a small book must NOT be blocked (the real
+    # bug an integration test caught: a fixed institutional-style
+    # percentage cap blocked nearly every first trade in this bot's
+    # actual 2-5-slot range).
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10, max_concurrent_positions=2)
+    decision = evaluate(
+        capital_config, None, [], last_price=100.0,
+        symbol="BTCINR", portfolio_positions=[], price_history={},
+    )
+    assert decision.action == "size"
+
+
+def test_evaluate_omitting_portfolio_context_skips_concentration_gate():
+    # portfolio_positions/price_history default to None — an existing
+    # caller that never passes them gets no concentration check at all,
+    # not a crash and not a spurious block.
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0, symbol="BTCINR")
+    assert decision.action == "size"

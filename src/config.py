@@ -301,3 +301,172 @@ BACKTEST_USE_LLM_SIGNAL_AGENT = (os.getenv("BACKTEST_USE_LLM_SIGNAL_AGENT") or "
 # the requested startTime/endTime range (confirmed empirically) — named
 # here so pagination logic has no magic number.
 BACKTEST_CANDLE_PAGE_SIZE = int(os.getenv("BACKTEST_CANDLE_PAGE_SIZE", "500"))
+
+# --- Market Data Quality Engine + Data Repair Engine ------------------------
+# src/data_quality/validator.py + repair.py. One shared entry point for both
+# live (data_agent.py, right after get_candles()) and backtest (data_provider
+# .py::ingest, once at ingest time) — see PROJECT_SPEC.md §3d. Each check
+# maps to a severity; "reject" drops the offending candle(s) from what
+# reaches the Feature Engine, "quarantine" drops the whole symbol for that
+# fetch, "warn" logs but passes through, "ignore" doesn't even log.
+DATA_QUALITY_SEVERITY_MISSING_CANDLE = os.getenv("DATA_QUALITY_SEVERITY_MISSING_CANDLE") or "warn"
+DATA_QUALITY_SEVERITY_DUPLICATE = os.getenv("DATA_QUALITY_SEVERITY_DUPLICATE") or "warn"
+DATA_QUALITY_SEVERITY_NEGATIVE_PRICE = os.getenv("DATA_QUALITY_SEVERITY_NEGATIVE_PRICE") or "reject"
+DATA_QUALITY_SEVERITY_INVALID_OHLC = os.getenv("DATA_QUALITY_SEVERITY_INVALID_OHLC") or "reject"
+DATA_QUALITY_SEVERITY_OUT_OF_ORDER = os.getenv("DATA_QUALITY_SEVERITY_OUT_OF_ORDER") or "warn"
+DATA_QUALITY_SEVERITY_TIMESTAMP_GAP = os.getenv("DATA_QUALITY_SEVERITY_TIMESTAMP_GAP") or "warn"
+DATA_QUALITY_SEVERITY_ZERO_VOLUME = os.getenv("DATA_QUALITY_SEVERITY_ZERO_VOLUME") or "warn"
+DATA_QUALITY_SEVERITY_PRICE_SPIKE = os.getenv("DATA_QUALITY_SEVERITY_PRICE_SPIKE") or "warn"
+DATA_QUALITY_SEVERITY_EXCHANGE_OUTAGE = os.getenv("DATA_QUALITY_SEVERITY_EXCHANGE_OUTAGE") or "reject"
+DATA_QUALITY_SEVERITY_CLOCK_DRIFT = os.getenv("DATA_QUALITY_SEVERITY_CLOCK_DRIFT") or "warn"
+DATA_QUALITY_SEVERITY_SYMBOL_MISMATCH = os.getenv("DATA_QUALITY_SEVERITY_SYMBOL_MISMATCH") or "reject"
+DATA_QUALITY_SEVERITY_TIMEFRAME_CHANGE = os.getenv("DATA_QUALITY_SEVERITY_TIMEFRAME_CHANGE") or "warn"
+# Pct jump vs. the prior close (same-timeframe) beyond which a candle counts
+# as an extreme spike, not ordinary volatility.
+DATA_QUALITY_PRICE_SPIKE_PCT_THRESHOLD = float(os.getenv("DATA_QUALITY_PRICE_SPIKE_PCT_THRESHOLD", "20"))
+# Live-fetch path only (candle time vs. wall clock) — meaningless on
+# historical/backtest data, which is never "now".
+DATA_QUALITY_CLOCK_DRIFT_SECONDS_THRESHOLD = int(
+    os.getenv("DATA_QUALITY_CLOCK_DRIFT_SECONDS_THRESHOLD", "300")
+)
+# A gap this many bars or fewer gets linearly interpolated by the repair
+# engine; wider gaps are left rejected — repairing a large hole would
+# fabricate market data, not recover from a blip.
+DATA_REPAIR_MAX_GAP_BARS = int(os.getenv("DATA_REPAIR_MAX_GAP_BARS", "3"))
+
+# --- Portfolio Intelligence Engine ------------------------------------------
+# src/portfolio/intelligence.py. Pure functions — no DB/network access; the
+# caller (live risk_manager or the backtest engine) supplies positions and
+# an already-as-of-truncated price_history. See PROJECT_SPEC.md §3d.
+
+# "SYMBOL:category,SYMBOL:category" — no external crypto-category taxonomy
+# exists for this bot to query, so this is a manually maintained mapping.
+# Unmapped symbols fall into "uncategorized", never a guessed category.
+COIN_CATEGORY_MAP = {
+    sym.strip().upper(): category.strip()
+    for sym, category in (
+        pair.split(":") for pair in (os.getenv("COIN_CATEGORY_MAP") or "").split(",") if pair.strip()
+    )
+}
+PORTFOLIO_VAR_CONFIDENCE_PCT = float(os.getenv("PORTFOLIO_VAR_CONFIDENCE_PCT", "95"))
+# Rolling-correlation / beta window width, in bars of whatever price_history
+# the caller supplied (daily closes for a live snapshot, backtest ticks for
+# a backtest run) — not a separate data fetch.
+PORTFOLIO_CORRELATION_LOOKBACK_BARS = int(os.getenv("PORTFOLIO_CORRELATION_LOOKBACK_BARS", "30"))
+# Market proxy for beta regression — no broad crypto index exists on
+# CoinDCX, BTC is the closest thing to a market benchmark.
+PORTFOLIO_BETA_PROXY_SYMBOL = os.getenv("PORTFOLIO_BETA_PROXY_SYMBOL") or "BTCINR"
+# Concentration caps scale with capital_config.max_concurrent_positions
+# rather than a fixed institutional-style percentage: an equal-weighted
+# N-position book has each position at 1/N already, so a flat 25% cap
+# would block nearly every trade in this bot's actual 2-5-position range
+# (a real bug a test caught — the very first position in a 2-slot book is
+# structurally 100% concentrated, which isn't "too concentrated", it's
+# just what one position looks like). "Equal share" = 100/max_concurrent_
+# positions; the cap is that share times this multiple.
+MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE = float(
+    os.getenv("MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE", "2.0")
+)
+MAX_SECTOR_CONCENTRATION_MULT_OF_EQUAL_SHARE = float(
+    os.getenv("MAX_SECTOR_CONCENTRATION_MULT_OF_EQUAL_SHARE", "2.5")
+)
+
+# --- Capital Allocation Engine ----------------------------------------------
+# src/portfolio/capital_allocation.py. Only used when capital_config.
+# sizing_mode='dynamic' — the DB row default is 'flat' (today's exact flat
+# capital_to_use*position_size_pct/100 formula, byte-identical), so this
+# whole block is inert until a human flips a mode's row in Supabase. Each
+# factor is an independent multiplier clamped to its own MIN/MAX, and the
+# combined product is clamped again — no single factor or their product can
+# blow sizing out unboundedly. See PROJECT_SPEC.md §3d.
+CAPITAL_ALLOC_CORRELATION_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_CORRELATION_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_CORRELATION_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_CORRELATION_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_VOLATILITY_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_VOLATILITY_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_VOLATILITY_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_VOLATILITY_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_DRAWDOWN_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_DRAWDOWN_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_DRAWDOWN_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_DRAWDOWN_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_EXPOSURE_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_EXPOSURE_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_EXPOSURE_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_EXPOSURE_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MIN_MULT = float(
+    os.getenv("CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MIN_MULT", "0.5")
+)
+CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MAX_MULT = float(
+    os.getenv("CAPITAL_ALLOC_STRATEGY_PERFORMANCE_MAX_MULT", "1.5")
+)
+CAPITAL_ALLOC_REGIME_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_REGIME_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_REGIME_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_REGIME_MAX_MULT", "1.5"))
+CAPITAL_ALLOC_CONFIDENCE_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_CONFIDENCE_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_CONFIDENCE_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_CONFIDENCE_MAX_MULT", "1.5"))
+# Clamp on the product of every factor above, the final safety rail before
+# the result still has to clear risk_manager's existing committed_capital
+# ceiling unchanged.
+CAPITAL_ALLOC_TOTAL_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MIN_MULT", "0.5"))
+CAPITAL_ALLOC_TOTAL_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MAX_MULT", "1.5"))
+
+# --- Execution Optimizer ----------------------------------------------------
+# src/execution_optimizer/optimizer.py. Real trades: recommendation is
+# computed and audit-logged only, RealExecutionAgent stays market-only
+# (unverified/inert, see PROJECT_SPEC.md §2). Paper trades: config-gated
+# opt-in to actually act on a recommended order type via the existing
+# backtest execution_simulator's fill logic (paper is simulated — safe to
+# exercise). Off by default.
+EXECUTION_OPTIMIZER_ENABLED = (os.getenv("EXECUTION_OPTIMIZER_ENABLED") or "false").strip().lower() == "true"
+# Spread above this favors a limit order (avoid crossing a wide synthetic
+# spread) over a market order, when the estimated fill probability clears
+# the floor below.
+EXECUTION_OPTIMIZER_SPREAD_BPS_LIMIT_THRESHOLD = float(
+    os.getenv("EXECUTION_OPTIMIZER_SPREAD_BPS_LIMIT_THRESHOLD", "15")
+)
+EXECUTION_OPTIMIZER_MIN_FILL_PROBABILITY = float(
+    os.getenv("EXECUTION_OPTIMIZER_MIN_FILL_PROBABILITY", "0.7")
+)
+
+# --- Feature Drift Detection -------------------------------------------------
+# src/learning/drift_detection.py. Runs as its own independent nightly step
+# in evolution.yml (never merged into evolution_agent.run_evolution() or
+# adaptive_strategy_engine — same "don't couple independent learning steps"
+# rule those two already follow). Advisory only, writes to drift_alerts;
+# nothing here touches config.py or scoring weights.
+DRIFT_BASELINE_WINDOW_DAYS = int(os.getenv("DRIFT_BASELINE_WINDOW_DAYS", "90"))
+DRIFT_RECENT_WINDOW_DAYS = int(os.getenv("DRIFT_RECENT_WINDOW_DAYS", "14"))
+# Population Stability Index (hand-rolled bucketed frequency ratio, no
+# scipy) — <0.1 stable, 0.1-0.25 warning, >=0.25 critical, an industry-
+# standard convention for this metric.
+DRIFT_PSI_WARNING_THRESHOLD = float(os.getenv("DRIFT_PSI_WARNING_THRESHOLD", "0.1"))
+DRIFT_PSI_CRITICAL_THRESHOLD = float(os.getenv("DRIFT_PSI_CRITICAL_THRESHOLD", "0.25"))
+DRIFT_PSI_BUCKET_COUNT = int(os.getenv("DRIFT_PSI_BUCKET_COUNT", "10"))
+
+# --- Strategy Health Engine --------------------------------------------------
+# src/learning/strategy_health.py. Health-score tiers, checked in descending
+# order (>=EXCELLENT -> Excellent, >=GOOD -> Good, >=WARNING -> Warning,
+# else Critical). Auto-suspension marks strategy_versions.status='suspended'
+# only (never a delete) — reversible in Supabase at any time.
+STRATEGY_HEALTH_EXCELLENT_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_EXCELLENT_THRESHOLD", "80"))
+STRATEGY_HEALTH_GOOD_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_GOOD_THRESHOLD", "60"))
+STRATEGY_HEALTH_WARNING_THRESHOLD = float(os.getenv("STRATEGY_HEALTH_WARNING_THRESHOLD", "40"))
+STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED = (
+    os.getenv("STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED") or "true"
+).strip().lower() == "true"
+# RECOMMENDATION_MIN_SAMPLE_SIZE (above) is reused directly as the "trust
+# this health score" trade-count floor — no duplicate constant.
+
+# --- Production Monitoring & Self-Diagnostics -------------------------------
+# src/monitoring/. Scoped to what's real for short-lived GitHub Actions cron
+# invocations (stateless, Supabase as the only durable state) rather than
+# invented long-running-server metaphors. diagnostics runs as a new step in
+# risk_check.yml (every 5 min, already the finest-grained cron) — no new
+# workflow file. See PROJECT_SPEC.md §3d.
+SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES = int(os.getenv("SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES", "30"))
+SYSTEM_METRICS_LEARNING_STALE_HOURS = int(os.getenv("SYSTEM_METRICS_LEARNING_STALE_HOURS", "48"))
+
+# --- Resilience --------------------------------------------------------------
+# src/resilience.py. retry_with_backoff() wraps coindcx_client.py's requests
+# calls and db/models.py's Supabase calls (both zero-retry before this) —
+# same backoff shape groq_client.py already used for LLM calls, now the one
+# shared implementation. The circuit breaker is DB-backed (survives across
+# cron invocations) and fails OPEN on its own write errors — a Supabase
+# outage can't block itself from being recorded as a Supabase outage.
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE_DELAY_SECONDS = float(os.getenv("RETRY_BASE_DELAY_SECONDS", "1"))
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "300"))

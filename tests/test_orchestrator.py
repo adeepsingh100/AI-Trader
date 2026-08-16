@@ -552,6 +552,55 @@ def test_run_cycle_logs_every_scanned_symbol_even_without_an_llm_call(
     mock_process.assert_called_once_with("paper")
 
 
+# --- per-symbol fault isolation (Resilience, PROJECT_SPEC.md §3d) ---
+
+
+@patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.calibrate_confidence")
+@patch("src.orchestrator.find_similar_trades")
+@patch("src.orchestrator.validate_opportunity")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+):
+    """A confirmed real gap before this fix: one symbol's exception used
+    to crash the whole cycle, so every remaining symbol never got
+    processed even though the cycle is otherwise safe to retry from a
+    clean DB-read state."""
+    mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_latest_version.return_value = _version()
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_snapshot.return_value = [_market("BTCINR"), _market("ETHINR")]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = [{"symbol": "BTCINR"}, {"symbol": "ETHINR"}]
+    mock_models.open_trade.return_value = {"id": 99}
+    mock_models.log_opportunity_evaluation.return_value = {"id": 501}
+    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
+    mock_calibrate.return_value = _permissive_calibration()
+    # First symbol's similarity lookup blows up; second symbol must still
+    # be processed normally.
+    mock_similar.side_effect = [RuntimeError("boom"), _empty_similar()]
+
+    execution_agent = Mock()
+    execution_agent.place_order.return_value = {"fill_price": 1_000_500, "fees": 1.0}
+
+    result = run_cycle(execution_agent=execution_agent)
+
+    # Second symbol (ETHINR) still opened a trade despite the first
+    # symbol's exception.
+    assert result["opened"] == [{"id": 99}]
+    mock_models.log_agent_event.assert_any_call(
+        "orchestrator", "error", "BTCINR: RuntimeError: boom"
+    )
+    # process_closed_trades still runs at the end — the cycle completed,
+    # it didn't abort.
+    mock_process.assert_called_once_with("paper")
+
+
 # --- real mode / paused / promoted-version routing (unaffected by scoring) ---
 
 

@@ -7,6 +7,7 @@ from src.agents.execution.paper import (
     TRADING_FEE_PCT,
     PaperExecutionAgent,
 )
+from src.execution_optimizer.optimizer import OrderContext
 
 
 def test_place_order_buy_applies_slippage_and_fee():
@@ -46,6 +47,43 @@ def test_sell_fees_exceed_buy_fees_at_same_notional_due_to_tds():
     buy = agent.place_order("BTCINR", "buy", qty=0.01, price=1_000_000)
     sell = agent.place_order("BTCINR", "sell", qty=0.01, price=1_000_000)
     assert sell["fees"] > buy["fees"]
+
+
+# --- Execution Optimizer integration (PROJECT_SPEC.md §3d) — additive,
+# optional order_context kwarg; every test above (no order_context passed)
+# must stay byte-identical, which they already are since the default is
+# None and EXECUTION_OPTIMIZER_ENABLED defaults to false.
+
+
+def test_place_order_ignores_order_context_when_optimizer_disabled():
+    agent = PaperExecutionAgent()
+    ctx = OrderContext("BTCINR", "buy", order_size=1000, spread_bps=50, bar_volume=1_000_000, recent_fill_rate=1.0)
+    with patch("src.agents.execution.paper.EXECUTION_OPTIMIZER_ENABLED", False):
+        fill = agent.place_order("BTCINR", "buy", qty=0.01, price=1_000_000, order_context=ctx)
+    assert fill["order_type"] == "market"
+    assert fill["fill_price"] == 1_000_000 * (1 + SLIPPAGE_BPS / 10_000)
+
+
+def test_place_order_uses_limit_fill_when_optimizer_enabled_and_recommends_limit():
+    agent = PaperExecutionAgent()
+    ctx = OrderContext("BTCINR", "buy", order_size=1000, spread_bps=50, bar_volume=1_000_000, recent_fill_rate=1.0)
+    with patch("src.agents.execution.paper.EXECUTION_OPTIMIZER_ENABLED", True), patch(
+        "src.agents.execution.paper.random.random", return_value=0.0
+    ):
+        fill = agent.place_order("BTCINR", "buy", qty=0.01, price=1_000_000, order_context=ctx)
+    assert fill["order_type"] == "limit"
+    half_spread = 1_000_000 * (50 / 2 / 10_000)
+    assert fill["fill_price"] == 1_000_000 - half_spread  # buy limit improves on price, doesn't cross full spread
+
+
+def test_place_order_falls_back_to_market_when_limit_attempt_misses():
+    agent = PaperExecutionAgent()
+    ctx = OrderContext("BTCINR", "buy", order_size=1000, spread_bps=50, bar_volume=1_000_000, recent_fill_rate=0.3)
+    with patch("src.agents.execution.paper.EXECUTION_OPTIMIZER_ENABLED", True), patch(
+        "src.agents.execution.paper.random.random", return_value=0.99  # misses the 0.3 fill-probability draw
+    ):
+        fill = agent.place_order("BTCINR", "buy", qty=0.01, price=1_000_000, order_context=ctx)
+    assert fill["order_type"] == "market"
 
 
 @patch("src.db.models")

@@ -28,12 +28,14 @@ from src.agents.execution.paper import PaperExecutionAgent
 from src.agents.execution.real import RealExecutionAgent
 from src.agents.risk_manager import (
     circuit_breaker_triggered,
+    committed_capital,
     evaluate,
     exit_reason,
     target_hit,
     today_ist,
 )
 from src.agents.signal_agent import validate_opportunity
+from src.audit.trail import config_version
 from src.coindcx_client import get_ticker
 from src.config import (
     BUCKET_MODIFIER_CAP,
@@ -56,6 +58,8 @@ from src.features.opportunity_scorer import (
 from src.learning.confidence_calibration import calibrate_confidence
 from src.learning.statistics import process_closed_trades, streaks
 from src.learning.trade_memory import find_similar_trades
+from src.monitoring.metrics import log_resource_snapshot, track
+from src.portfolio.intelligence import Position, correlation, returns_series
 
 MODE = "paper"
 
@@ -122,6 +126,49 @@ def _recent_performance_modifier(mode: str) -> float | None:
     if streak["current_streak_type"] == "win":
         return min(RECENT_STREAK_WIN_MODIFIER_CAP, length_fraction * RECENT_STREAK_WIN_MODIFIER_CAP)
     return None
+
+
+def _price_history_from_snapshot(scored: list[dict]) -> dict[str, list[float]]:
+    """Daily closes for every symbol scanned this cycle — already-fetched
+    data (market["candles_by_timeframe"]["1d"]), no extra API calls.
+    Symbols not in this cycle's top-N snapshot (a held position that's
+    fallen out of top turnover) simply aren't keys here; Portfolio
+    Intelligence degrades correlation/beta for them to None rather than
+    guessing — concentration/sector checks don't need price history at
+    all, so they're unaffected."""
+    history: dict[str, list[float]] = {}
+    for r in scored:
+        daily = r["market"]["candles_by_timeframe"].get("1d")
+        if daily:
+            history[r["symbol"]] = [c["close"] for c in daily if c.get("close") is not None]
+    return history
+
+
+def _portfolio_positions(open_trades: list[dict], last_prices: dict[str, float]) -> list[Position]:
+    """Current price falls back to entry_price for a held symbol this
+    cycle's snapshot didn't cover — an approximation (not a fresh ticker
+    price), but keeps concentration math running rather than skipping a
+    position it does hold."""
+    return [
+        Position(t["symbol"], t["qty"], t["entry_price"], last_prices.get(t["symbol"], t["entry_price"]))
+        for t in open_trades
+    ]
+
+
+def _avg_correlation_with_book(symbol: str, open_trades: list[dict], price_history: dict[str, list[float]]) -> float | None:
+    candidate_prices = price_history.get(symbol)
+    if not candidate_prices:
+        return None
+    candidate_returns = returns_series(candidate_prices)
+    correlations = []
+    for t in open_trades:
+        held_prices = price_history.get(t["symbol"])
+        if not held_prices or t["symbol"] == symbol:
+            continue
+        c = correlation(candidate_returns, returns_series(held_prices))
+        if c is not None:
+            correlations.append(c)
+    return sum(correlations) / len(correlations) if correlations else None
 
 
 def _sweep_stop_loss_take_profit(
@@ -256,7 +303,18 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
         version = models.get_latest_version()
         if version is None:
-            raise RuntimeError("no strategy_versions row — create one first")
+            # Two different situations share "no active version": never
+            # bootstrapped at all (seed_config.py never ran — a real setup
+            # error, still worth a loud crash) vs. every existing version
+            # is suspended (Strategy Health Engine, PROJECT_SPEC.md §3d —
+            # a legitimate, reversible outcome that must no-op, not
+            # crash-loop the cron every 10 minutes).
+            if not models.get_all_strategy_versions():
+                raise RuntimeError("no strategy_versions row — create one first")
+            models.log_agent_event(
+                "orchestrator", "info", "paper mode: every strategy version is suspended, skipping"
+            )
+            return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_active_version"}
 
     if execution_agent is None:
         execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
@@ -280,7 +338,8 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         execution_agent.flatten_all(mode)
         return {"opened": opened, "closed": closed, "circuit_breaker": True}
 
-    snapshot = get_market_snapshot(n_symbols)
+    with track("data_agent", "market_snapshot"):
+        snapshot = get_market_snapshot(n_symbols)
 
     # Pass 1: pure, no LLM, no side effects — score every scanned symbol.
     scored = []
@@ -307,13 +366,26 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
     overall_win_rate = overall_row.get("win_rate") if overall_row else None
     recent_performance_modifier = _recent_performance_modifier(mode)
 
+    # Portfolio Intelligence + Capital Allocation inputs (PROJECT_SPEC.md
+    # §3d) — built once per cycle from data already fetched this cycle
+    # (no extra API calls), reused by every candidate's risk_manager.evaluate
+    # call below.
+    price_history = _price_history_from_snapshot(scored)
+    last_price_by_symbol = {r["symbol"]: r["market"]["last_price"] for r in scored}
+
     # Pass 2: LLM validation only for entry candidates and held positions
     # whose score has deteriorated past the exit threshold — everyone else
     # is logged with no LLM call at all.
-    for record in scored:
-        if circuit_breaker_triggered(daily_pnl, capital_config):
-            execution_agent.flatten_all(mode)
-            break
+    #
+    # Per-symbol fault isolation (Resilience, PROJECT_SPEC.md §3d): the body
+    # is a nested function so one symbol's exception (a malformed LLM
+    # response, a transient execution error) can be caught and logged by
+    # the loop below without aborting every remaining symbol in the cycle —
+    # a confirmed real gap before this. `nonlocal daily_pnl` is needed
+    # because the exit branch reassigns it (via _record_close) and that
+    # update must be visible to the next iteration's circuit-breaker check.
+    def _process_candidate(record: dict) -> None:
+        nonlocal daily_pnl
 
         symbol = record["symbol"]
         market = record["market"]
@@ -361,7 +433,33 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             )
 
             if llm_decision == "accept" and confidence_cleared:
-                decision = evaluate(capital_config, daily_pnl, open_trades, market["last_price"])
+                capital_to_use = capital_config.get("capital_to_use") or 0
+                sizing_context = {
+                    "avg_correlation": _avg_correlation_with_book(symbol, open_trades, price_history),
+                    "candidate_volatility_pct": (record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}).get("atr_pct"),
+                    # Not computed live yet — no live mark-to-market equity
+                    # curve exists to derive it from (that's backtest-only,
+                    # src/backtest/portfolio_manager.py); the drawdown
+                    # factor defaults to neutral (1.0) rather than a
+                    # fabricated estimate.
+                    "recent_drawdown_pct": None,
+                    "current_exposure_pct": (
+                        committed_capital(open_trades) / capital_to_use * 100 if capital_to_use else None
+                    ),
+                    "strategy_win_rate": overall_win_rate,
+                    "market_regime": record["market_regime"],
+                    "confidence": calibrated["final_confidence"],
+                }
+                decision = evaluate(
+                    capital_config,
+                    daily_pnl,
+                    open_trades,
+                    market["last_price"],
+                    symbol=symbol,
+                    portfolio_positions=_portfolio_positions(open_trades, last_price_by_symbol),
+                    price_history=price_history,
+                    sizing_context=sizing_context,
+                )
                 risk_manager_result = decision.action
                 if decision.action == "size":
                     fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
@@ -434,13 +532,27 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             final_decision=final_decision,
             reason=reason,
             trade_id=trade_id,
+            market_regime=record["market_regime"],
+            config_version=config_version(),
         )
         if calibration_to_log is not None:
             models.log_confidence_calibration(
                 opportunity_evaluation_id=evaluation_row["id"], **calibration_to_log
             )
 
+    for record in scored:
+        if circuit_breaker_triggered(daily_pnl, capital_config):
+            execution_agent.flatten_all(mode)
+            break
+        try:
+            _process_candidate(record)
+        except Exception as e:
+            models.log_agent_event(
+                "orchestrator", "error", f"{record['symbol']}: {type(e).__name__}: {e}"
+            )
+
     process_closed_trades(mode)
+    log_resource_snapshot("orchestrator")
 
     return {
         "opened": opened,

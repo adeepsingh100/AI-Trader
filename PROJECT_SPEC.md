@@ -502,6 +502,182 @@ No new GitHub Actions workflow — on-demand CLI (`python -m
 src.backtest.engine`/`ingest_data`), same precedent as `seed_config.py`,
 not a recurring job.
 
+## 3d. Institutional Reliability Layer
+
+Everything §3a-§3c built is trading intelligence; this is production
+reliability on top of it — data quality, portfolio-aware risk, execution
+quality, drift/health monitoring, observability, and fault tolerance.
+Confirmed via research before building: none of it existed anywhere in
+this repo, not even partially, except order types already simulating
+correctly in `src/backtest/` (nothing chose between them yet) and LLM
+calls already having retry/backoff/fallback (`groq_client.py`, nothing
+else did). Architecturally different from §3a-§3c: those were purely
+additive; several pieces here **must** touch the live trading hot path
+(`risk_manager.py`, `orchestrator.py`, `coindcx_client.py`, `db/models.py`)
+to mean anything — done narrowly, with every touched function keeping its
+existing signature and default behavior.
+
+**Market Data Quality Engine + Data Repair Engine** (`src/data_quality/`):
+`validator.py`'s `MarketDataValidator` checks every candle for missing
+bars/duplicates/negative or invalid OHLC/out-of-order timestamps/gaps/
+zero-volume/extreme spikes/exchange outages/clock drift (live-fetch path
+only)/symbol mismatch/timeframe changes, each mapped to a configurable
+`ignore|warn|reject|quarantine` severity. `repair.py`'s `DataRepairEngine`
+auto-fixes only what's safely fixable (small gaps ≤`DATA_REPAIR_MAX_GAP_BARS`
+via linear interpolation, exact-duplicate merges, reordering) — a
+reject/quarantine-severity issue is never silently repaired, and every
+repair returns a logged entry (`data_quality_log`), never a silent
+mutation. One shared entry point for both live (`data_agent.py`, right
+after `get_candles()`) and backtest (`data_provider.py::ingest`, once at
+ingest time) — not forked per pipeline.
+
+**Portfolio Intelligence Engine** (`src/portfolio/intelligence.py`): pure
+functions, no DB/network access — the caller supplies `positions` and a
+`price_history` dict **already truncated to the caller's current point in
+time** (the module never windows/slices beyond what it's handed, the fix
+for a real look-ahead trap a design review caught: a careless backtest
+call site could otherwise hand it a future-inclusive series "for
+convenience"). Computes correlation matrix + rolling correlation, sector/
+coin-category exposure (via a configurable `COIN_CATEGORY_MAP`, unmapped
+symbols fall into `"uncategorized"` — no external crypto taxonomy exists
+to query), stablecoin allocation, exchange exposure (always 100% —
+single-exchange bot), max concentration, net/gross exposure (equal by
+construction, spot-only/no shorting), beta (vs. `PORTFOLIO_BETA_PROXY_SYMBOL`,
+default BTC), risk contribution, portfolio volatility, historical VaR/
+Expected Shortfall (sorted-return percentile method, no distributional
+assumption — same reasoning as §3c's bootstrap-over-parametric choice),
+diversification score (1 − Herfindahl index). All hand-rolled stdlib math
+(Python 3.9 compatible — deliberately not `statistics.covariance`/
+`correlation`, 3.10+ only), same "no numpy/scipy" discipline as
+`learning/statistics.py`'s z-tests.
+
+Concentration caps scale with `capital_config.max_concurrent_positions`
+(`100/max_concurrent_positions × MAX_POSITION_CONCENTRATION_MULT_OF_EQUAL_SHARE`)
+rather than a fixed institutional-style percentage — a real bug an
+integration test caught: a flat 25% cap blocked nearly every first trade
+in this bot's actual 2-5-position range, since one position in a small
+book is structurally 100% of it. `risk_manager.evaluate()` gained new
+**optional** kwargs (`symbol`, `portfolio_positions`, `price_history`) —
+omitted, behavior is byte-identical to before; supplied, a concentration
+gate runs before the existing capital-limit check.
+
+**Capital Allocation Engine** (`src/portfolio/capital_allocation.py`): the
+highest-risk piece — replaces the flat `capital_to_use × position_size_pct
+/ 100` formula with a multiplicative blend of independently configurable
+factors (correlation/volatility/drawdown/exposure/strategy-performance/
+regime/confidence, each clamped, the combined product clamped again).
+**Rollout is paper-first, not automatic**: migration `0008` adds
+`capital_config.sizing_mode text default 'flat'` — `'flat'` is today's
+exact formula (byte-identical, verified by a regression test), `'dynamic'`
+calls the new engine. Nothing in code flips this column; a human sets
+paper's row to `'dynamic'` in Supabase after reviewing behavior, real's row
+stays `'flat'` until they choose otherwise — the same "human edits a row
+directly, no auto-promotion" invariant `paused`/`promoted_to_real` already
+run on. The dynamic result still flows through the unchanged
+`committed_capital(open_trades) + trade_capital > capital_to_use` ceiling —
+the multiplier feeds that gate, never bypasses it.
+
+**Execution Optimizer** (`src/execution_optimizer/optimizer.py`): pure
+recommendation engine (MARKET vs. LIMIT, reusing `src/backtest/
+order_manager.py`'s `OrderType` — no duplicate enum) estimating fill
+probability/cost/delay/slippage from spread/liquidity/volatility/order-size/
+recent-fill-rate. `RealExecutionAgent` stays fully untouched (market-only,
+per its own documented unverified/inert status). `PaperExecutionAgent`
+gained an optional, config-gated (`EXECUTION_OPTIMIZER_ENABLED`, default
+false) path to act on a LIMIT recommendation same-cycle — modeled as
+filling at a half-spread-improved price with probability
+`estimated_fill_probability`, an explicit single-shot simplification since
+paper trading has no cross-cycle resting-order infrastructure (that's what
+`order_manager.py` is for, built for the backtest engine's multi-tick event
+loop, not this synchronous per-cycle call).
+
+**Feature Drift Detection** (`src/learning/drift_detection.py`): hand-rolled
+Population Stability Index for feature-value distribution drift, a
+correlation-magnitude delta for feature-importance trend, and
+`z_test_two_proportions`-based (reused) win-rate/confidence-calibration/
+opportunity-score-accuracy drift — baseline window vs. recent window, only
+flags a *statistically significant worsening*, never an improvement or
+noise. Runs as its own independent step in `evolution.yml` (never merged
+into `evolution_agent.run_evolution()` or `adaptive_strategy_engine.py` —
+the same "don't couple independent learning steps" rule those two already
+follow). Writes to `drift_alerts` — advisory only, same as every other
+`src/learning/` output.
+
+**Strategy Health Engine** (`src/learning/strategy_health.py`): health
+score (0-100, `Excellent/Good/Warning/Critical`) per `strategy_version`
+from rolling Sharpe/drawdown/win-rate/profit-factor (`learning/statistics.py`,
+reused), recent-vs-historical performance (z-tests, reused), and
+walk-forward pass rate where a backtest exists for that version (omitted,
+never fabricated, otherwise). Migration `0008` adds
+`strategy_versions.status text default 'active'` — the same mutable-flag
+pattern `promoted_to_real` already uses on this table. **A design review
+caught a real silent-no-op risk here**: `get_latest_version()`/
+`get_latest_promoted_version()` were unfiltered `ORDER BY version_number
+DESC LIMIT 1` queries — both now filter `status != 'suspended'`, and
+paper mode's prior hard crash on "no version" now distinguishes "never
+bootstrapped" (still a crash) from "every version suspended" (a graceful
+no-op, since a crash-loop every 10 minutes is a worse outcome). Suspension
+is **status-only, never a delete** — reversible in Supabase at any time —
+and only fires when `STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED` (default true)
+and the trade count clears `RECOMMENDATION_MIN_SAMPLE_SIZE`.
+
+**Production Monitoring + Self-Diagnostics** (`src/monitoring/`): scoped
+to what's real for stateless ~10-minute GitHub Actions cron invocations
+(Supabase as the only durable state), not invented long-running-server
+metaphors. `metrics.py`'s `track()` context manager wraps timing/success
+capture around `orchestrator.run_cycle`'s market-snapshot fetch, writing to
+one generic `system_metrics` table (jsonb-bundle pattern, not N
+single-purpose tables); `resource_snapshot()` is a stdlib `resource`/
+`shutil.disk_usage` read of the runner's own process, the closest
+meaningful thing to "CPU/memory/disk" for a script that runs seconds and
+exits. `diagnostics.py`'s `run_health_check()` checks DB reachability,
+market-feed freshness, learning-engine freshness, execution-engine
+configuration, portfolio-position sanity, and recommendation-engine
+reachability — added as a new step in `risk_check.yml` (already the
+finest-grained cron, 5 min) rather than a 4th workflow file, which itself
+risks silently going stale unnoticed.
+
+**Audit System** — reuse first, not a new write path. `opportunity_evaluations`/
+`confidence_calibration`/`trades` already capture every decision point in
+`run_cycle` today (timestamp/component/input/decision/output/reason/
+strategy-version/confidence/trade-id). `src/audit/trail.py::get_decision_trail()`
+is a **read** function joining those three into one chronological timeline.
+Only two genuinely missing fields became new columns on an existing table:
+`opportunity_evaluations.config_version` (`trail.py::config_version()`, a
+short hash of the live scoring/threshold constants, for reproducibility)
+and `.market_regime` (already computed by the opportunity scorer, just not
+persisted before). A design review flagged that layering new write calls
+into the same hot loop being hardened by per-symbol isolation (below) would
+work against that hardening — this sidesteps it entirely.
+
+**Resilience** (`src/resilience.py`): `retry_with_backoff()` — the same
+backoff shape `groq_client.py` already used for LLM calls, now the one
+shared implementation — wraps every **read** call in `coindcx_client.py`
+and the handful of hot-path reads in `db/models.py` that gate whether a
+cycle can start at all (`get_capital_config`/`get_latest_version`/
+`get_latest_promoted_version`/`get_daily_pnl`/`get_open_trades`).
+`create_order` is deliberately **never** retried — a failed request whose
+response was lost but which actually succeeded server-side would place a
+second order on retry, a real double-submission risk a plain re-read
+doesn't carry (the reason a full mechanical retry-every-`.execute()`-call
+retrofit across all ~55 `db/models.py` functions was rejected in favor of
+this narrower, correctness-checked set — writes get retried only where they
+use `.upsert()`, which is naturally idempotent). A DB-backed circuit
+breaker (`circuit_breaker_state` table: `coindcx_api`/`supabase`/`llm`,
+consecutive-failure count, cooldown) survives across cron invocations and
+fails **open** on its own write errors (a Supabase outage can't block
+itself from being recorded as a Supabase outage). Per-symbol
+`try/except` isolation was added to `orchestrator.run_cycle`'s Pass 2 loop
+— a confirmed real gap: one symbol's exception used to abort every
+remaining symbol in the cycle even though the cycle is otherwise safe to
+retry from a clean DB-read state; this is the actual root-cause fix for
+"crash recovery" in a stateless cron architecture, not new checkpointing
+infrastructure (there's no persistent daemon to checkpoint).
+
+No new dependency of any kind — everything above is stdlib plus this
+repo's own existing modules, matching the zero-numpy/scipy discipline the
+codebase already prides itself on.
+
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
 - Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
@@ -816,6 +992,22 @@ only, never automatic deletion/live application). No "Simulation Reports"
 table — a report is generated on demand from the above, same precedent as
 §3b's report having no storage table of its own.
 
+**Institutional Reliability Layer (§3d), migration `0008`** — 5 new tables
++ 4 new columns, all with safe defaults that preserve today's exact
+behavior until a human opts in: `data_quality_log` (one row per issue
+found, live or backtest ingestion), `drift_alerts`, `strategy_health_scores`
+(a history per version, not just latest-value), `system_metrics` (one
+generic table, matching the jsonb-bundle precedent rather than N
+single-purpose tables), `circuit_breaker_state` (DB-backed so a trip
+survives across cron invocations). New columns:
+`capital_config.sizing_mode` (default `'flat'`), `strategy_versions.status`
+(default `'active'`), `opportunity_evaluations.config_version` +
+`.market_regime`. Unique among this repo's migrations: `get_latest_version()`/
+`get_latest_promoted_version()` now filter on `strategy_versions.status`,
+so unlike every prior migration (which only left a *new* feature dark
+until run), **this one must be applied before its corresponding code
+deploys** — those two functions gate every live trading cycle.
+
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
 - Row-level security: dashboard's Supabase anon key is read-only across
@@ -838,7 +1030,11 @@ Vercel (Next.js dashboard) ──── Supabase JS client (anon, RLS) ───
 
 The Backtesting Engine (§3c) is deliberately absent from this diagram — it
 runs on demand (`python -m src.backtest.engine`/`ingest_data`), never on a
-schedule, same precedent as `seed_config.py`.
+schedule, same precedent as `seed_config.py`. The Institutional Reliability
+Layer (§3d) IS in this diagram, but as new steps inside the existing three
+jobs, not new nodes: `src.monitoring.diagnostics` joins `risk_check.yml`
+(*/5 min), `src.learning.drift_detection`/`strategy_health` join
+`evolution.yml` (daily) — no 4th workflow file.
 
 ## 8. Dashboard (Next.js on Vercel)
 
@@ -917,7 +1113,9 @@ funds exist, before trusting it beyond the promotion gate.
 │   │   ├── recommendations.py
 │   │   ├── simulation.py            # walk-forward validation, §3b
 │   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b
-│   │   └── reports.py
+│   │   ├── reports.py
+│   │   ├── drift_detection.py       # Feature Drift Detection, §3d
+│   │   └── strategy_health.py       # Strategy Health Engine, §3d
 │   ├── backtest/                    # Event-Driven Backtesting Engine (§3c) — on-demand CLI, not scheduled
 │   │   ├── events.py
 │   │   ├── simulation_clock.py
@@ -934,6 +1132,20 @@ funds exist, before trusting it beyond the promotion gate.
 │   │   ├── overfitting_detection.py
 │   │   ├── report.py
 │   │   └── ingest_data.py           # CLI: backfills historical_candles
+│   ├── data_quality/                # Market Data Quality Engine + Data Repair Engine (§3d)
+│   │   ├── validator.py             # MarketDataValidator
+│   │   └── repair.py                # DataRepairEngine
+│   ├── portfolio/                   # Portfolio Intelligence + Capital Allocation (§3d)
+│   │   ├── intelligence.py
+│   │   └── capital_allocation.py
+│   ├── execution_optimizer/         # Execution Optimizer (§3d)
+│   │   └── optimizer.py
+│   ├── monitoring/                  # Production Monitoring + Self-Diagnostics (§3d)
+│   │   ├── metrics.py
+│   │   └── diagnostics.py
+│   ├── audit/                       # Audit System (§3d) — read-only decision-trail join
+│   │   └── trail.py
+│   ├── resilience.py                # retry/backoff + DB-backed circuit breaker (§3d)
 │   └── db/
 │       ├── models.py
 │       └── migrations/
@@ -943,7 +1155,8 @@ funds exist, before trusting it beyond the promotion gate.
 │           ├── 0004_opportunity_evaluations.sql
 │           ├── 0005_learning_engine.sql
 │           ├── 0006_adaptive_strategy_engine.sql
-│           └── 0007_backtesting_engine.sql
+│           ├── 0007_backtesting_engine.sql
+│           └── 0008_reliability_layer.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10
