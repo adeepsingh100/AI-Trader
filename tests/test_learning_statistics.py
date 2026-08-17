@@ -1,8 +1,16 @@
 import math
+from unittest.mock import patch
 
 import pytest
 
-from src.learning.statistics import compute_bucket_statistics, streaks, z_test_two_means, z_test_two_proportions
+from src.learning.statistics import (
+    _bucket_memberships,
+    accuracy_rates,
+    compute_bucket_statistics,
+    streaks,
+    z_test_two_means,
+    z_test_two_proportions,
+)
 
 
 def _trade(pnl, opened="2026-01-01T00:00:00Z", closed="2026-01-01T01:00:00Z"):
@@ -191,3 +199,62 @@ def test_streaks_empty_input():
         "current_streak_type": None,
         "current_streak_length": 0,
     }
+
+
+# --- exit_reason bucket dimension (Weakness Detection) ---
+
+
+def test_bucket_memberships_includes_exit_reason_when_present():
+    trade = {
+        "symbol": "BTCINR",
+        "version_id": 1,
+        "closed_at": "2026-01-01T12:00:00Z",
+        "exit_reason": "stop_loss",
+    }
+    memberships = _bucket_memberships(trade, opportunity_score=None, confidence=None)
+    assert memberships["exit_reason"] == "stop_loss"
+
+
+def test_bucket_memberships_omits_exit_reason_when_absent():
+    trade = {"symbol": "BTCINR", "version_id": 1, "closed_at": "2026-01-01T12:00:00Z"}
+    memberships = _bucket_memberships(trade, opportunity_score=None, confidence=None)
+    assert "exit_reason" not in memberships
+
+
+# --- accuracy_rates (Performance Analyzer) ---
+
+
+def test_accuracy_rates_aggregates_over_trade_evaluations():
+    rows = [
+        {
+            "confidence_was_accurate": True,
+            "opportunity_score_was_accurate": False,
+            "risk_assessment": "appropriate",
+            "stop_loss_assessment": "too_tight",
+            "target_assessment": "realistic",
+        },
+        {
+            "confidence_was_accurate": True,
+            "opportunity_score_was_accurate": True,
+            "risk_assessment": "too_aggressive",
+            "stop_loss_assessment": "appropriate",
+            "target_assessment": None,
+        },
+    ]
+    with patch("src.learning.statistics.models") as mock_models:
+        mock_models.get_trade_evaluations.return_value = rows
+        result = accuracy_rates([1, 2])
+
+    assert result["confidence_accuracy_pct"] == pytest.approx(100.0)
+    assert result["opportunity_score_accuracy_pct"] == pytest.approx(50.0)
+    assert result["risk_accuracy_pct"] == pytest.approx(50.0)
+    assert result["stop_loss_accuracy_pct"] == pytest.approx(50.0)
+    assert result["target_accuracy_pct"] == pytest.approx(100.0)  # None row excluded, not counted as wrong
+
+
+def test_accuracy_rates_none_when_no_rows():
+    with patch("src.learning.statistics.models") as mock_models:
+        mock_models.get_trade_evaluations.return_value = []
+        result = accuracy_rates([])
+
+    assert all(v is None for v in result.values())

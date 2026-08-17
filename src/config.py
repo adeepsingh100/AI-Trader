@@ -492,3 +492,30 @@ CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECON
 # the chain, not a flat retry).
 LLM_MAX_RETRIES_PER_MODEL = int(os.getenv("LLM_MAX_RETRIES_PER_MODEL", "2"))
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0"))
+
+# --- Scientific Strategy Optimization ----------------------------------------
+# src/learning/fitness.py + recommendations.py/simulation.py's extended
+# candidate pipeline, replacing evolution_agent.py's retired nightly LLM
+# prompt/param rewrite. Fitness weights default to the reference blend
+# (30% profit factor / 25% Sharpe / 20% expectancy / 15% win rate / 10%
+# drawdown penalty); renormalized among whatever components are available
+# (weighted_average's existing convention), so a missing component never
+# skews the score.
+FITNESS_WEIGHT_PROFIT_FACTOR = float(os.getenv("FITNESS_WEIGHT_PROFIT_FACTOR", "0.30"))
+FITNESS_WEIGHT_SHARPE = float(os.getenv("FITNESS_WEIGHT_SHARPE", "0.25"))
+FITNESS_WEIGHT_EXPECTANCY = float(os.getenv("FITNESS_WEIGHT_EXPECTANCY", "0.20"))
+FITNESS_WEIGHT_WIN_RATE = float(os.getenv("FITNESS_WEIGHT_WIN_RATE", "0.15"))
+FITNESS_WEIGHT_DRAWDOWN_PENALTY = float(os.getenv("FITNESS_WEIGHT_DRAWDOWN_PENALTY", "0.10"))
+# Sensitivity anchor mapping expectancy (as % of capital_to_use) onto the
+# 0-100 component scale: expectancy_pct * this value is added to a neutral
+# 50 baseline, clamped to [0, 100].
+FITNESS_EXPECTANCY_SCALE = float(os.getenv("FITNESS_EXPECTANCY_SCALE", "10"))
+# Gate for strategy_versions.promotion_eligible, alongside the existing
+# PROMOTION_MIN_PAPER_DAYS/_CUMULATIVE_PNL/_MAX_DRAWDOWN_PCT thresholds.
+PROMOTION_MIN_FITNESS_SCORE = float(os.getenv("PROMOTION_MIN_FITNESS_SCORE", "60"))
+# stop_loss_pct/take_profit_pct candidate sweep range (recommendations.py's
+# generate_exit_params_recommendations) — decimal fractions of entry price,
+# same convention as params_json.stop_loss_pct/take_profit_pct itself.
+EXIT_PARAM_SWEEP_MIN_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MIN_PCT", "0.01"))
+EXIT_PARAM_SWEEP_MAX_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MAX_PCT", "0.10"))
+EXIT_PARAM_SWEEP_STEP_PCT = float(os.getenv("EXIT_PARAM_SWEEP_STEP_PCT", "0.01"))

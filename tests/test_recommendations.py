@@ -3,7 +3,9 @@ from unittest.mock import patch
 import pytest
 
 from src.learning.recommendations import (
+    _simulate_exit_pnl,
     current_weights,
+    generate_exit_params_recommendations,
     generate_recommendations,
     generate_regime_recommendations,
     generate_symbol_recommendations,
@@ -250,3 +252,69 @@ def test_current_weights_matches_config():
         "volatility_score": 0.15,
         "risk_score": 0.15,
     }
+
+
+# --- _simulate_exit_pnl (exit-params candidate approximation) ---
+
+
+def test_simulate_exit_pnl_stop_triggers_when_mae_exceeds_candidate():
+    trade = {"entry_price": 100.0, "qty": 1.0, "mae_pct": 5.0, "mfe_pct": 0.5, "pnl": -30.0}
+    assert _simulate_exit_pnl(trade, stop_loss_pct=0.02, take_profit_pct=None) == pytest.approx(-2.0)
+
+
+def test_simulate_exit_pnl_stop_not_triggered_returns_actual_pnl():
+    trade = {"entry_price": 100.0, "qty": 1.0, "mae_pct": 1.0, "mfe_pct": 0.5, "pnl": -5.0}
+    assert _simulate_exit_pnl(trade, stop_loss_pct=0.02, take_profit_pct=None) == pytest.approx(-5.0)
+
+
+def test_simulate_exit_pnl_target_triggers_when_mfe_exceeds_candidate():
+    trade = {"entry_price": 100.0, "qty": 1.0, "mae_pct": 0.5, "mfe_pct": 6.0, "pnl": 20.0}
+    assert _simulate_exit_pnl(trade, stop_loss_pct=None, take_profit_pct=0.03) == pytest.approx(3.0)
+
+
+# --- generate_exit_params_recommendations ---
+
+
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+@patch("src.learning.recommendations.models")
+def test_generate_exit_params_recommendations_below_sample_size_returns_empty(mock_models):
+    mock_models.get_recently_closed_trades.return_value = [_trade(1, -30)]
+    assert generate_exit_params_recommendations("paper") == []
+
+
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MIN_PCT", 0.01)
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MAX_PCT", 0.05)
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_STEP_PCT", 0.01)
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_IMPROVEMENT_PCT", 10)
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.MIN_EXPECTANCY_DELTA", 1.0)
+@patch("src.learning.recommendations.models")
+def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_improvement(mock_models):
+    # Every trade blew past a 1% adverse move before eventually closing at
+    # a much bigger loss with no stop enforced — a tight stop clearly
+    # would have helped, and none reached favorable territory (no
+    # take_profit_pct candidate should fire).
+    trades = [
+        _trade(i, pnl=-30.0, entry_price=100.0, qty=1.0, mae_pct=5.0, mfe_pct=0.2)
+        for i in range(1, 5)
+    ]
+    mock_models.get_recently_closed_trades.return_value = trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_recommendation.return_value = None
+
+    result = generate_exit_params_recommendations("paper")
+
+    assert result
+    metric_names = {r["metric_name"] for r in result}
+    assert "stop_loss_pct" in metric_names
+    assert "take_profit_pct" not in metric_names  # mfe_pct never cleared any candidate
+    calls = mock_models.insert_recommendation.call_args_list
+    assert all(c.kwargs["category"] == "exit_params" for c in calls)
+
+
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.models")
+def test_generate_exit_params_recommendations_empty_when_baseline_expectancy_none(mock_models):
+    mock_models.get_recently_closed_trades.return_value = []
+    assert generate_exit_params_recommendations("paper") == []

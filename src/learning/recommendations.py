@@ -33,6 +33,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from src.config import (
+    EXIT_PARAM_SWEEP_MAX_PCT,
+    EXIT_PARAM_SWEEP_MIN_PCT,
+    EXIT_PARAM_SWEEP_STEP_PCT,
     LEARNING_HISTORY_WINDOW_DAYS,
     MIN_EXPECTANCY_DELTA,
     MIN_OPPORTUNITY_SCORE,
@@ -124,7 +127,12 @@ def _find_optimal_threshold(
     return best_threshold, best_stats, improvement_pct
 
 
-def generate_recommendations(mode: str) -> list[dict]:
+def generate_recommendations(mode: str, weakness_context: dict | None = None) -> list[dict]:
+    """weakness_context (Scientific Strategy Optimization Framework,
+    optional): weakness_detection.identify_weaknesses(mode)'s output —
+    when its worst opportunity_score_bucket finding is available, the
+    rationale cites it as supporting evidence rather than standing alone
+    as a bare number."""
     closed = _recently_closed(mode)
     if len(closed) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return []
@@ -166,6 +174,12 @@ def generate_recommendations(mode: str) -> list[dict]:
         f"{best_stats['expectancy']:.2f} vs {baseline_stats['expectancy']:.2f} at the current "
         f"MIN_OPPORTUNITY_SCORE={MIN_OPPORTUNITY_SCORE} (n={len(baseline_trades)})."
     )
+    weak_bucket = (weakness_context or {}).get("worst_by_dimension", {}).get("opportunity_score_bucket")
+    if weak_bucket is not None:
+        rationale += (
+            f" Corroborated by weakness detection: bucket {weak_bucket['value']} is the worst-performing "
+            f"opportunity_score_bucket (expectancy {weak_bucket['expectancy']:.2f}, n={weak_bucket['trades_count']})."
+        )
     models.insert_recommendation(
         mode=mode,
         metric_name="MIN_OPPORTUNITY_SCORE",
@@ -451,5 +465,97 @@ def generate_symbol_recommendations(mode: str) -> list[dict]:
                 batch_id=None,
             )
             results.append({"metric_name": metric_name, "recommended_value": best_threshold, "rationale": rationale})
+
+    return results
+
+
+def _sweep_range() -> list[float]:
+    values, pct = [], EXIT_PARAM_SWEEP_MIN_PCT
+    while pct <= EXIT_PARAM_SWEEP_MAX_PCT + 1e-9:
+        values.append(round(pct, 6))
+        pct += EXIT_PARAM_SWEEP_STEP_PCT
+    return values
+
+
+def _simulate_exit_pnl(trade: dict, stop_loss_pct: float | None, take_profit_pct: float | None) -> float:
+    """Approximates this trade's pnl under a candidate stop_loss_pct/
+    take_profit_pct using its recorded mfe_pct/mae_pct (max favorable/
+    adverse excursion) rather than a full price-path replay — the same
+    approximation _assess_stop_loss/_assess_target already make per-trade
+    in statistics.py, generalized here into a sweep. Does not model
+    excursion ORDER (whether the favorable or adverse extreme happened
+    first) — a stated limitation, not a full backtest."""
+    notional = trade["entry_price"] * trade["qty"]
+    mae_pct, mfe_pct = trade.get("mae_pct") or 0.0, trade.get("mfe_pct") or 0.0
+    if stop_loss_pct and mae_pct >= stop_loss_pct * 100:
+        return -stop_loss_pct * notional
+    if take_profit_pct and mfe_pct >= take_profit_pct * 100:
+        return take_profit_pct * notional
+    return trade["pnl"]
+
+
+def generate_exit_params_recommendations(mode: str) -> list[dict]:
+    """New candidate type (Scientific Strategy Optimization Framework):
+    sweeps stop_loss_pct/take_profit_pct — previously only ever
+    LLM-guessed via the now-retired evolution_agent.propose_next_version —
+    against expectancy via _simulate_exit_pnl. Each leg is swept
+    independently, holding the other at its current configured value."""
+    closed = _recently_closed(mode)
+    if len(closed) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+        return []
+
+    capital_config = models.get_capital_config(mode)
+    capital_to_use = capital_config["capital_to_use"] if capital_config else 0
+    version = models.get_latest_version()
+    current_params = (version.get("params_json") or {}) if version else {}
+    current_stop, current_target = current_params.get("stop_loss_pct"), current_params.get("take_profit_pct")
+
+    baseline_stats = compute_bucket_statistics(closed, capital_to_use)
+    if baseline_stats["expectancy"] is None:
+        return []
+
+    candidates = _sweep_range()
+    results = []
+    for param_name, fixed_other in (("stop_loss_pct", current_target), ("take_profit_pct", current_stop)):
+        best_value, best_expectancy = None, baseline_stats["expectancy"]
+        for candidate_value in candidates:
+            stop = candidate_value if param_name == "stop_loss_pct" else fixed_other
+            target = candidate_value if param_name == "take_profit_pct" else fixed_other
+            simulated = [{**t, "pnl": _simulate_exit_pnl(t, stop, target)} for t in closed]
+            stats = compute_bucket_statistics(simulated, capital_to_use)
+            if stats["expectancy"] is not None and stats["expectancy"] > best_expectancy:
+                best_value, best_expectancy = candidate_value, stats["expectancy"]
+
+        if best_value is None:
+            continue
+        delta = best_expectancy - baseline_stats["expectancy"]
+        if delta < MIN_EXPECTANCY_DELTA:
+            continue
+        improvement_pct = (
+            delta / abs(baseline_stats["expectancy"]) * 100
+            if baseline_stats["expectancy"]
+            else (float("inf") if best_expectancy > 0 else 0.0)
+        )
+        if improvement_pct < RECOMMENDATION_MIN_IMPROVEMENT_PCT:
+            continue
+        if _not_materially_different(mode, param_name, best_value):
+            continue
+
+        current_value = current_stop if param_name == "stop_loss_pct" else current_target
+        rationale = (
+            f"Simulated {param_name}={best_value:.3f} (mfe_pct/mae_pct approximation, n={len(closed)}) "
+            f"shows expectancy {best_expectancy:.2f} vs current {baseline_stats['expectancy']:.2f} "
+            f"(current {param_name}={current_value})."
+        )
+        models.insert_recommendation(
+            mode=mode,
+            metric_name=param_name,
+            current_value=current_value,
+            recommended_value=best_value,
+            rationale=rationale,
+            sample_size=len(closed),
+            category="exit_params",
+        )
+        results.append({"metric_name": param_name, "recommended_value": best_value, "rationale": rationale})
 
     return results
