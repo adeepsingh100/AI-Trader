@@ -1,11 +1,32 @@
 from unittest.mock import patch
 
+from src.learning.learning_status import LearningStatus
 from src.learning.simulation import (
     _train_test_split,
     simulate_exit_params_recommendation,
     simulate_threshold_recommendation,
     simulate_weight_recommendation,
 )
+
+
+def _status(trades_collected=0, **overrides):
+    """Explicit LearningStatus threaded via status= into every call below
+    — can_simulate()/can_create_candidate() compare trades_collected
+    against the real config defaults (250/500), so no test here ever
+    triggers a real compute_learning_status()/EvidenceEngine DB call."""
+    base = dict(
+        stage="BOOTSTRAP", trades_collected=trades_collected, rejected_trades=0, winning_trades=0,
+        losing_trades=0, evidence={}, evidence_readiness_pct=0.0, data_sufficiency_pct=0.0,
+        recommendations_count=0, simulations_count=0, candidates_count=0, promotion_eligible=False,
+        next_stage=None, trades_to_next_stage=0, evidence_gaps=[], current_activity="", reason="",
+    )
+    base.update(overrides)
+    return LearningStatus(**base)
+
+
+_SIMULATE_READY = _status(trades_collected=999)  # can_simulate() and can_create_candidate() both True
+_NOT_SIMULATE_READY = _status(trades_collected=0)
+_SIMULATE_BUT_NOT_VALIDATE = _status(trades_collected=300)  # >=250 (can_simulate) but <500 (can_create_candidate)
 
 
 def _trade(trade_id, pnl, closed_at):
@@ -44,11 +65,9 @@ def test_train_test_split_orders_by_closed_at_and_respects_pct():
 # --- simulate_weight_recommendation ---
 
 
-@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
 @patch("src.learning.simulation.models")
 def test_simulate_weight_recommendation_none_when_insufficient_trades(mock_models):
-    mock_models.get_recently_closed_trades.return_value = [_trade(1, 10, "2026-01-01T00:00:00Z")]
-    assert simulate_weight_recommendation("paper") is None
+    assert simulate_weight_recommendation("paper", status=_NOT_SIMULATE_READY) is None
     mock_models.insert_strategy_simulation.assert_not_called()
 
 
@@ -59,14 +78,12 @@ def test_simulate_weight_recommendation_none_when_no_candidate_from_train_window
     trades = [_trade(i, 10, f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 5)]
     mock_models.get_recently_closed_trades.return_value = trades
     mock_weights.return_value = None
-    assert simulate_weight_recommendation("paper") is None
+    assert simulate_weight_recommendation("paper", status=_SIMULATE_READY) is None
     mock_models.insert_strategy_simulation.assert_not_called()
 
 
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 4)
-@patch("src.learning.simulation.LEARNING_STAGE_VALIDATION_MIN_TRADES", 4)
 @patch("src.learning.simulation.score_separation_p_value")
 @patch("src.learning.simulation.compute_subscore_correlation_weights")
 @patch("src.learning.simulation.models")
@@ -85,7 +102,7 @@ def test_simulate_weight_recommendation_passes_and_creates_candidate_version(
     mock_models.insert_strategy_simulation.return_value = {"id": 42, "passed": True}
     mock_models.get_latest_adaptive_strategy_version.return_value = None
 
-    result = simulate_weight_recommendation("paper", batch_id="abc")
+    result = simulate_weight_recommendation("paper", batch_id="abc", status=_SIMULATE_READY)
 
     assert result == {"id": 42, "passed": True}
     kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
@@ -100,7 +117,6 @@ def test_simulate_weight_recommendation_passes_and_creates_candidate_version(
 
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 4)
 @patch("src.learning.simulation.score_separation_p_value")
 @patch("src.learning.simulation.compute_subscore_correlation_weights")
 @patch("src.learning.simulation.models")
@@ -114,7 +130,7 @@ def test_simulate_weight_recommendation_fails_writes_row_without_candidate(
     mock_separation.return_value = {"p_value": 0.9, "mean_win_score": 50, "mean_loss_score": 50, "n_win": 3, "n_loss": 3}
     mock_models.insert_strategy_simulation.return_value = {"id": 42, "passed": False}
 
-    result = simulate_weight_recommendation("paper")
+    result = simulate_weight_recommendation("paper", status=_SIMULATE_READY)
 
     assert result == {"id": 42, "passed": False}
     mock_models.insert_adaptive_strategy_version.assert_not_called()
@@ -135,19 +151,16 @@ def test_simulate_threshold_recommendation_none_when_not_pending_status(mock_mod
     assert simulate_threshold_recommendation("paper") is None
 
 
-@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 100)
 @patch("src.learning.simulation.models")
 def test_simulate_threshold_recommendation_none_when_insufficient_trades(mock_models):
     mock_models.get_latest_recommendation.return_value = {"recommended_value": 70, "status": "pending"}
-    mock_models.get_recently_closed_trades.return_value = [_trade(1, 10, "2026-01-01T00:00:00Z")]
-    assert simulate_threshold_recommendation("paper") is None
+    assert simulate_threshold_recommendation("paper", status=_NOT_SIMULATE_READY) is None
     mock_models.insert_strategy_simulation.assert_not_called()
 
 
 @patch("src.learning.simulation.MIN_OPPORTUNITY_SCORE", 60)
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_threshold_recommendation_evaluates_only_test_window(mock_models):
     mock_models.get_latest_recommendation.return_value = {
@@ -173,7 +186,7 @@ def test_simulate_threshold_recommendation_evaluates_only_test_window(mock_model
     mock_models.get_entry_evaluation_for_trade.side_effect = _entry_eval
     mock_models.insert_strategy_simulation.return_value = {"id": 7, "passed": False}
 
-    result = simulate_threshold_recommendation("paper")
+    result = simulate_threshold_recommendation("paper", status=_SIMULATE_READY)
 
     assert result is not None
     mock_models.insert_strategy_simulation.assert_called_once()
@@ -182,26 +195,22 @@ def test_simulate_threshold_recommendation_evaluates_only_test_window(mock_model
 # --- simulate_exit_params_recommendation ---
 
 
-@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 100)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_empty_when_insufficient_trades(mock_models):
     mock_models.get_latest_recommendation.return_value = {"recommended_value": 0.02, "status": "pending"}
-    mock_models.get_recently_closed_trades.return_value = [_exit_trade(1, 10, "2026-01-01T00:00:00Z")]
-    assert simulate_exit_params_recommendation("paper") == []
+    assert simulate_exit_params_recommendation("paper", status=_NOT_SIMULATE_READY) == []
     mock_models.insert_strategy_simulation.assert_not_called()
 
 
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_skips_leg_with_no_pending_recommendation(mock_models):
     mock_models.get_latest_recommendation.return_value = None
-    assert simulate_exit_params_recommendation("paper") == []
+    assert simulate_exit_params_recommendation("paper", status=_SIMULATE_READY) == []
 
 
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
-@patch("src.learning.simulation.LEARNING_STAGE_VALIDATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_models, mock_bootstrap):
     mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
@@ -224,7 +233,7 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
         "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
     }
 
-    results = simulate_exit_params_recommendation("paper")
+    results = simulate_exit_params_recommendation("paper", status=_SIMULATE_READY)
 
     assert len(results) == 1
     mock_models.insert_strategy_simulation.assert_called_once()
@@ -240,7 +249,6 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_zero(mock_models, mock_bootstrap):
     mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
@@ -264,7 +272,7 @@ def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_
         "point_estimate": 0.01, "ci_low": -0.001, "ci_high": 0.03, "confidence_pct": 95.0, "iterations": 1000,
     }
 
-    simulate_exit_params_recommendation("paper")
+    simulate_exit_params_recommendation("paper", status=_SIMULATE_READY)
 
     kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
     assert kwargs["passed"] is False
@@ -275,7 +283,6 @@ def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candle_data(
     mock_models, mock_bootstrap, mock_has_candles
@@ -300,7 +307,7 @@ def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candl
         "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
     }
 
-    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"})
+    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"}, status=_SIMULATE_READY)
 
     mock_has_candles.assert_called_once()
     kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
@@ -311,15 +318,14 @@ def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candl
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_defers_candidate_below_validation_stage(mock_models, mock_bootstrap):
-    """Progressive Learning Stages: a simulation can pass its z-test +
-    bootstrap CI at Stage 3 (8 trades here, well above the patched
-    Stage-3 floor) without yet clearing LEARNING_STAGE_VALIDATION_MIN_TRADES
-    (left at its real default, 500) — the strategy_simulations row still
-    honestly records passed=True, but no adaptive_strategy_versions
-    candidate is created, and the research note explains why."""
+    """Evidence-Driven Learning Progression: a simulation can pass its
+    z-test + bootstrap CI at Stage 3 (status.can_simulate() True at 300
+    trades) without yet clearing status.can_create_candidate() (False
+    below 500) — the strategy_simulations row still honestly records
+    passed=True, but no adaptive_strategy_versions candidate is created,
+    and the research note explains why."""
     mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
@@ -339,7 +345,7 @@ def test_simulate_exit_params_recommendation_defers_candidate_below_validation_s
         "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
     }
 
-    simulate_exit_params_recommendation("paper")
+    simulate_exit_params_recommendation("paper", status=_SIMULATE_BUT_NOT_VALIDATE)
 
     kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
     assert kwargs["passed"] is True  # statistically genuine pass
@@ -353,7 +359,6 @@ def test_simulate_exit_params_recommendation_defers_candidate_below_validation_s
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseline_wins(
     mock_models, mock_bootstrap, mock_has_candles, mock_replay
@@ -378,7 +383,7 @@ def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseli
     }
     mock_replay.return_value = {"winner": "a", "promotion_recommended": False, "p_values": {}}
 
-    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"})
+    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"}, status=_SIMULATE_READY)
 
     kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
     assert kwargs["passed"] is False

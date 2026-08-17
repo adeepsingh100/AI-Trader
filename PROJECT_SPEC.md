@@ -795,58 +795,106 @@ promotion_eligible` (§2), `strategy_simulations.research_note`/
 nullable/safe-defaulted, zero behavior change until the corresponding code
 ships. No new dependency — stdlib plus this repo's own modules throughout.
 
-### Progressive Learning Stages (bootstrap-learning)
+### Evidence-Driven Learning Progression (bootstrap-learning)
 
 A single flat `RECOMMENDATION_MIN_SAMPLE_SIZE=20` gated the *overall*
 "enough evidence to attempt this at all" check in every generator/
 simulator — correct in isolation, but on a fresh paper-trading history it
 meant the whole pipeline stayed silent (`[]` everywhere, no explanation)
 until 20 trades existed, then jumped straight to full validation rigor
-with no visibility into what was happening in between. Replaced with
-staged, artifact-specific thresholds so the system is always doing
-something useful and always explains what stage it's in — without
-weakening any validation, lowering any statistical bar, or promoting
-anything earlier.
+with no visibility into what was happening in between. First fix (staged,
+still trade-count-only thresholds) still ignored everything
+`orchestrator.py` already logs besides closed trades — rejected
+candidates, symbols/regimes/hours/features/confidence seen. Second pass:
+a new `EvidenceEngine` measures ALL of that, and `LearningStatus` becomes
+the single authority every gate asks (`status.can_generate_hypotheses()`
+etc.) instead of comparing a raw trade count inline.
 
 `RECOMMENDATION_MIN_SAMPLE_SIZE` (still 20) keeps its original, narrower
-job unchanged: a per-bucket/per-subset credibility floor (train/test
-halves, per-regime/per-symbol buckets, per-feature-pair counts) — a
-different, still-valid concern from "is there enough evidence overall,"
-and not touched by this. Five new `LEARNING_STAGE_*`/
-`LEARNING_FEATURE_IMPORTANCE_MIN_TRADES` constants (`src/config.py`) each
-replace exactly one outer gate:
+job unchanged throughout: a per-bucket/per-subset credibility floor
+(train/test halves, per-regime/per-symbol buckets, per-feature-pair
+counts) — a different, still-valid concern from "is there enough evidence
+overall," never touched by any of this.
 
-| Stage | Trades | Unlocks | Gate constant |
-|---|---|---|---|
-| BOOTSTRAP | 0–24 | data collection only (already unconditional — `orchestrator.py` logs every trade/rejection/feature/score/confidence regardless of stage) | — |
-| OBSERVATION | 25–99 | weakness reports (`weakness_detection.py`) | `LEARNING_STAGE_OBSERVATION_MIN_TRADES` |
-| (mid-stage) | 50+ | feature importance (`feature_importance.compute_feature_importance`) | `LEARNING_FEATURE_IMPORTANCE_MIN_TRADES` |
-| HYPOTHESIS | 100–249 | recommendations (`recommendations.py`'s 5 generators) | `LEARNING_STAGE_HYPOTHESIS_MIN_TRADES` |
-| SIMULATION | 250–499 | backtest/walk-forward simulation runs (`strategy_simulations` rows written either way) | `LEARNING_STAGE_SIMULATION_MIN_TRADES` |
-| VALIDATION | 500+ | candidate strategy creation (`adaptive_strategy_versions` rows) | `LEARNING_STAGE_VALIDATION_MIN_TRADES` |
+**The load-bearing design decision**: evidence-readiness substitutes for
+trade count only where the underlying capability doesn't need trade
+OUTCOMES. Rejection analysis and coverage reporting don't need a single
+closed trade, so **BOOTSTRAP→OBSERVATION is fully evidence-driven** — ANY
+one of several dimensions clearing its bar unlocks it. Hypothesis
+generation (z-test on win/loss separation), simulation (train/test split
+of outcomes), and candidate validation (bootstrap CI on trade PnLs) are
+statistically irreducible — no amount of "20 symbols seen" makes a
+win/loss z-test valid on a sample it wasn't valid on before. Relaxing
+those via coverage would be lowering statistical standards through a side
+door, so **OBSERVATION→HYPOTHESIS→SIMULATION→VALIDATION stay gated on
+trade count alone**, unchanged numbers, unchanged rigor:
 
-A simulation can pass its z-test/bootstrap-CI validation at Stage 3
-(250-499 trades) without yet being allowed to create a candidate —
-`simulation.py::_create_candidate_version` gates on
-`LEARNING_STAGE_VALIDATION_MIN_TRADES` independently of the statistical
+| Stage | Unlocks via | Gate |
+|---|---|---|
+| BOOTSTRAP→OBSERVATION | data collection is already unconditional (`orchestrator.py` logs every trade/rejection/feature/score/confidence regardless of stage); OBSERVATION itself unlocks on ANY of: 25 closed trades, 500 rejected opportunities, 25 trading hours covered, 20 symbols covered, 6 market regimes covered, 80% feature coverage, or 40% blended evidence readiness | `EvidenceEngine` + `EVIDENCE_*` constants (`src/config.py`) |
+| OBSERVATION→HYPOTHESIS | 100 closed trades (statistically irreducible — trade-count only) | `LEARNING_STAGE_HYPOTHESIS_MIN_TRADES` |
+| HYPOTHESIS→SIMULATION | 250 closed trades | `LEARNING_STAGE_SIMULATION_MIN_TRADES` |
+| SIMULATION→VALIDATION (candidate creation) | 500 closed trades | `LEARNING_STAGE_VALIDATION_MIN_TRADES` |
+| (independent) | feature importance (`feature_importance.compute_feature_importance`) unlocks at 50 trades — a distinct, deliberately different floor from HYPOTHESIS's 100, not one of the 5 `can_*()` capabilities | `LEARNING_FEATURE_IMPORTANCE_MIN_TRADES` |
+
+A simulation can pass its z-test/bootstrap-CI validation at the SIMULATION
+stage without yet being allowed to create a candidate —
+`simulation.py::_create_candidate_version` checks
+`status.can_create_candidate()` independently of the statistical
 pass/fail; the `strategy_simulations` row still honestly records
 `passed=true` (that column's meaning is unchanged), and its `research_note`
 gains a "Stage gate: ..." line explaining the deferral so it's never
 ambiguous why a passing simulation produced no candidate.
 
-**`src/learning/learning_status.py`** (new): `compute_learning_status(mode)`
-is the single source of truth for where a mode sits — stage, trades
-collected/rejected/won/lost, data-sufficiency %, recommendation/
-simulation/candidate counts, `promotion_eligible`, current activity, and
-why. Depends only on `models`/`config` (never `evolution_agent.py`, so no
-circular-import risk), consumed by both `evolution_agent.run_evolution()`
-and `adaptive_strategy_engine.analyze()` (added to their return dicts and
-log lines — purely additive, neither engine's own logic changed),
-`reports.py`'s HTML report (new "Learning status" section, first, above
-"Weaknesses found"), and mirrored in the dashboard's `/learning` page. No
-new table — every field is derived on read from tables that already exist,
-same "don't store a derivable fact under a second name" precedent as
-everywhere else in this codebase.
+**`src/learning/evidence_engine.py`** (new): `EvidenceEngine.collect(mode)`
+measures — never changes a strategy, purely a read-side pass — closed/
+winning/losing trades, rejected/candidate opportunities, symbols/market-
+regimes/trading-hours covered, feature coverage (fraction of
+`feature_engine.FEATURE_KEYS` with a correlation on record), confidence
+coverage (fraction of scanned candidates that reached LLM scoring at
+all), learning coverage (fraction of the 8 `learning_statistics`
+dimension types populated), plus two Root Cause Analysis extensions:
+`symbols_rarely_qualifying` (seen often, rejected often, never bought) and
+`regimes_with_no_candidates` (regime seen on scanned candidates, never on
+a buy). Reuses 4 already-existing model queries — zero new DB functions.
+`compute_evidence_readiness(evidence)` blends 7 of those dimensions into
+one 0-100% score via `opportunity_scorer.weighted_average` (the same
+renormalize-among-available primitive `fitness.py` already reuses),
+weights configurable via `EVIDENCE_WEIGHT_*` (`src/config.py`).
+Deliberately out of scope: "which feature combinations consistently
+fail" — needs multivariate analysis over rejected candidates' feature
+vectors, a real, separate feature, not folded in here.
+
+**`src/learning/learning_status.py`**: `compute_learning_status(mode)` now
+returns a `LearningStatus` dataclass (not a plain dict) with five capability
+methods — `can_generate_hypotheses()`, `can_simulate()`, `can_validate()`,
+`can_create_candidate()` (delegates to `can_validate()` — candidate rows
+are validation's output, not a separately-thresholded gate, one number
+behind both names), and `can_promote()` (reads the `promotion_eligible`
+flag `evolution_agent.promotion_eligible()` already computes with its own
+full rigor — paper-days + PnL + drawdown + bootstrap CI + fitness — never
+recomputes promotion logic here). `recommendations.py`'s 5 generators and
+`simulation.py`'s 3 simulators each gained an optional
+`status: LearningStatus | None = None` param (same threading pattern
+`generate_recommendations`'s existing `weakness_context` param already
+used) — `None` means "compute it myself" (every function stays
+independently callable), but `adaptive_strategy_engine.analyze()` computes
+one `LearningStatus` and threads the same instance into all 8 calls,
+avoiding 8x redundant `EvidenceEngine` passes per nightly run. Every
+`if len(closed) < CONSTANT: return []` this replaced is gone — each
+generator/simulator now asks `status.can_generate_hypotheses()` /
+`status.can_simulate()` instead.
+
+Consumed by `evolution_agent.run_evolution()` and
+`adaptive_strategy_engine.analyze()` (added to their return dicts and log
+lines — purely additive, neither engine's own logic changed),
+`reports.py`'s HTML report (new "Learning status" + "Evidence coverage
+breakdown" sections, first, above "Weaknesses found"), and mirrored in the
+dashboard's `/learning` page (Evidence Readiness % is now the page's
+headline stat, with a coverage breakdown grid). No new table — every field
+is derived on read from tables that already exist, same "don't store a
+derivable fact under a second name" precedent as everywhere else in this
+codebase.
 
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
@@ -1297,7 +1345,8 @@ funds exist, before trusting it beyond the promotion gate.
 │   │   ├── fitness.py               # multi-objective fitness score, §3e
 │   │   ├── rejection_analysis.py    # root cause analysis, §3e
 │   │   ├── weakness_detection.py    # §3e
-│   │   ├── learning_status.py       # Progressive Learning Stages, §3e
+│   │   ├── evidence_engine.py       # Evidence-Driven Learning Progression, §3e
+│   │   ├── learning_status.py       # LearningStatus + can_*() capability gates, §3e
 │   │   ├── reports.py
 │   │   ├── drift_detection.py       # Feature Drift Detection, §3d
 │   │   └── strategy_health.py       # Strategy Health Engine, §3d

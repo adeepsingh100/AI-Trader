@@ -3,8 +3,8 @@
 Never validates against future data: a recommendation is regenerated
 using only the OLDER (train) fraction of LEARNING_HISTORY_WINDOW_DAYS,
 then tested only against the NEWER (test) fraction — never touched during
-generation. Overall evidence gate is LEARNING_STAGE_SIMULATION_MIN_TRADES
-(Progressive Learning Stages, Stage 3) — stricter than the hypothesis-stage
+generation. Overall evidence gate is status.can_simulate() (Evidence-
+Driven Learning Progression, Stage 3) — stricter than the hypothesis-stage
 floor by design, since preventing look-ahead bias means both halves must
 *also* independently clear RECOMMENDATION_MIN_SAMPLE_SIZE on top of that.
 
@@ -12,9 +12,9 @@ floor by design, since preventing look-ahead bias means both halves must
 documents: re-scoring/re-partitioning trades that were ALREADY TAKEN,
 never inventing a counterfactual trade that wasn't. On a statistically
 significant pass (two-sample z-test, SIGNIFICANCE_THRESHOLD) that ALSO
-clears LEARNING_STAGE_VALIDATION_MIN_TRADES (Stage 4 — a simulation can
-pass at Stage 3 on 250-499 trades without yet being allowed to create a
-candidate), a strategy_simulations row is written and an
+clears status.can_create_candidate() (Stage 4 — a simulation can pass at
+Stage 3 without yet being allowed to create a candidate), a
+strategy_simulations row is written and an
 adaptive_strategy_versions candidate is created LAZILY — only for
 proposals that clear both bars, so that table only ever holds genuine,
 sufficiently-evidenced candidates. A failing simulation, or one that
@@ -44,7 +44,6 @@ from src.config import (
     ADAPTIVE_TRAIN_TEST_SPLIT_PCT,
     BACKTEST_TICK_TIMEFRAME,
     LEARNING_HISTORY_WINDOW_DAYS,
-    LEARNING_STAGE_SIMULATION_MIN_TRADES,
     LEARNING_STAGE_VALIDATION_MIN_TRADES,
     MIN_OPPORTUNITY_SCORE,
     RECOMMENDATION_MIN_SAMPLE_SIZE,
@@ -53,6 +52,7 @@ from src.config import (
 from src.db import models
 from src.learning.feature_importance import compute_subscore_correlation_weights, score_separation_p_value
 from src.learning.fitness import compute_fitness_score
+from src.learning.learning_status import LearningStatus, compute_learning_status
 from src.learning.recommendations import _simulate_exit_pnl, current_weights
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
 from src.utils import parse_timestamp as _parse_ts
@@ -166,16 +166,16 @@ def _create_candidate_version(
     batch_id: str | None,
     simulation_id: int,
     params_json: dict,
-    total_trades: int,
+    status: LearningStatus,
     fitness_score: float | None = None,
 ) -> dict | None:
     """Progressive Learning Stages, Stage 4: a candidate row is only ever
-    created once total_trades clears LEARNING_STAGE_VALIDATION_MIN_TRADES —
-    a statistically-passing simulation below that floor is real (its
-    strategy_simulations row still records passed=True) but candidate
-    creation is deferred, not skipped forever; the caller re-simulates
-    every run and creates the row as soon as enough evidence accumulates."""
-    if total_trades < LEARNING_STAGE_VALIDATION_MIN_TRADES:
+    created once status.can_create_candidate() clears — a statistically-
+    passing simulation below that floor is real (its strategy_simulations
+    row still records passed=True) but candidate creation is deferred, not
+    skipped forever; the caller re-simulates every run and creates the row
+    as soon as enough evidence accumulates."""
+    if not status.can_create_candidate():
         return None
     latest = models.get_latest_adaptive_strategy_version(mode)
     next_version_number = (latest["version_number"] + 1) if latest else 1
@@ -194,15 +194,19 @@ def _create_candidate_version(
     )
 
 
-def simulate_weight_recommendation(mode: str, batch_id: str | None = None) -> dict | None:
+def simulate_weight_recommendation(
+    mode: str, batch_id: str | None = None, status: LearningStatus | None = None
+) -> dict | None:
     """Re-derives a candidate weight set using only the TRAIN window, then
     tests whether it separates winners from losers on the TEST window
     better than the current live weights do on that same out-of-sample
     window. None if there isn't enough trade volume to independently
     clear the sample floor on both halves."""
-    all_trades = _fetch_trades(mode)
-    if len(all_trades) < LEARNING_STAGE_SIMULATION_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_simulate():
         return None
+
+    all_trades = _fetch_trades(mode)
 
     train, test = _train_test_split(all_trades)
     if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
@@ -238,12 +242,12 @@ def simulate_weight_recommendation(mode: str, batch_id: str | None = None) -> di
     )
 
     if passed:
-        _create_candidate_version(mode, batch_id, simulation_row["id"], candidate_weights, total_trades=len(all_trades))
+        _create_candidate_version(mode, batch_id, simulation_row["id"], candidate_weights, status=status)
 
     return simulation_row
 
 
-def simulate_threshold_recommendation(mode: str) -> dict | None:
+def simulate_threshold_recommendation(mode: str, status: LearningStatus | None = None) -> dict | None:
     """Walk-forward validation for the MIN_OPPORTUNITY_SCORE threshold
     recommendation specifically — the one threshold metric with a single,
     stable score extractor (opportunity_score). Per-symbol optimal_*
@@ -256,9 +260,11 @@ def simulate_threshold_recommendation(mode: str) -> dict | None:
     if latest is None or latest.get("recommended_value") is None or latest.get("status") != "pending":
         return None
 
-    all_trades = _fetch_trades(mode)
-    if len(all_trades) < LEARNING_STAGE_SIMULATION_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_simulate():
         return None
+
+    all_trades = _fetch_trades(mode)
     train, test = _train_test_split(all_trades)
     if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return None
@@ -312,10 +318,10 @@ def simulate_threshold_recommendation(mode: str) -> dict | None:
     candidate_created = False
     stage_gate_note = None
     if passed:
-        if len(all_trades) < LEARNING_STAGE_VALIDATION_MIN_TRADES:
+        if not status.can_create_candidate():
             stage_gate_note = (
                 f"statistically valid but deferred — needs {LEARNING_STAGE_VALIDATION_MIN_TRADES} "
-                f"total closed trades (have {len(all_trades)})."
+                f"total closed trades (have {status.trades_collected})."
             )
         else:
             candidate_created = True
@@ -354,7 +360,7 @@ def simulate_threshold_recommendation(mode: str) -> dict | None:
             batch_id,
             simulation_row["id"],
             {"MIN_OPPORTUNITY_SCORE": candidate_threshold},
-            total_trades=len(all_trades),
+            status=status,
             fitness_score=fitness["fitness_score"],
         )
 
@@ -362,7 +368,7 @@ def simulate_threshold_recommendation(mode: str) -> dict | None:
 
 
 def simulate_exit_params_recommendation(
-    mode: str, symbol_to_pair: dict[str, str] | None = None
+    mode: str, symbol_to_pair: dict[str, str] | None = None, status: LearningStatus | None = None
 ) -> list[dict]:
     """Walk-forward validation for stop_loss_pct/take_profit_pct candidates
     (recommendations.generate_exit_params_recommendations) — the new lever
@@ -375,6 +381,10 @@ def simulate_exit_params_recommendation(
     is supplied — the nightly caller builds this from a live markets_details
     fetch, the one thing here that needs network data; test/CLI callers
     that omit it get the always-available check only, never a crash."""
+    status = status or compute_learning_status(mode)
+    if not status.can_simulate():
+        return []
+
     results = []
     for param_name in ("stop_loss_pct", "take_profit_pct"):
         latest = models.get_latest_recommendation(mode, param_name)
@@ -382,8 +392,6 @@ def simulate_exit_params_recommendation(
             continue
 
         all_trades = _fetch_trades(mode)
-        if len(all_trades) < LEARNING_STAGE_SIMULATION_MIN_TRADES:
-            continue
         train, test = _train_test_split(all_trades)
         if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
             continue
@@ -463,10 +471,10 @@ def simulate_exit_params_recommendation(
         candidate_created = False
         stage_gate_note = None
         if passed:
-            if len(all_trades) < LEARNING_STAGE_VALIDATION_MIN_TRADES:
+            if not status.can_create_candidate():
                 stage_gate_note = (
                     f"statistically valid but deferred — needs {LEARNING_STAGE_VALIDATION_MIN_TRADES} "
-                    f"total closed trades (have {len(all_trades)})."
+                    f"total closed trades (have {status.trades_collected})."
                 )
             else:
                 candidate_created = True
@@ -496,7 +504,7 @@ def simulate_exit_params_recommendation(
             fitness = compute_fitness_score(candidate_stats, capital_to_use)
             _create_candidate_version(
                 mode, batch_id, simulation_row["id"], {param_name: candidate_value},
-                total_trades=len(all_trades), fitness_score=fitness["fitness_score"],
+                status=status, fitness_score=fitness["fitness_score"],
             )
 
         results.append(simulation_row)

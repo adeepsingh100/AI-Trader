@@ -4,12 +4,12 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
-import { computeLearningStage, rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
+import { collectEvidence, computeLearningStage, rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
 import type {
   AdaptiveStrategyVersion,
-  HoldEvaluation,
   LearningStatistic,
   LearningStatus,
+  OpportunityEvaluationRow,
   Recommendation,
   StrategySimulation,
 } from "@/lib/types";
@@ -23,7 +23,8 @@ const MIN_SAMPLE_SIZE = 25;
 
 interface LearningData {
   learningStats: LearningStatistic[];
-  holdEvaluations: HoldEvaluation[];
+  evaluations: OpportunityEvaluationRow[];
+  featureNames: string[];
   recommendations: Recommendation[];
   simulations: StrategySimulation[];
   versions: AdaptiveStrategyVersion[];
@@ -103,6 +104,7 @@ const STAGE_ORDER = ["BOOTSTRAP", "OBSERVATION", "HYPOTHESIS", "SIMULATION", "VA
 function LearningStatusCard({ status }: { status: LearningStatus }) {
   const stageIndex = STAGE_ORDER.indexOf(status.stage);
   const progressPct = ((stageIndex + 1) / STAGE_ORDER.length) * 100;
+  const e = status.evidence;
 
   return (
     <div
@@ -116,9 +118,11 @@ function LearningStatusCard({ status }: { status: LearningStatus }) {
         >
           {status.stage}
         </span>
+        <span className="text-lg font-semibold tabular-nums" style={{ color: "var(--text-primary)" }}>
+          {status.evidenceReadinessPct.toFixed(0)}%
+        </span>
         <span className="text-sm" style={{ color: "var(--text-secondary)" }}>
-          {status.tradesCollected} trades collected
-          {status.nextStage && ` · ${status.tradesToNextStage} more to ${status.nextStage}`}
+          evidence readiness
         </span>
         {status.promotionEligible && (
           <span
@@ -144,23 +148,72 @@ function LearningStatusCard({ status }: { status: LearningStatus }) {
         {status.reason}
       </p>
 
-      <div className="flex gap-6 flex-wrap text-xs pt-1" style={{ color: "var(--text-muted)" }}>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs pt-1" style={{ color: "var(--text-muted)" }}>
         <span>
-          Winning / losing: <span style={{ color: "var(--text-secondary)" }}>{status.winningTrades} / {status.losingTrades}</span>
+          Closed trades <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {status.tradesCollected} ({status.winningTrades}W / {status.losingTrades}L)
+          </span>
         </span>
         <span>
-          Rejected trades: <span style={{ color: "var(--text-secondary)" }}>{status.rejectedTrades}</span>
+          Rejected opportunities <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {status.rejectedTrades}
+          </span>
         </span>
         <span>
-          Data sufficiency: <span style={{ color: "var(--text-secondary)" }}>{status.dataSufficiencyPct.toFixed(1)}%</span>
+          Symbols covered <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {e.symbolsCovered}
+          </span>
         </span>
         <span>
-          Recommendations / simulations / candidates:{" "}
-          <span style={{ color: "var(--text-secondary)" }}>
+          Market regimes covered <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {e.marketRegimesCovered} / 6
+          </span>
+        </span>
+        <span>
+          Trading hours covered <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {e.tradingHoursCovered} / 24
+          </span>
+        </span>
+        <span>
+          Feature coverage <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {e.featureCoveragePct.toFixed(1)}%
+          </span>
+        </span>
+        <span>
+          Confidence coverage <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
+            {e.confidenceCoveragePct.toFixed(1)}%
+          </span>
+        </span>
+        <span>
+          Recs / sims / candidates <br />
+          <span className="text-sm tabular-nums" style={{ color: "var(--text-secondary)" }}>
             {status.recommendationsCount} / {status.simulationsCount} / {status.candidatesCount}
           </span>
         </span>
       </div>
+
+      {status.nextStage && status.evidenceGaps.length > 0 && (
+        <p className="text-xs pt-1" style={{ color: "var(--text-muted)" }}>
+          Missing evidence for {status.nextStage}: {status.evidenceGaps.join(" OR ")}
+        </p>
+      )}
+      {e.symbolsRarelyQualifying.length > 0 && (
+        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+          Symbols rarely qualifying: {e.symbolsRarelyQualifying.map((s) => s.symbol).slice(0, 5).join(", ")}
+        </p>
+      )}
+      {e.regimesWithNoCandidates.length > 0 && (
+        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+          Regimes with no candidates: {e.regimesWithNoCandidates.join(", ")}
+        </p>
+      )}
     </div>
   );
 }
@@ -176,16 +229,15 @@ export default function LearningClient() {
     async function load() {
       const sinceIso = new Date(Date.now() - HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
-      const [stats, holds, recs, sims, versions, trades, strategyVersions] = await Promise.all([
+      const [stats, evals, recs, sims, versions, trades, strategyVersions, features] = await Promise.all([
         supabase
           .from("learning_statistics")
           .select("dimension_type,dimension_value,expectancy,trades_count")
           .eq("mode", mode),
         supabase
           .from("opportunity_evaluations")
-          .select("reason,risk_manager_result")
+          .select("symbol,market_regime,timestamp,final_decision,llm_decision,reason,risk_manager_result")
           .eq("mode", mode)
-          .eq("final_decision", "hold")
           .gte("timestamp", sinceIso)
           .limit(5000),
         supabase
@@ -214,24 +266,29 @@ export default function LearningClient() {
           .select("promotion_eligible")
           .order("version_number", { ascending: false })
           .limit(1),
+        supabase.from("feature_importance").select("feature_name,timeframe").eq("mode", mode),
       ]);
       if (cancelled) return;
 
       const err =
         stats.error?.message ??
-        holds.error?.message ??
+        evals.error?.message ??
         recs.error?.message ??
         sims.error?.message ??
         versions.error?.message ??
         trades.error?.message ??
-        strategyVersions.error?.message;
+        strategyVersions.error?.message ??
+        features.error?.message;
       setError(err ?? null);
       setData(
         err
           ? null
           : {
               learningStats: stats.data ?? [],
-              holdEvaluations: holds.data ?? [],
+              evaluations: evals.data ?? [],
+              featureNames: (features.data ?? [])
+                .filter((f) => f.timeframe !== "blended")
+                .map((f) => f.feature_name),
               recommendations: recs.data ?? [],
               simulations: sims.data ?? [],
               versions: versions.data ?? [],
@@ -247,25 +304,39 @@ export default function LearningClient() {
     };
   }, [mode]);
 
-  const learningStatus = useMemo(
+  const evidence = useMemo(
     () =>
       data
-        ? computeLearningStage(
+        ? collectEvidence(
             data.closedTrades,
-            data.holdEvaluations.length,
+            data.evaluations,
+            new Set(data.featureNames),
+            new Set(data.learningStats.map((r) => r.dimension_type))
+          )
+        : null,
+    [data]
+  );
+  const learningStatus = useMemo(
+    () =>
+      data && evidence
+        ? computeLearningStage(
+            evidence,
             data.recommendations.length,
             data.simulations.length,
             data.versions.length,
             data.promotionEligible
           )
         : null,
-    [data]
+    [data, evidence]
   );
   const weaknesses = useMemo(
     () => (data ? worstBucketByDimension(data.learningStats, MIN_SAMPLE_SIZE) : {}),
     [data]
   );
-  const rejections = useMemo(() => (data ? rejectionBreakdown(data.holdEvaluations) : []), [data]);
+  const rejections = useMemo(
+    () => (data ? rejectionBreakdown(data.evaluations.filter((e) => e.final_decision === "hold")) : []),
+    [data]
+  );
   const fitnessBySimulationId = useMemo(() => {
     const map = new Map<number, number | null>();
     for (const v of data?.versions ?? []) {

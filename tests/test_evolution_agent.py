@@ -2,10 +2,20 @@ import datetime
 from unittest.mock import patch
 
 from src.agents.evolution_agent import compute_metrics, promotion_eligible, promotion_ready, run_evolution
+from src.learning.learning_status import LearningStatus
 
 
 def _trade(pnl, closed_at):
     return {"pnl": pnl, "closed_at": closed_at}
+
+
+def _status(stage, trades_collected):
+    return LearningStatus(
+        stage=stage, trades_collected=trades_collected, rejected_trades=0, winning_trades=0,
+        losing_trades=0, evidence={}, evidence_readiness_pct=0.0, data_sufficiency_pct=0.0,
+        recommendations_count=0, simulations_count=0, candidates_count=0, promotion_eligible=False,
+        next_stage=None, trades_to_next_stage=0, evidence_gaps=[], current_activity="", reason="",
+    )
 
 
 # --- compute_metrics ---
@@ -157,14 +167,15 @@ _CLEARLY_PROFITABLE_TRADES = [
 ]
 
 
-@patch("src.agents.evolution_agent.compute_learning_status")
+@patch("src.learning.learning_status.compute_learning_status")
 @patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
 @patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
 @patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
 @patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
 @patch("src.agents.evolution_agent.models")
 def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models, mock_learning_status):
-    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
+    status = _status("HYPOTHESIS", 120)
+    mock_learning_status.return_value = status
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20)
     version.update({"id": 1, "version_number": 3})
@@ -174,17 +185,17 @@ def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models,
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is True
-    assert result["learning_status"] == {"stage": "HYPOTHESIS", "trades_collected": 120}
+    assert result["learning_status"] is status
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, True)
     mock_models.insert_strategy_version.assert_not_called()
     mock_models.promote_version.assert_not_called()
 
 
-@patch("src.agents.evolution_agent.compute_learning_status")
+@patch("src.learning.learning_status.compute_learning_status")
 @patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
 @patch("src.agents.evolution_agent.models")
 def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models, mock_learning_status):
-    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 10}
+    mock_learning_status.return_value = _status("BOOTSTRAP", 10)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     # Starts eligible=True (e.g. a manual test fixture) so the too-young
     # check genuinely flips it to False, proving the guard actually fires
@@ -200,10 +211,10 @@ def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models, mock_l
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, False)
 
 
-@patch("src.agents.evolution_agent.compute_learning_status")
+@patch("src.learning.learning_status.compute_learning_status")
 @patch("src.agents.evolution_agent.models")
 def test_run_evolution_skips_setting_flag_when_unchanged(mock_models, mock_learning_status):
-    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 0}
+    mock_learning_status.return_value = _status("BOOTSTRAP", 0)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=2, promotion_eligible=False)  # too young -> stays False
     version.update({"id": 1, "version_number": 3})
@@ -215,10 +226,10 @@ def test_run_evolution_skips_setting_flag_when_unchanged(mock_models, mock_learn
     mock_models.set_strategy_version_promotion_eligible.assert_not_called()
 
 
-@patch("src.agents.evolution_agent.compute_learning_status")
+@patch("src.learning.learning_status.compute_learning_status")
 @patch("src.agents.evolution_agent.models")
 def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_status):
-    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
+    mock_learning_status.return_value = _status("HYPOTHESIS", 120)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20, promoted=True)
     version.update({"id": 1, "version_number": 3})
