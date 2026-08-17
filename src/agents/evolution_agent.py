@@ -25,6 +25,7 @@ from src.config import (
     PROMOTION_MIN_PAPER_DAYS,
 )
 from src.db import models
+from src.learning.learning_status import compute_learning_status
 from src.utils import max_drawdown_pct, parse_timestamp
 
 # Local imports (inside run_evolution, not here) — src.learning.statistics
@@ -121,9 +122,12 @@ def run_evolution(mode: str = "paper") -> dict:
     if eligible != version.get("promotion_eligible"):
         models.set_strategy_version_promotion_eligible(version["id"], eligible)
 
+    learning_status = compute_learning_status(mode)
+
     models.log_agent_event(
         "evolution_agent",
         "info",
+        f"stage={learning_status['stage']} trades_collected={learning_status['trades_collected']} "
         f"metrics={metrics} fitness_score={fitness['fitness_score']} promotion_eligible={eligible}",
     )
 
@@ -131,6 +135,7 @@ def run_evolution(mode: str = "paper") -> dict:
         "metrics": metrics,
         "fitness": fitness,
         "promotion_eligible": eligible,
+        "learning_status": learning_status,
     }
 
 

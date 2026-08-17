@@ -15,9 +15,11 @@ _PATCHES = (
     "src.learning.adaptive_strategy_engine.generate_symbol_recommendations",
     "src.learning.adaptive_strategy_engine.generate_regime_recommendations",
     "src.learning.adaptive_strategy_engine.generate_weight_recommendations",
+    "src.learning.adaptive_strategy_engine.compute_learning_status",
 )
 
 
+@patch(_PATCHES[12])
 @patch(_PATCHES[0])
 @patch(_PATCHES[1])
 @patch(_PATCHES[2])
@@ -43,7 +45,9 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_rejections,
     mock_feature_importance,
     mock_models,
+    mock_learning_status,
 ):
+    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
     mock_weight_recs.return_value = [{"metric_name": "OPPORTUNITY_WEIGHT_TREND", "batch_id": "abc"}]
     mock_regime_recs.return_value = [{"metric_name": "avoid_regime:sideways"}]
     mock_symbol_recs.return_value = []
@@ -67,6 +71,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_simulate_threshold.assert_called_once_with("paper")
     mock_simulate_exit_params.assert_called_once_with("paper", symbol_to_pair=None)
 
+    assert result["learning_status"] == {"stage": "HYPOTHESIS", "trades_collected": 120}
     assert result["candidates_created"] == 2  # weight + exit-params simulations passed
     assert result["simulations"] == [
         {"id": 1, "passed": True}, {"id": 2, "passed": False}, {"id": 3, "passed": True},
@@ -76,6 +81,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_models.log_agent_event.assert_called_once()
 
 
+@patch(_PATCHES[12])
 @patch(_PATCHES[0])
 @patch(_PATCHES[1])
 @patch(_PATCHES[2])
@@ -101,7 +107,9 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_rejections,
     mock_feature_importance,
     mock_models,
+    mock_learning_status,
 ):
+    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 3}
     mock_weight_recs.return_value = []
     mock_regime_recs.return_value = []
     mock_symbol_recs.return_value = []

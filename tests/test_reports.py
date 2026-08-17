@@ -3,10 +3,27 @@ from unittest.mock import patch
 from src.learning.reports import generate_adaptive_strategy_report_html
 
 
+@patch("src.learning.reports.compute_learning_status")
 @patch("src.learning.reports.rejection_breakdown")
 @patch("src.learning.reports.identify_weaknesses")
 @patch("src.learning.reports.models")
-def test_generate_adaptive_strategy_report_html_smoke(mock_models, mock_weaknesses, mock_rejections):
+def test_generate_adaptive_strategy_report_html_smoke(mock_models, mock_weaknesses, mock_rejections, mock_learning_status):
+    mock_learning_status.return_value = {
+        "stage": "HYPOTHESIS",
+        "trades_collected": 120,
+        "rejected_trades": 400,
+        "winning_trades": 60,
+        "losing_trades": 60,
+        "data_sufficiency_pct": 24.0,
+        "recommendations_count": 3,
+        "simulations_count": 2,
+        "candidates_count": 1,
+        "promotion_eligible": False,
+        "next_stage": "SIMULATION",
+        "trades_to_next_stage": 130,
+        "current_activity": "Generating hypotheses.",
+        "reason": "130 more closed trade(s) needed to reach SIMULATION (requires 250).",
+    }
     mock_models.get_recommendations.return_value = [
         {
             "category": "weight",
@@ -62,12 +79,30 @@ def test_generate_adaptive_strategy_report_html_smoke(mock_models, mock_weakness
     assert "72.3" in out  # fitness score
     assert "high_volatility" in out  # weakness
     assert "block_concentration_limit" in out  # rejection reason
+    assert "HYPOTHESIS" in out  # learning status stage
 
 
+@patch("src.learning.reports.compute_learning_status")
 @patch("src.learning.reports.rejection_breakdown")
 @patch("src.learning.reports.identify_weaknesses")
 @patch("src.learning.reports.models")
-def test_generate_adaptive_strategy_report_html_handles_empty_data(mock_models, mock_weaknesses, mock_rejections):
+def test_generate_adaptive_strategy_report_html_handles_empty_data(mock_models, mock_weaknesses, mock_rejections, mock_learning_status):
+    mock_learning_status.return_value = {
+        "stage": "BOOTSTRAP",
+        "trades_collected": 3,
+        "rejected_trades": 40,
+        "winning_trades": 1,
+        "losing_trades": 2,
+        "data_sufficiency_pct": 0.6,
+        "recommendations_count": 0,
+        "simulations_count": 0,
+        "candidates_count": 0,
+        "promotion_eligible": False,
+        "next_stage": "OBSERVATION",
+        "trades_to_next_stage": 22,
+        "current_activity": "Collecting trade data only.",
+        "reason": "22 more closed trade(s) needed to reach OBSERVATION (requires 25).",
+    }
     mock_models.get_recommendations.return_value = []
     mock_models.get_strategy_simulations.return_value = []
     mock_models.get_adaptive_strategy_versions.return_value = []

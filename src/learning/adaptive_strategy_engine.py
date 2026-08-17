@@ -45,6 +45,7 @@ from src.learning.recommendations import (
     generate_symbol_recommendations,
     generate_weight_recommendations,
 )
+from src.learning.learning_status import compute_learning_status
 from src.learning.rejection_analysis import rejection_breakdown
 from src.learning.simulation import (
     simulate_exit_params_recommendation,
@@ -85,6 +86,7 @@ class AdaptiveStrategyEngine:
     for the full invariant statement."""
 
     def analyze(self, mode: str = "paper") -> dict:
+        learning_status = compute_learning_status(mode)
         weaknesses = identify_weaknesses(mode)
         rejections = rejection_breakdown(mode)
 
@@ -114,6 +116,7 @@ class AdaptiveStrategyEngine:
         models.log_agent_event(
             "adaptive_strategy_engine",
             "info",
+            f"stage={learning_status['stage']} trades_collected={learning_status['trades_collected']} "
             f"weight_recs={len(weight_recs)} regime_recs={len(regime_recs)} "
             f"symbol_recs={len(symbol_recs)} threshold_recs={len(threshold_recs)} "
             f"exit_params_recs={len(exit_params_recs)} "
@@ -122,6 +125,7 @@ class AdaptiveStrategyEngine:
         )
 
         return {
+            "learning_status": learning_status,
             "weaknesses": weaknesses,
             "rejection_breakdown": rejections,
             "weight_recommendations": weight_recs,

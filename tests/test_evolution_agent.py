@@ -157,12 +157,14 @@ _CLEARLY_PROFITABLE_TRADES = [
 ]
 
 
+@patch("src.agents.evolution_agent.compute_learning_status")
 @patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
 @patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
 @patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
 @patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models):
+def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models, mock_learning_status):
+    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20)
     version.update({"id": 1, "version_number": 3})
@@ -172,14 +174,17 @@ def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models)
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is True
+    assert result["learning_status"] == {"stage": "HYPOTHESIS", "trades_collected": 120}
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, True)
     mock_models.insert_strategy_version.assert_not_called()
     mock_models.promote_version.assert_not_called()
 
 
+@patch("src.agents.evolution_agent.compute_learning_status")
 @patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models):
+def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models, mock_learning_status):
+    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 10}
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     # Starts eligible=True (e.g. a manual test fixture) so the too-young
     # check genuinely flips it to False, proving the guard actually fires
@@ -195,8 +200,10 @@ def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models):
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, False)
 
 
+@patch("src.agents.evolution_agent.compute_learning_status")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_skips_setting_flag_when_unchanged(mock_models):
+def test_run_evolution_skips_setting_flag_when_unchanged(mock_models, mock_learning_status):
+    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 0}
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=2, promotion_eligible=False)  # too young -> stays False
     version.update({"id": 1, "version_number": 3})
@@ -208,8 +215,10 @@ def test_run_evolution_skips_setting_flag_when_unchanged(mock_models):
     mock_models.set_strategy_version_promotion_eligible.assert_not_called()
 
 
+@patch("src.agents.evolution_agent.compute_learning_status")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_never_eligible_for_real_mode(mock_models):
+def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_status):
+    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20, promoted=True)
     version.update({"id": 1, "version_number": 3})

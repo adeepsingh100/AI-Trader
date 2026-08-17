@@ -65,6 +65,8 @@ def test_simulate_weight_recommendation_none_when_no_candidate_from_train_window
 
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 4)
+@patch("src.learning.simulation.LEARNING_STAGE_VALIDATION_MIN_TRADES", 4)
 @patch("src.learning.simulation.score_separation_p_value")
 @patch("src.learning.simulation.compute_subscore_correlation_weights")
 @patch("src.learning.simulation.models")
@@ -98,6 +100,7 @@ def test_simulate_weight_recommendation_passes_and_creates_candidate_version(
 
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 4)
 @patch("src.learning.simulation.score_separation_p_value")
 @patch("src.learning.simulation.compute_subscore_correlation_weights")
 @patch("src.learning.simulation.models")
@@ -144,6 +147,7 @@ def test_simulate_threshold_recommendation_none_when_insufficient_trades(mock_mo
 @patch("src.learning.simulation.MIN_OPPORTUNITY_SCORE", 60)
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_threshold_recommendation_evaluates_only_test_window(mock_models):
     mock_models.get_latest_recommendation.return_value = {
@@ -196,6 +200,8 @@ def test_simulate_exit_params_recommendation_skips_leg_with_no_pending_recommend
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
+@patch("src.learning.simulation.LEARNING_STAGE_VALIDATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_models, mock_bootstrap):
     mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
@@ -234,6 +240,7 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_zero(mock_models, mock_bootstrap):
     mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
@@ -268,6 +275,7 @@ def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candle_data(
     mock_models, mock_bootstrap, mock_has_candles
@@ -300,11 +308,52 @@ def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candl
     assert kwargs["passed"] is True
 
 
+@patch("src.learning.simulation.bootstrap_confidence_interval")
+@patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_defers_candidate_below_validation_stage(mock_models, mock_bootstrap):
+    """Progressive Learning Stages: a simulation can pass its z-test +
+    bootstrap CI at Stage 3 (8 trades here, well above the patched
+    Stage-3 floor) without yet clearing LEARNING_STAGE_VALIDATION_MIN_TRADES
+    (left at its real default, 500) — the strategy_simulations row still
+    honestly records passed=True, but no adaptive_strategy_versions
+    candidate is created, and the research note explains why."""
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+        {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
+        if name == "stop_loss_pct"
+        else None
+    )
+    train_trades = [_exit_trade(i, pnl=10, closed_at=f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 6)]
+    test_trades = [
+        _exit_trade(6, pnl=-30, closed_at="2026-01-06T00:00:00Z", mae_pct=5.0),
+        _exit_trade(7, pnl=-40, closed_at="2026-01-07T00:00:00Z", mae_pct=5.0),
+        _exit_trade(8, pnl=-35, closed_at="2026-01-08T00:00:00Z", mae_pct=5.0),
+    ]
+    mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_bootstrap.return_value = {
+        "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
+    }
+
+    simulate_exit_params_recommendation("paper")
+
+    kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
+    assert kwargs["passed"] is True  # statistically genuine pass
+    assert "Stage gate:" in kwargs["research_note"]
+    assert "Decision: Rejected" in kwargs["research_note"]  # no candidate was actually created
+    mock_models.insert_adaptive_strategy_version.assert_not_called()
+
+
 @patch("src.learning.simulation._backtest_replay_gate")
 @patch("src.learning.simulation._has_historical_candles", return_value=True)
 @patch("src.learning.simulation.bootstrap_confidence_interval")
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.LEARNING_STAGE_SIMULATION_MIN_TRADES", 8)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseline_wins(
     mock_models, mock_bootstrap, mock_has_candles, mock_replay

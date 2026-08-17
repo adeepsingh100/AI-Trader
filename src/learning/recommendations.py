@@ -37,6 +37,7 @@ from src.config import (
     EXIT_PARAM_SWEEP_MIN_PCT,
     EXIT_PARAM_SWEEP_STEP_PCT,
     LEARNING_HISTORY_WINDOW_DAYS,
+    LEARNING_STAGE_HYPOTHESIS_MIN_TRADES,
     MIN_EXPECTANCY_DELTA,
     MIN_OPPORTUNITY_SCORE,
     OPPORTUNITY_SCORE_BUCKET_WIDTH,
@@ -134,7 +135,7 @@ def generate_recommendations(mode: str, weakness_context: dict | None = None) ->
     rationale cites it as supporting evidence rather than standing alone
     as a bare number."""
     closed = _recently_closed(mode)
-    if len(closed) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(closed) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
         return []
 
     scored_trades = []
@@ -203,7 +204,7 @@ def generate_weight_recommendations(mode: str) -> list[dict]:
         return []
 
     trades = _recently_closed(mode)
-    if len(trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
         return []
 
     candidate_sep = score_separation_p_value(trades, candidate_weights)
@@ -318,7 +319,7 @@ def generate_regime_recommendations(mode: str) -> list[dict]:
     in a sideways one), reusing generate_weight_recommendations'
     primitives scoped to each regime's own trade subset."""
     all_trades = _recently_closed(mode)
-    if len(all_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(all_trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
         return []
 
     wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
@@ -395,7 +396,7 @@ def generate_symbol_recommendations(mode: str) -> list[dict]:
     _find_optimal_threshold sweep generate_recommendations() uses
     globally, generalized and scoped per symbol."""
     all_trades = _recently_closed(mode)
-    if len(all_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(all_trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
         return []
 
     capital_config = models.get_capital_config(mode)
@@ -501,7 +502,7 @@ def generate_exit_params_recommendations(mode: str) -> list[dict]:
     against expectancy via _simulate_exit_pnl. Each leg is swept
     independently, holding the other at its current configured value."""
     closed = _recently_closed(mode)
-    if len(closed) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(closed) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
         return []
 
     capital_config = models.get_capital_config(mode)

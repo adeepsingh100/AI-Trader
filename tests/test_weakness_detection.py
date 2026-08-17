@@ -38,7 +38,7 @@ def test_identify_weaknesses_ranks_worst_and_best_by_expectancy():
 
 
 def test_identify_weaknesses_excludes_below_sample_floor(monkeypatch):
-    monkeypatch.setattr("src.learning.weakness_detection.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+    monkeypatch.setattr("src.learning.weakness_detection.LEARNING_STAGE_OBSERVATION_MIN_TRADES", 20)
     rows = [_stat_row("symbol", "THINCOIN", expectancy=-100.0, trades_count=3)]
     with patch("src.learning.weakness_detection.models") as mock_models:
         mock_models.get_learning_statistics.return_value = rows

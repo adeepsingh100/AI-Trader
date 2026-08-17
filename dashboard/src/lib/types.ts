@@ -97,3 +97,22 @@ export interface AdaptiveStrategyVersion {
   created_at: string;
   source_simulation_id: number | null;
 }
+
+export type LearningStage = "BOOTSTRAP" | "OBSERVATION" | "HYPOTHESIS" | "SIMULATION" | "VALIDATION";
+
+export interface LearningStatus {
+  stage: LearningStage;
+  tradesCollected: number;
+  rejectedTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  dataSufficiencyPct: number;
+  recommendationsCount: number;
+  simulationsCount: number;
+  candidatesCount: number;
+  promotionEligible: boolean;
+  nextStage: LearningStage | null;
+  tradesToNextStage: number;
+  currentActivity: string;
+  reason: string;
+}

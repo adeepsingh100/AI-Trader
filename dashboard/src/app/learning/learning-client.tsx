@@ -4,11 +4,12 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
-import { rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
+import { computeLearningStage, rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
 import type {
   AdaptiveStrategyVersion,
   HoldEvaluation,
   LearningStatistic,
+  LearningStatus,
   Recommendation,
   StrategySimulation,
 } from "@/lib/types";
@@ -16,9 +17,9 @@ import type {
 // LEARNING_HISTORY_WINDOW_DAYS default (src/config.py) — the window
 // rejection_breakdown() uses when no explicit `since` is passed.
 const HISTORY_WINDOW_DAYS = 180;
-// RECOMMENDATION_MIN_SAMPLE_SIZE default (src/config.py) — same floor
-// identify_weaknesses() gates buckets on.
-const MIN_SAMPLE_SIZE = 20;
+// LEARNING_STAGE_OBSERVATION_MIN_TRADES default (src/config.py) — same
+// floor identify_weaknesses() gates buckets on.
+const MIN_SAMPLE_SIZE = 25;
 
 interface LearningData {
   learningStats: LearningStatistic[];
@@ -26,6 +27,8 @@ interface LearningData {
   recommendations: Recommendation[];
   simulations: StrategySimulation[];
   versions: AdaptiveStrategyVersion[];
+  closedTrades: { pnl: number | null }[];
+  promotionEligible: boolean;
 }
 
 function DataTable({
@@ -95,6 +98,73 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 const fmt = (n: number | null, digits = 2) => (n == null ? "-" : n.toFixed(digits));
 
+const STAGE_ORDER = ["BOOTSTRAP", "OBSERVATION", "HYPOTHESIS", "SIMULATION", "VALIDATION"] as const;
+
+function LearningStatusCard({ status }: { status: LearningStatus }) {
+  const stageIndex = STAGE_ORDER.indexOf(status.stage);
+  const progressPct = ((stageIndex + 1) / STAGE_ORDER.length) * 100;
+
+  return (
+    <div
+      className="rounded-xl p-4 shadow-sm space-y-3"
+      style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+    >
+      <div className="flex items-center gap-3 flex-wrap">
+        <span
+          className="text-xs font-semibold px-2 py-1 rounded uppercase tracking-wide"
+          style={{ color: "#fff", background: "var(--text-primary)" }}
+        >
+          {status.stage}
+        </span>
+        <span className="text-sm" style={{ color: "var(--text-secondary)" }}>
+          {status.tradesCollected} trades collected
+          {status.nextStage && ` · ${status.tradesToNextStage} more to ${status.nextStage}`}
+        </span>
+        {status.promotionEligible && (
+          <span
+            className="text-xs font-medium px-1.5 py-0.5 rounded"
+            style={{ color: STATUS.good, background: "#eafaea" }}
+          >
+            promotion eligible
+          </span>
+        )}
+      </div>
+
+      <div className="h-1.5 rounded-full overflow-hidden" style={{ background: "var(--page-plane)" }}>
+        <div
+          className="h-full rounded-full transition-all"
+          style={{ width: `${progressPct}%`, background: "var(--text-primary)" }}
+        />
+      </div>
+
+      <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
+        {status.currentActivity}
+      </p>
+      <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+        {status.reason}
+      </p>
+
+      <div className="flex gap-6 flex-wrap text-xs pt-1" style={{ color: "var(--text-muted)" }}>
+        <span>
+          Winning / losing: <span style={{ color: "var(--text-secondary)" }}>{status.winningTrades} / {status.losingTrades}</span>
+        </span>
+        <span>
+          Rejected trades: <span style={{ color: "var(--text-secondary)" }}>{status.rejectedTrades}</span>
+        </span>
+        <span>
+          Data sufficiency: <span style={{ color: "var(--text-secondary)" }}>{status.dataSufficiencyPct.toFixed(1)}%</span>
+        </span>
+        <span>
+          Recommendations / simulations / candidates:{" "}
+          <span style={{ color: "var(--text-secondary)" }}>
+            {status.recommendationsCount} / {status.simulationsCount} / {status.candidatesCount}
+          </span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function LearningClient() {
   const mode = useMode();
   const [data, setData] = useState<LearningData | null>(null);
@@ -106,7 +176,7 @@ export default function LearningClient() {
     async function load() {
       const sinceIso = new Date(Date.now() - HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
-      const [stats, holds, recs, sims, versions] = await Promise.all([
+      const [stats, holds, recs, sims, versions, trades, strategyVersions] = await Promise.all([
         supabase
           .from("learning_statistics")
           .select("dimension_type,dimension_value,expectancy,trades_count")
@@ -133,11 +203,28 @@ export default function LearningClient() {
           .select("version_number,status,fitness_score,notes,created_at,source_simulation_id")
           .eq("mode", mode)
           .order("created_at", { ascending: false }),
+        supabase
+          .from("trades")
+          .select("pnl")
+          .eq("mode", mode)
+          .eq("status", "closed")
+          .gte("closed_at", sinceIso),
+        supabase
+          .from("strategy_versions")
+          .select("promotion_eligible")
+          .order("version_number", { ascending: false })
+          .limit(1),
       ]);
       if (cancelled) return;
 
       const err =
-        stats.error?.message ?? holds.error?.message ?? recs.error?.message ?? sims.error?.message ?? versions.error?.message;
+        stats.error?.message ??
+        holds.error?.message ??
+        recs.error?.message ??
+        sims.error?.message ??
+        versions.error?.message ??
+        trades.error?.message ??
+        strategyVersions.error?.message;
       setError(err ?? null);
       setData(
         err
@@ -148,6 +235,8 @@ export default function LearningClient() {
               recommendations: recs.data ?? [],
               simulations: sims.data ?? [],
               versions: versions.data ?? [],
+              closedTrades: trades.data ?? [],
+              promotionEligible: strategyVersions.data?.[0]?.promotion_eligible ?? false,
             }
       );
     }
@@ -158,6 +247,20 @@ export default function LearningClient() {
     };
   }, [mode]);
 
+  const learningStatus = useMemo(
+    () =>
+      data
+        ? computeLearningStage(
+            data.closedTrades,
+            data.holdEvaluations.length,
+            data.recommendations.length,
+            data.simulations.length,
+            data.versions.length,
+            data.promotionEligible
+          )
+        : null,
+    [data]
+  );
   const weaknesses = useMemo(
     () => (data ? worstBucketByDimension(data.learningStats, MIN_SAMPLE_SIZE) : {}),
     [data]
@@ -196,8 +299,10 @@ export default function LearningClient() {
       )}
       {!error && data === null && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
 
-      {data && (
+      {data && learningStatus && (
         <>
+          <LearningStatusCard status={learningStatus} />
+
           <Section title="Weaknesses found">
             <DataTable
               headers={["Dimension", "Worst bucket", "Expectancy", "Trades"]}

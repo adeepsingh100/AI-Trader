@@ -519,3 +519,20 @@ PROMOTION_MIN_FITNESS_SCORE = float(os.getenv("PROMOTION_MIN_FITNESS_SCORE", "60
 EXIT_PARAM_SWEEP_MIN_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MIN_PCT", "0.01"))
 EXIT_PARAM_SWEEP_MAX_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MAX_PCT", "0.10"))
 EXIT_PARAM_SWEEP_STEP_PCT = float(os.getenv("EXIT_PARAM_SWEEP_STEP_PCT", "0.01"))
+
+# --- Progressive Learning Stages ----------------------------------------------
+# Replaces RECOMMENDATION_MIN_SAMPLE_SIZE as the OVERALL "enough evidence
+# collected to attempt this artifact type at all" gate for each layer of the
+# learning engine (src/learning/learning_status.py computes which stage a
+# mode is in from these same 4 boundaries). RECOMMENDATION_MIN_SAMPLE_SIZE
+# itself is unchanged and keeps its original, narrower meaning: a per-bucket/
+# per-subset credibility floor (e.g. "does this one symbol/regime bucket, or
+# this one train/test half, have enough trades to trust its own stats") —
+# that check stays exactly as strict as before at every site it already
+# gates; only the single outer "is there enough evidence overall" check per
+# generator moves to these staged, artifact-specific values.
+LEARNING_STAGE_OBSERVATION_MIN_TRADES = int(os.getenv("LEARNING_STAGE_OBSERVATION_MIN_TRADES", "25"))
+LEARNING_FEATURE_IMPORTANCE_MIN_TRADES = int(os.getenv("LEARNING_FEATURE_IMPORTANCE_MIN_TRADES", "50"))
+LEARNING_STAGE_HYPOTHESIS_MIN_TRADES = int(os.getenv("LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", "100"))
+LEARNING_STAGE_SIMULATION_MIN_TRADES = int(os.getenv("LEARNING_STAGE_SIMULATION_MIN_TRADES", "250"))
+LEARNING_STAGE_VALIDATION_MIN_TRADES = int(os.getenv("LEARNING_STAGE_VALIDATION_MIN_TRADES", "500"))

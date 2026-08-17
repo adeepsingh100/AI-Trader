@@ -4,9 +4,13 @@ not stdlib statistics.correlation() — that function doesn't exist before
 Python 3.10, and this repo's local dev interpreter is 3.9 even though CI
 runs 3.11.
 
-Gated behind RECOMMENDATION_MIN_SAMPLE_SIZE: below that, correlation over
-a handful of trades is noise that would read as an authoritative number,
-so the write is skipped entirely rather than stored misleadingly.
+compute_feature_importance() is gated behind LEARNING_FEATURE_IMPORTANCE_MIN_TRADES
+(Progressive Learning Stages): below that, correlation over a handful of
+trades is noise that would read as an authoritative number, so the write is
+skipped entirely rather than stored misleadingly. compute_subscore_correlation_weights()
+keeps the narrower RECOMMENDATION_MIN_SAMPLE_SIZE floor — it's dual-use
+(mode-wide and per-regime-scoped), and the mode-wide caller already gates
+higher upstream before ever reaching it.
 
 Two things get correlated here, sharing the same math and the same
 feature_importance table (distinguished by the `timeframe` column):
@@ -28,7 +32,11 @@ from datetime import datetime, timedelta, timezone
 
 from statistics import stdev
 
-from src.config import LEARNING_HISTORY_WINDOW_DAYS, RECOMMENDATION_MIN_SAMPLE_SIZE
+from src.config import (
+    LEARNING_FEATURE_IMPORTANCE_MIN_TRADES,
+    LEARNING_HISTORY_WINDOW_DAYS,
+    RECOMMENDATION_MIN_SAMPLE_SIZE,
+)
 from src.features.feature_engine import FEATURE_KEYS
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME, weighted_average
 from src.db import models
@@ -72,7 +80,7 @@ def compute_feature_importance(mode: str, timeframes: list[str] | None = None) -
 
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
     trades = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
-    if len(trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
+    if len(trades) < LEARNING_FEATURE_IMPORTANCE_MIN_TRADES:
         return []
 
     outcomes = {t["id"]: (1.0 if t["pnl"] > 0 else 0.0) for t in trades}

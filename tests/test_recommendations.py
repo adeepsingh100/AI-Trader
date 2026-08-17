@@ -33,6 +33,7 @@ def test_generate_recommendations_below_sample_size_returns_empty(mock_models):
 @patch("src.learning.recommendations.OPPORTUNITY_SCORE_BUCKET_WIDTH", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_IMPROVEMENT_PCT", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.MIN_EXPECTANCY_DELTA", 1.0)
 @patch("src.learning.recommendations.models")
 def test_generate_recommendations_writes_recommendation_on_clear_improvement(mock_models):
@@ -109,8 +110,25 @@ def test_generate_weight_recommendations_none_when_no_candidate_weights(mock_mod
     mock_models.get_recently_closed_trades.assert_not_called()
 
 
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.recommendations.compute_subscore_correlation_weights")
+@patch("src.learning.recommendations.models")
+def test_generate_weight_recommendations_stays_empty_below_hypothesis_stage(mock_models, mock_weights):
+    """Progressive Learning Stages: 40 trades would have cleared the old
+    flat RECOMMENDATION_MIN_SAMPLE_SIZE (patched to 2 here, well below 40)
+    but LEARNING_STAGE_HYPOTHESIS_MIN_TRADES is left at its real default
+    (100) — proving the staged gate is genuinely stricter, not cosmetic."""
+    mock_weights.return_value = {"trend_score": 0.7}
+    mock_models.get_recently_closed_trades.return_value = [_trade(i, 100) for i in range(40)]
+
+    assert generate_weight_recommendations("paper") == []
+    mock_models.get_recently_closed_trades.assert_called_once()
+    mock_models.insert_recommendation.assert_not_called()
+
+
 @patch("src.learning.recommendations.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 2)
 @patch("src.learning.recommendations.score_separation_p_value")
 @patch("src.learning.recommendations.compute_subscore_correlation_weights")
 @patch("src.learning.recommendations.models")
@@ -164,6 +182,7 @@ def test_generate_weight_recommendations_rejected_when_not_better_than_current(
 
 @patch("src.learning.recommendations.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.z_test_two_proportions")
 @patch("src.learning.recommendations.compute_subscore_correlation_weights")
 @patch("src.learning.recommendations.models")
@@ -287,6 +306,7 @@ def test_generate_exit_params_recommendations_below_sample_size_returns_empty(mo
 @patch("src.learning.recommendations.EXIT_PARAM_SWEEP_STEP_PCT", 0.01)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_IMPROVEMENT_PCT", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.MIN_EXPECTANCY_DELTA", 1.0)
 @patch("src.learning.recommendations.models")
 def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_improvement(mock_models):

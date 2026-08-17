@@ -795,6 +795,59 @@ promotion_eligible` (§2), `strategy_simulations.research_note`/
 nullable/safe-defaulted, zero behavior change until the corresponding code
 ships. No new dependency — stdlib plus this repo's own modules throughout.
 
+### Progressive Learning Stages (bootstrap-learning)
+
+A single flat `RECOMMENDATION_MIN_SAMPLE_SIZE=20` gated the *overall*
+"enough evidence to attempt this at all" check in every generator/
+simulator — correct in isolation, but on a fresh paper-trading history it
+meant the whole pipeline stayed silent (`[]` everywhere, no explanation)
+until 20 trades existed, then jumped straight to full validation rigor
+with no visibility into what was happening in between. Replaced with
+staged, artifact-specific thresholds so the system is always doing
+something useful and always explains what stage it's in — without
+weakening any validation, lowering any statistical bar, or promoting
+anything earlier.
+
+`RECOMMENDATION_MIN_SAMPLE_SIZE` (still 20) keeps its original, narrower
+job unchanged: a per-bucket/per-subset credibility floor (train/test
+halves, per-regime/per-symbol buckets, per-feature-pair counts) — a
+different, still-valid concern from "is there enough evidence overall,"
+and not touched by this. Five new `LEARNING_STAGE_*`/
+`LEARNING_FEATURE_IMPORTANCE_MIN_TRADES` constants (`src/config.py`) each
+replace exactly one outer gate:
+
+| Stage | Trades | Unlocks | Gate constant |
+|---|---|---|---|
+| BOOTSTRAP | 0–24 | data collection only (already unconditional — `orchestrator.py` logs every trade/rejection/feature/score/confidence regardless of stage) | — |
+| OBSERVATION | 25–99 | weakness reports (`weakness_detection.py`) | `LEARNING_STAGE_OBSERVATION_MIN_TRADES` |
+| (mid-stage) | 50+ | feature importance (`feature_importance.compute_feature_importance`) | `LEARNING_FEATURE_IMPORTANCE_MIN_TRADES` |
+| HYPOTHESIS | 100–249 | recommendations (`recommendations.py`'s 5 generators) | `LEARNING_STAGE_HYPOTHESIS_MIN_TRADES` |
+| SIMULATION | 250–499 | backtest/walk-forward simulation runs (`strategy_simulations` rows written either way) | `LEARNING_STAGE_SIMULATION_MIN_TRADES` |
+| VALIDATION | 500+ | candidate strategy creation (`adaptive_strategy_versions` rows) | `LEARNING_STAGE_VALIDATION_MIN_TRADES` |
+
+A simulation can pass its z-test/bootstrap-CI validation at Stage 3
+(250-499 trades) without yet being allowed to create a candidate —
+`simulation.py::_create_candidate_version` gates on
+`LEARNING_STAGE_VALIDATION_MIN_TRADES` independently of the statistical
+pass/fail; the `strategy_simulations` row still honestly records
+`passed=true` (that column's meaning is unchanged), and its `research_note`
+gains a "Stage gate: ..." line explaining the deferral so it's never
+ambiguous why a passing simulation produced no candidate.
+
+**`src/learning/learning_status.py`** (new): `compute_learning_status(mode)`
+is the single source of truth for where a mode sits — stage, trades
+collected/rejected/won/lost, data-sufficiency %, recommendation/
+simulation/candidate counts, `promotion_eligible`, current activity, and
+why. Depends only on `models`/`config` (never `evolution_agent.py`, so no
+circular-import risk), consumed by both `evolution_agent.run_evolution()`
+and `adaptive_strategy_engine.analyze()` (added to their return dicts and
+log lines — purely additive, neither engine's own logic changed),
+`reports.py`'s HTML report (new "Learning status" section, first, above
+"Weaknesses found"), and mirrored in the dashboard's `/learning` page. No
+new table — every field is derived on read from tables that already exist,
+same "don't store a derivable fact under a second name" precedent as
+everywhere else in this codebase.
+
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
 - Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
@@ -1244,6 +1297,7 @@ funds exist, before trusting it beyond the promotion gate.
 │   │   ├── fitness.py               # multi-objective fitness score, §3e
 │   │   ├── rejection_analysis.py    # root cause analysis, §3e
 │   │   ├── weakness_detection.py    # §3e
+│   │   ├── learning_status.py       # Progressive Learning Stages, §3e
 │   │   ├── reports.py
 │   │   ├── drift_detection.py       # Feature Drift Detection, §3d
 │   │   └── strategy_health.py       # Strategy Health Engine, §3d
