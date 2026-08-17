@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.config import LEARNING_HISTORY_WINDOW_DAYS
 from src.db import models
-from src.learning.learning_status import compute_learning_status
+from src.learning.learning_status import LearningStatus, compute_learning_status
 from src.learning.rejection_analysis import rejection_breakdown
 from src.learning.statistics import streaks as _compute_streaks
 from src.learning.weakness_detection import identify_weaknesses
@@ -131,23 +131,43 @@ def generate_adaptive_strategy_report_html(mode: str) -> str:
         ]
         return _table(["Rejection reason", "Count", "% of rejections"], table_rows, "No rejected candidates logged yet.")
 
-    def _learning_status_rows(status: dict) -> str:
+    def _learning_status_rows(status: LearningStatus) -> str:
         table_rows = [
-            ["Stage", html.escape(status["stage"])],
-            ["Trades collected", str(status["trades_collected"])],
-            ["Winning / losing", f"{status['winning_trades']} / {status['losing_trades']}"],
-            ["Rejected trades", str(status["rejected_trades"])],
-            ["Data sufficiency", f"{status['data_sufficiency_pct']:.1f}%"],
-            ["Recommendations / simulations / candidates", f"{status['recommendations_count']} / {status['simulations_count']} / {status['candidates_count']}"],
-            ["Promotion eligible", "yes" if status["promotion_eligible"] else "no"],
-            ["Current activity", html.escape(status["current_activity"])],
+            ["Stage", html.escape(status.stage)],
+            ["Evidence readiness", f"{status.evidence_readiness_pct:.1f}%"],
+            ["Trades collected", str(status.trades_collected)],
+            ["Winning / losing", f"{status.winning_trades} / {status.losing_trades}"],
+            ["Rejected trades", str(status.rejected_trades)],
+            ["Data sufficiency", f"{status.data_sufficiency_pct:.1f}%"],
             [
-                "Next stage",
-                html.escape(f"{status['next_stage']} ({status['trades_to_next_stage']} trades away)") if status["next_stage"] else "-",
+                "Recommendations / simulations / candidates",
+                f"{status.recommendations_count} / {status.simulations_count} / {status.candidates_count}",
             ],
-            ["Reason", html.escape(status["reason"])],
+            ["Promotion eligible", "yes" if status.promotion_eligible else "no"],
+            ["Current activity", html.escape(status.current_activity)],
+            ["Next stage", html.escape(status.next_stage) if status.next_stage else "-"],
+            ["Reason", html.escape(status.reason)],
         ]
         return _table(["Field", "Value"], table_rows, "Learning status unavailable.")
+
+    def _evidence_rows(evidence: dict) -> str:
+        table_rows = [
+            ["Symbols covered", str(evidence["symbols_covered"])],
+            ["Market regimes covered", f"{evidence['market_regimes_covered']} / 6"],
+            ["Trading hours covered", f"{evidence['trading_hours_covered']} / 24"],
+            ["Feature coverage", f"{evidence['feature_coverage_pct']:.1f}%"],
+            ["Confidence coverage", f"{evidence['confidence_coverage_pct']:.1f}%"],
+            ["Candidate opportunities scanned", str(evidence["candidate_opportunities"])],
+            [
+                "Symbols rarely qualifying",
+                html.escape(", ".join(r["symbol"] for r in evidence["symbols_rarely_qualifying"][:5]) or "-"),
+            ],
+            [
+                "Regimes with no candidates",
+                html.escape(", ".join(evidence["regimes_with_no_candidates"]) or "-"),
+            ],
+        ]
+        return _table(["Coverage dimension", "Value"], table_rows, "No evidence collected yet.")
 
     all_recs = models.get_recommendations(mode)
     pending = [r for r in all_recs if r.get("status") == "pending"]
@@ -166,8 +186,10 @@ def generate_adaptive_strategy_report_html(mode: str) -> str:
 
     return f"""
     <section>
-      <h3>Learning status (Progressive Learning Stages)</h3>
+      <h3>Learning status (Evidence-Driven Learning Progression)</h3>
       {_learning_status_rows(learning_status)}
+      <h3>Evidence coverage breakdown</h3>
+      {_evidence_rows(learning_status.evidence)}
       <h3>Weaknesses found</h3>
       {_weakness_rows(weaknesses)}
       <h3>Rejection breakdown (root cause of "no trade")</h3>

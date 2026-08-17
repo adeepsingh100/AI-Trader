@@ -37,7 +37,6 @@ from src.config import (
     EXIT_PARAM_SWEEP_MIN_PCT,
     EXIT_PARAM_SWEEP_STEP_PCT,
     LEARNING_HISTORY_WINDOW_DAYS,
-    LEARNING_STAGE_HYPOTHESIS_MIN_TRADES,
     MIN_EXPECTANCY_DELTA,
     MIN_OPPORTUNITY_SCORE,
     OPPORTUNITY_SCORE_BUCKET_WIDTH,
@@ -53,6 +52,7 @@ from src.config import (
 from src.db import models
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME
 from src.learning.feature_importance import compute_subscore_correlation_weights, score_separation_p_value
+from src.learning.learning_status import LearningStatus, compute_learning_status
 from src.learning.statistics import compute_bucket_statistics, z_test_two_proportions
 
 _SUBSCORE_TO_WEIGHT_CONFIG = {
@@ -128,15 +128,22 @@ def _find_optimal_threshold(
     return best_threshold, best_stats, improvement_pct
 
 
-def generate_recommendations(mode: str, weakness_context: dict | None = None) -> list[dict]:
+def generate_recommendations(
+    mode: str, weakness_context: dict | None = None, status: LearningStatus | None = None
+) -> list[dict]:
     """weakness_context (Scientific Strategy Optimization Framework,
     optional): weakness_detection.identify_weaknesses(mode)'s output —
     when its worst opportunity_score_bucket finding is available, the
     rationale cites it as supporting evidence rather than standing alone
-    as a bare number."""
-    closed = _recently_closed(mode)
-    if len(closed) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
+    as a bare number. status (Evidence-Driven Learning Progression,
+    optional): a pre-computed LearningStatus — adaptive_strategy_engine.py
+    computes one and threads it into all 8 generator/simulator calls per
+    run rather than each recomputing it; standalone/test callers omitting
+    it get one computed here."""
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
         return []
+    closed = _recently_closed(mode)
 
     scored_trades = []
     for trade in closed:
@@ -193,7 +200,7 @@ def generate_recommendations(mode: str, weakness_context: dict | None = None) ->
     return [{"metric_name": "MIN_OPPORTUNITY_SCORE", "recommended_value": best_threshold, "rationale": rationale}]
 
 
-def generate_weight_recommendations(mode: str) -> list[dict]:
+def generate_weight_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
     """Step 2: candidate weight set from sub-score/outcome correlation,
     accepted only if it separates winners from losers significantly
     better (lower p-value) than the CURRENT weights do on the same trades
@@ -203,9 +210,11 @@ def generate_weight_recommendations(mode: str) -> list[dict]:
     if candidate_weights is None:
         return []
 
-    trades = _recently_closed(mode)
-    if len(trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
         return []
+
+    trades = _recently_closed(mode)
 
     candidate_sep = score_separation_p_value(trades, candidate_weights)
     if candidate_sep is None or candidate_sep["p_value"] is None or candidate_sep["p_value"] >= SIGNIFICANCE_THRESHOLD:
@@ -313,14 +322,16 @@ def _avoid_bucket_recommendations(
     return results
 
 
-def generate_regime_recommendations(mode: str) -> list[dict]:
+def generate_regime_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
     """Step 4: "avoid regime X" plus regime-conditioned weight
     recommendations (e.g. trend weight matters more in a bull regime than
     in a sideways one), reusing generate_weight_recommendations'
     primitives scoped to each regime's own trade subset."""
-    all_trades = _recently_closed(mode)
-    if len(all_trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
         return []
+
+    all_trades = _recently_closed(mode)
 
     wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
     n_overall = len(all_trades)
@@ -390,14 +401,16 @@ def _symbol_metric_extractors() -> dict[str, callable]:
     }
 
 
-def generate_symbol_recommendations(mode: str) -> list[dict]:
+def generate_symbol_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
     """Step 5: "avoid symbol X" plus a per-symbol optimal-threshold sweep
     for confidence/opportunity_score/stop_distance/volatility — the same
     _find_optimal_threshold sweep generate_recommendations() uses
     globally, generalized and scoped per symbol."""
-    all_trades = _recently_closed(mode)
-    if len(all_trades) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
         return []
+
+    all_trades = _recently_closed(mode)
 
     capital_config = models.get_capital_config(mode)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
@@ -495,15 +508,17 @@ def _simulate_exit_pnl(trade: dict, stop_loss_pct: float | None, take_profit_pct
     return trade["pnl"]
 
 
-def generate_exit_params_recommendations(mode: str) -> list[dict]:
+def generate_exit_params_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
     """New candidate type (Scientific Strategy Optimization Framework):
     sweeps stop_loss_pct/take_profit_pct — previously only ever
     LLM-guessed via the now-retired evolution_agent.propose_next_version —
     against expectancy via _simulate_exit_pnl. Each leg is swept
     independently, holding the other at its current configured value."""
-    closed = _recently_closed(mode)
-    if len(closed) < LEARNING_STAGE_HYPOTHESIS_MIN_TRADES:
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
         return []
+
+    closed = _recently_closed(mode)
 
     capital_config = models.get_capital_config(mode)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0

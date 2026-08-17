@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.learning.learning_status import LearningStatus
 from src.learning.recommendations import (
     _simulate_exit_pnl,
     current_weights,
@@ -19,21 +20,40 @@ def _trade(trade_id, pnl, closed_at="2026-01-01T00:00:00Z", **overrides):
     return base
 
 
+def _status(trades_collected=0, **overrides):
+    """Explicit LearningStatus for every test below — passed straight into
+    the status= param every generator now accepts, so no test here ever
+    triggers a real compute_learning_status()/EvidenceEngine DB call.
+    can_generate_hypotheses() etc. compare trades_collected against the
+    real config defaults (100/250/500), so a high trades_collected reads
+    as "ready" with zero constant-patching needed."""
+    base = dict(
+        stage="BOOTSTRAP", trades_collected=trades_collected, rejected_trades=0, winning_trades=0,
+        losing_trades=0, evidence={}, evidence_readiness_pct=0.0, data_sufficiency_pct=0.0,
+        recommendations_count=0, simulations_count=0, candidates_count=0, promotion_eligible=False,
+        next_stage=None, trades_to_next_stage=0, evidence_gaps=[], current_activity="", reason="",
+    )
+    base.update(overrides)
+    return LearningStatus(**base)
+
+
+_READY = _status(trades_collected=999)
+_NOT_READY = _status(trades_collected=0)
+
+
 # --- generate_recommendations (threshold sweep) ---
 
 
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
 @patch("src.learning.recommendations.models")
 def test_generate_recommendations_below_sample_size_returns_empty(mock_models):
-    mock_models.get_recently_closed_trades.return_value = [_trade(1, 100)]
-    assert generate_recommendations("paper") == []
+    assert generate_recommendations("paper", status=_NOT_READY) == []
 
 
 @patch("src.learning.recommendations.MIN_OPPORTUNITY_SCORE", 60)
 @patch("src.learning.recommendations.OPPORTUNITY_SCORE_BUCKET_WIDTH", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_IMPROVEMENT_PCT", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
-@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.MIN_EXPECTANCY_DELTA", 1.0)
 @patch("src.learning.recommendations.models")
 def test_generate_recommendations_writes_recommendation_on_clear_improvement(mock_models):
@@ -44,7 +64,7 @@ def test_generate_recommendations_writes_recommendation_on_clear_improvement(moc
     mock_models.get_entry_evaluation_for_trade.side_effect = lambda tid: {"opportunity_score": scores[tid]}
     mock_models.get_latest_recommendation.return_value = None
 
-    result = generate_recommendations("paper")
+    result = generate_recommendations("paper", status=_READY)
 
     assert result[0]["recommended_value"] == 80
     mock_models.insert_recommendation.assert_called_once()
@@ -75,7 +95,7 @@ def test_generate_recommendations_blocked_by_absolute_expectancy_delta_floor(moc
     mock_models.get_entry_evaluation_for_trade.side_effect = lambda tid: {"opportunity_score": scores[tid]}
     mock_models.get_latest_recommendation.return_value = None
 
-    assert generate_recommendations("paper") == []
+    assert generate_recommendations("paper", status=_READY) == []
     mock_models.insert_recommendation.assert_not_called()
 
 
@@ -94,7 +114,7 @@ def test_generate_recommendations_idempotent_when_not_materially_different(mock_
     # already on record at essentially the same value (80) -> not material
     mock_models.get_latest_recommendation.return_value = {"recommended_value": 80}
 
-    assert generate_recommendations("paper") == []
+    assert generate_recommendations("paper", status=_READY) == []
     mock_models.insert_recommendation.assert_not_called()
 
 
@@ -110,25 +130,20 @@ def test_generate_weight_recommendations_none_when_no_candidate_weights(mock_mod
     mock_models.get_recently_closed_trades.assert_not_called()
 
 
-@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
 @patch("src.learning.recommendations.compute_subscore_correlation_weights")
 @patch("src.learning.recommendations.models")
 def test_generate_weight_recommendations_stays_empty_below_hypothesis_stage(mock_models, mock_weights):
-    """Progressive Learning Stages: 40 trades would have cleared the old
-    flat RECOMMENDATION_MIN_SAMPLE_SIZE (patched to 2 here, well below 40)
-    but LEARNING_STAGE_HYPOTHESIS_MIN_TRADES is left at its real default
-    (100) — proving the staged gate is genuinely stricter, not cosmetic."""
+    """Evidence-Driven Learning Progression: a valid candidate weight set
+    still doesn't get recommended while status.can_generate_hypotheses()
+    is False — the LearningStatus gate is checked, not bypassed."""
     mock_weights.return_value = {"trend_score": 0.7}
-    mock_models.get_recently_closed_trades.return_value = [_trade(i, 100) for i in range(40)]
 
-    assert generate_weight_recommendations("paper") == []
-    mock_models.get_recently_closed_trades.assert_called_once()
+    assert generate_weight_recommendations("paper", status=_NOT_READY) == []
     mock_models.insert_recommendation.assert_not_called()
 
 
 @patch("src.learning.recommendations.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
-@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 2)
 @patch("src.learning.recommendations.score_separation_p_value")
 @patch("src.learning.recommendations.compute_subscore_correlation_weights")
 @patch("src.learning.recommendations.models")
@@ -147,7 +162,7 @@ def test_generate_weight_recommendations_writes_one_row_per_subscore_sharing_bat
 
     mock_separation.side_effect = _separation
 
-    result = generate_weight_recommendations("paper")
+    result = generate_weight_recommendations("paper", status=_READY)
 
     assert {r["metric_name"] for r in result} == {"OPPORTUNITY_WEIGHT_TREND", "OPPORTUNITY_WEIGHT_MOMENTUM"}
     batch_ids = {r["batch_id"] for r in result}
@@ -173,7 +188,7 @@ def test_generate_weight_recommendations_rejected_when_not_better_than_current(
 
     mock_separation.side_effect = _separation
 
-    assert generate_weight_recommendations("paper") == []
+    assert generate_weight_recommendations("paper", status=_READY) == []
     mock_models.insert_recommendation.assert_not_called()
 
 
@@ -182,7 +197,6 @@ def test_generate_weight_recommendations_rejected_when_not_better_than_current(
 
 @patch("src.learning.recommendations.SIGNIFICANCE_THRESHOLD", 0.05)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
-@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.z_test_two_proportions")
 @patch("src.learning.recommendations.compute_subscore_correlation_weights")
 @patch("src.learning.recommendations.models")
@@ -201,7 +215,7 @@ def test_generate_regime_recommendations_flags_worse_than_baseline_regime(
     mock_z_test.return_value = 0.01  # significant
     mock_weights.return_value = None  # skip the weight-conditioning half
 
-    result = generate_regime_recommendations("paper")
+    result = generate_regime_recommendations("paper", status=_READY)
 
     avoid_rows = [r for r in result if r["metric_name"].startswith("avoid_regime:")]
     assert len(avoid_rows) == 1
@@ -221,7 +235,7 @@ def test_generate_regime_recommendations_never_flags_a_regime_better_than_baseli
     ]
     mock_weights.return_value = None
 
-    result = generate_regime_recommendations("paper")
+    result = generate_regime_recommendations("paper", status=_READY)
 
     assert not any(r["metric_name"].startswith("avoid_regime:") for r in result)
 
@@ -249,7 +263,7 @@ def test_generate_symbol_recommendations_avoid_symbol_idempotent(mock_models, mo
     mock_models.get_entry_evaluation_for_trade.return_value = None
     mock_models.get_confidence_calibration_for_evaluation.return_value = None
 
-    result = generate_symbol_recommendations("paper")
+    result = generate_symbol_recommendations("paper", status=_READY)
 
     assert not any(r["metric_name"].startswith("avoid_symbol:") for r in result)
     mock_models.insert_recommendation.assert_not_called()
@@ -297,8 +311,7 @@ def test_simulate_exit_pnl_target_triggers_when_mfe_exceeds_candidate():
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
 @patch("src.learning.recommendations.models")
 def test_generate_exit_params_recommendations_below_sample_size_returns_empty(mock_models):
-    mock_models.get_recently_closed_trades.return_value = [_trade(1, -30)]
-    assert generate_exit_params_recommendations("paper") == []
+    assert generate_exit_params_recommendations("paper", status=_NOT_READY) == []
 
 
 @patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MIN_PCT", 0.01)
@@ -306,7 +319,6 @@ def test_generate_exit_params_recommendations_below_sample_size_returns_empty(mo
 @patch("src.learning.recommendations.EXIT_PARAM_SWEEP_STEP_PCT", 0.01)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_IMPROVEMENT_PCT", 10)
 @patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
-@patch("src.learning.recommendations.LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", 4)
 @patch("src.learning.recommendations.MIN_EXPECTANCY_DELTA", 1.0)
 @patch("src.learning.recommendations.models")
 def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_improvement(mock_models):
@@ -323,7 +335,7 @@ def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_imp
     mock_models.get_latest_version.return_value = {"params_json": {}}
     mock_models.get_latest_recommendation.return_value = None
 
-    result = generate_exit_params_recommendations("paper")
+    result = generate_exit_params_recommendations("paper", status=_READY)
 
     assert result
     metric_names = {r["metric_name"] for r in result}
@@ -337,4 +349,4 @@ def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_imp
 @patch("src.learning.recommendations.models")
 def test_generate_exit_params_recommendations_empty_when_baseline_expectancy_none(mock_models):
     mock_models.get_recently_closed_trades.return_value = []
-    assert generate_exit_params_recommendations("paper") == []
+    assert generate_exit_params_recommendations("paper", status=_READY) == []

@@ -25,12 +25,12 @@ from src.config import (
     PROMOTION_MIN_PAPER_DAYS,
 )
 from src.db import models
-from src.learning.learning_status import compute_learning_status
 from src.utils import max_drawdown_pct, parse_timestamp
 
 # Local imports (inside run_evolution, not here) — src.learning.statistics
 # imports compute_metrics from this file, so importing it (or anything
-# that imports it) at module level here would be circular.
+# that imports it, e.g. learning_status.py via evidence_engine.py) at
+# module level here would be circular.
 
 
 def compute_metrics(trades: list[dict], capital_to_use: float) -> dict:
@@ -107,10 +107,11 @@ def run_evolution(mode: str = "paper") -> dict:
     trades = models.get_closed_trades(mode, version["id"])
     metrics = compute_metrics(trades, capital_config["capital_to_use"])
 
-    # Local imports — src.learning.statistics/fitness ultimately import
-    # compute_metrics from this file, so importing them at module level
-    # here would be circular.
+    # Local imports — src.learning.statistics/fitness/learning_status
+    # ultimately import compute_metrics from this file, so importing them
+    # at module level here would be circular.
     from src.learning.fitness import compute_fitness_score
+    from src.learning.learning_status import compute_learning_status
     from src.learning.statistics import compute_bucket_statistics
 
     bucket_stats = compute_bucket_statistics(trades, capital_config["capital_to_use"])
@@ -127,7 +128,8 @@ def run_evolution(mode: str = "paper") -> dict:
     models.log_agent_event(
         "evolution_agent",
         "info",
-        f"stage={learning_status['stage']} trades_collected={learning_status['trades_collected']} "
+        f"stage={learning_status.stage} trades_collected={learning_status.trades_collected} "
+        f"evidence_readiness={learning_status.evidence_readiness_pct:.0f}% "
         f"metrics={metrics} fitness_score={fitness['fitness_score']} promotion_eligible={eligible}",
     )
 

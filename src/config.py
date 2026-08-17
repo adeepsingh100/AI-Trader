@@ -536,3 +536,35 @@ LEARNING_FEATURE_IMPORTANCE_MIN_TRADES = int(os.getenv("LEARNING_FEATURE_IMPORTA
 LEARNING_STAGE_HYPOTHESIS_MIN_TRADES = int(os.getenv("LEARNING_STAGE_HYPOTHESIS_MIN_TRADES", "100"))
 LEARNING_STAGE_SIMULATION_MIN_TRADES = int(os.getenv("LEARNING_STAGE_SIMULATION_MIN_TRADES", "250"))
 LEARNING_STAGE_VALIDATION_MIN_TRADES = int(os.getenv("LEARNING_STAGE_VALIDATION_MIN_TRADES", "500"))
+
+# --- Evidence Engine -----------------------------------------------------------
+# src/learning/evidence_engine.py measures evidence quality across every
+# dimension orchestrator.py already logs every cycle (not just closed
+# trades) — rejected candidates, symbols/regimes/hours/features/confidence
+# seen. Only the BOOTSTRAP->OBSERVATION transition is evidence-driven (see
+# learning_status.py's _stage_for): rejection analysis and coverage
+# reporting don't need a trade to close, so evidence genuinely substitutes
+# for trade count there. HYPOTHESIS/SIMULATION/VALIDATION stay gated on
+# LEARNING_STAGE_*_MIN_TRADES above, unchanged — those are win/loss
+# statistical procedures no amount of symbol/regime coverage can validate.
+#
+# Evidence Readiness blend weights (renormalized among available
+# components via weighted_average, same convention FITNESS_WEIGHT_* uses).
+EVIDENCE_WEIGHT_TRADE_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_TRADE_COVERAGE", "0.25"))
+EVIDENCE_WEIGHT_MARKET_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_MARKET_COVERAGE", "0.15"))
+EVIDENCE_WEIGHT_SYMBOL_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_SYMBOL_COVERAGE", "0.15"))
+EVIDENCE_WEIGHT_FEATURE_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_FEATURE_COVERAGE", "0.15"))
+EVIDENCE_WEIGHT_SESSION_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_SESSION_COVERAGE", "0.10"))
+EVIDENCE_WEIGHT_CONFIDENCE_COVERAGE = float(os.getenv("EVIDENCE_WEIGHT_CONFIDENCE_COVERAGE", "0.10"))
+EVIDENCE_WEIGHT_REJECTION_EVIDENCE = float(os.getenv("EVIDENCE_WEIGHT_REJECTION_EVIDENCE", "0.10"))
+# Targets doubling as both the 100%-coverage denominator AND the
+# BOOTSTRAP->OBSERVATION OR-condition threshold for that dimension — one
+# number, not a separate target and a separate gate for the same fact.
+EVIDENCE_SYMBOL_COVERAGE_TARGET = int(os.getenv("EVIDENCE_SYMBOL_COVERAGE_TARGET", "20"))
+EVIDENCE_REJECTED_COVERAGE_TARGET = int(os.getenv("EVIDENCE_REJECTED_COVERAGE_TARGET", "500"))
+EVIDENCE_HOURS_OBSERVATION_MIN_TRADES = int(os.getenv("EVIDENCE_HOURS_OBSERVATION_MIN_TRADES", "25"))
+EVIDENCE_REGIMES_OBSERVATION_MIN = int(os.getenv("EVIDENCE_REGIMES_OBSERVATION_MIN", "6"))
+EVIDENCE_FEATURE_COVERAGE_OBSERVATION_MIN_PCT = float(
+    os.getenv("EVIDENCE_FEATURE_COVERAGE_OBSERVATION_MIN_PCT", "80")
+)
+EVIDENCE_READINESS_OBSERVATION_MIN_PCT = float(os.getenv("EVIDENCE_READINESS_OBSERVATION_MIN_PCT", "40"))

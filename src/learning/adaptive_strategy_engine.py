@@ -86,37 +86,43 @@ class AdaptiveStrategyEngine:
     for the full invariant statement."""
 
     def analyze(self, mode: str = "paper") -> dict:
-        learning_status = compute_learning_status(mode)
+        # Computed once, threaded into every generator/simulator below —
+        # each accepts status=None and would compute its own otherwise,
+        # but that would mean 8 redundant EvidenceEngine passes per run.
+        status = compute_learning_status(mode)
         weaknesses = identify_weaknesses(mode)
         rejections = rejection_breakdown(mode)
 
-        weight_recs = generate_weight_recommendations(mode)
-        regime_recs = generate_regime_recommendations(mode)
-        symbol_recs = generate_symbol_recommendations(mode)
-        threshold_recs = generate_recommendations(mode, weakness_context=weaknesses)
-        exit_params_recs = generate_exit_params_recommendations(mode)
+        weight_recs = generate_weight_recommendations(mode, status=status)
+        regime_recs = generate_regime_recommendations(mode, status=status)
+        symbol_recs = generate_symbol_recommendations(mode, status=status)
+        threshold_recs = generate_recommendations(mode, weakness_context=weaknesses, status=status)
+        exit_params_recs = generate_exit_params_recommendations(mode, status=status)
         timeframe_importance = compute_feature_importance(mode, timeframes=FEATURE_TIMEFRAMES)
 
         simulations = []
         if weight_recs:
             batch_id = weight_recs[0].get("batch_id")
-            weight_simulation = simulate_weight_recommendation(mode, batch_id)
+            weight_simulation = simulate_weight_recommendation(mode, batch_id, status=status)
             if weight_simulation is not None:
                 simulations.append(weight_simulation)
         if threshold_recs:
-            threshold_simulation = simulate_threshold_recommendation(mode)
+            threshold_simulation = simulate_threshold_recommendation(mode, status=status)
             if threshold_simulation is not None:
                 simulations.append(threshold_simulation)
         if exit_params_recs:
             symbol_to_pair = _build_symbol_to_pair(mode)
-            simulations.extend(simulate_exit_params_recommendation(mode, symbol_to_pair=symbol_to_pair))
+            simulations.extend(
+                simulate_exit_params_recommendation(mode, symbol_to_pair=symbol_to_pair, status=status)
+            )
 
         candidates_created = sum(1 for s in simulations if s.get("passed"))
 
         models.log_agent_event(
             "adaptive_strategy_engine",
             "info",
-            f"stage={learning_status['stage']} trades_collected={learning_status['trades_collected']} "
+            f"stage={status.stage} trades_collected={status.trades_collected} "
+            f"evidence_readiness={status.evidence_readiness_pct:.0f}% "
             f"weight_recs={len(weight_recs)} regime_recs={len(regime_recs)} "
             f"symbol_recs={len(symbol_recs)} threshold_recs={len(threshold_recs)} "
             f"exit_params_recs={len(exit_params_recs)} "
@@ -125,7 +131,7 @@ class AdaptiveStrategyEngine:
         )
 
         return {
-            "learning_status": learning_status,
+            "learning_status": status,
             "weaknesses": weaknesses,
             "rejection_breakdown": rejections,
             "weight_recommendations": weight_recs,

@@ -64,7 +64,12 @@ export interface LearningStatistic {
   trades_count: number;
 }
 
-export interface HoldEvaluation {
+export interface OpportunityEvaluationRow {
+  symbol: string | null;
+  market_regime: string | null;
+  timestamp: string | null;
+  final_decision: string | null;
+  llm_decision: string | null;
   reason: string | null;
   risk_manager_result: string | null;
 }
@@ -100,12 +105,30 @@ export interface AdaptiveStrategyVersion {
 
 export type LearningStage = "BOOTSTRAP" | "OBSERVATION" | "HYPOTHESIS" | "SIMULATION" | "VALIDATION";
 
+export interface Evidence {
+  closedTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  rejectedOpportunities: number;
+  candidateOpportunities: number;
+  symbolsCovered: number;
+  marketRegimesCovered: number;
+  tradingHoursCovered: number;
+  featureCoveragePct: number;
+  confidenceCoveragePct: number;
+  learningCoveragePct: number;
+  symbolsRarelyQualifying: { symbol: string; seen: number; rejectRatePct: number }[];
+  regimesWithNoCandidates: string[];
+}
+
 export interface LearningStatus {
   stage: LearningStage;
   tradesCollected: number;
   rejectedTrades: number;
   winningTrades: number;
   losingTrades: number;
+  evidence: Evidence;
+  evidenceReadinessPct: number;
   dataSufficiencyPct: number;
   recommendationsCount: number;
   simulationsCount: number;
@@ -113,6 +136,7 @@ export interface LearningStatus {
   promotionEligible: boolean;
   nextStage: LearningStage | null;
   tradesToNextStage: number;
+  evidenceGaps: string[];
   currentActivity: string;
   reason: string;
 }

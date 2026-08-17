@@ -1,6 +1,17 @@
 from unittest.mock import patch
 
 from src.learning.adaptive_strategy_engine import AdaptiveStrategyEngine
+from src.learning.learning_status import LearningStatus
+
+
+def _status(stage, trades_collected):
+    return LearningStatus(
+        stage=stage, trades_collected=trades_collected, rejected_trades=0, winning_trades=0,
+        losing_trades=0, evidence={}, evidence_readiness_pct=0.0, data_sufficiency_pct=0.0,
+        recommendations_count=0, simulations_count=0, candidates_count=0, promotion_eligible=False,
+        next_stage=None, trades_to_next_stage=0, evidence_gaps=[], current_activity="", reason="",
+    )
+
 
 _PATCHES = (
     "src.learning.adaptive_strategy_engine.models",
@@ -47,7 +58,8 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_models,
     mock_learning_status,
 ):
-    mock_learning_status.return_value = {"stage": "HYPOTHESIS", "trades_collected": 120}
+    status = _status("HYPOTHESIS", 120)
+    mock_learning_status.return_value = status
     mock_weight_recs.return_value = [{"metric_name": "OPPORTUNITY_WEIGHT_TREND", "batch_id": "abc"}]
     mock_regime_recs.return_value = [{"metric_name": "avoid_regime:sideways"}]
     mock_symbol_recs.return_value = []
@@ -62,16 +74,16 @@ def test_analyze_composes_all_generators_and_simulations(
 
     result = AdaptiveStrategyEngine().analyze(mode="paper")
 
-    mock_weight_recs.assert_called_once_with("paper")
-    mock_regime_recs.assert_called_once_with("paper")
-    mock_symbol_recs.assert_called_once_with("paper")
-    mock_threshold_recs.assert_called_once_with("paper", weakness_context=mock_weaknesses.return_value)
-    mock_exit_params_recs.assert_called_once_with("paper")
-    mock_simulate_weight.assert_called_once_with("paper", "abc")
-    mock_simulate_threshold.assert_called_once_with("paper")
-    mock_simulate_exit_params.assert_called_once_with("paper", symbol_to_pair=None)
+    mock_weight_recs.assert_called_once_with("paper", status=status)
+    mock_regime_recs.assert_called_once_with("paper", status=status)
+    mock_symbol_recs.assert_called_once_with("paper", status=status)
+    mock_threshold_recs.assert_called_once_with("paper", weakness_context=mock_weaknesses.return_value, status=status)
+    mock_exit_params_recs.assert_called_once_with("paper", status=status)
+    mock_simulate_weight.assert_called_once_with("paper", "abc", status=status)
+    mock_simulate_threshold.assert_called_once_with("paper", status=status)
+    mock_simulate_exit_params.assert_called_once_with("paper", symbol_to_pair=None, status=status)
 
-    assert result["learning_status"] == {"stage": "HYPOTHESIS", "trades_collected": 120}
+    assert result["learning_status"] is status
     assert result["candidates_created"] == 2  # weight + exit-params simulations passed
     assert result["simulations"] == [
         {"id": 1, "passed": True}, {"id": 2, "passed": False}, {"id": 3, "passed": True},
@@ -109,7 +121,7 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_models,
     mock_learning_status,
 ):
-    mock_learning_status.return_value = {"stage": "BOOTSTRAP", "trades_collected": 3}
+    mock_learning_status.return_value = _status("BOOTSTRAP", 3)
     mock_weight_recs.return_value = []
     mock_regime_recs.return_value = []
     mock_symbol_recs.return_value = []
