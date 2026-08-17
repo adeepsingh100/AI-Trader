@@ -33,6 +33,7 @@ from src.features.feature_engine import FEATURE_KEYS
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME, weighted_average
 from src.db import models
 from src.learning.statistics import z_test_two_means
+from src.utils import normalize_positive_weights
 
 # Non-numeric / not meaningfully correlatable as a plain float.
 _EXCLUDED_FEATURE_KEYS = {"volatility_regime", "volume_spike", "obv_rising"}
@@ -173,11 +174,7 @@ def compute_subscore_correlation_weights(
     if not correlations:
         return None
 
-    positive = {k: max(0.0, v) for k, v in correlations.items()}
-    total = sum(positive.values())
-    if total <= 0:
-        return None
-    return {k: v / total for k, v in positive.items()}
+    return normalize_positive_weights(correlations)
 
 
 def score_separation_p_value(trades: list[dict], weights: dict[str, float]) -> dict | None:

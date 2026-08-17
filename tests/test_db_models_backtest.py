@@ -2,14 +2,7 @@ from datetime import date, datetime, timezone
 from unittest.mock import Mock
 
 from src.db import models
-
-
-def _fluent_mock(execute_result):
-    m = Mock()
-    for method in ("select", "eq", "insert", "update", "upsert", "order", "limit", "in_", "gte", "lte"):
-        getattr(m, method).return_value = m
-    m.execute.return_value = Mock(data=execute_result)
-    return m
+from tests.conftest import _fluent_mock
 
 
 # --- historical_candles ---

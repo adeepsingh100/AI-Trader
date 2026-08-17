@@ -9,13 +9,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from src.config import SYSTEM_METRICS_LEARNING_STALE_HOURS, SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES
+from src.resilience import log_fail_open
 
 
 def _check_database() -> dict:
     from src.db import models
 
     try:
-        models.get_client().table("capital_config").select("mode").limit(1).execute()
+        models.ping()
         return {"healthy": True}
     except Exception as e:
         return {"healthy": False, "detail": str(e)}
@@ -115,8 +116,8 @@ def run_health_check(mode: str = "paper") -> dict:
                 for name, check in checks.items()
             ]
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log_fail_open("diagnostics.system_metrics", e)
 
     return {"overall_healthy": overall_healthy, "checks": checks}
 

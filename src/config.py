@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- LLM Provider (Groq / Ollama Cloud) --------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_CHAIN = [
     m.strip()
@@ -25,12 +26,14 @@ OLLAMA_MODEL_CHAIN = [
     m.strip() for m in (os.getenv("OLLAMA_MODEL_CHAIN") or "gpt-oss:120b").split(",") if m.strip()
 ]
 
+# --- Credentials -------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET", "")
 
+# --- Promotion (paper -> real) -----------------------------------------------
 PROMOTION_MIN_PAPER_DAYS = int(os.getenv("PROMOTION_MIN_PAPER_DAYS", "14"))
 PROMOTION_MIN_CUMULATIVE_PNL = float(os.getenv("PROMOTION_MIN_CUMULATIVE_PNL", "0"))
 PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15"))
@@ -201,7 +204,10 @@ MIN_EXPECTANCY_DELTA = float(os.getenv("MIN_EXPECTANCY_DELTA", "1.0"))
 
 # Walk-forward validation: generate a recommendation using only the older
 # TRAIN fraction of LEARNING_HISTORY_WINDOW_DAYS, evaluate it only against
-# the newer TEST fraction — never touched during generation.
+# the newer TEST fraction — never touched during generation. NOTE: despite
+# the _PCT suffix (kept as-is — an env var rename risks silently dropping a
+# value someone already has set), this is a 0-1 fraction, not 0-100 like
+# every other _PCT constant in this file.
 ADAPTIVE_TRAIN_TEST_SPLIT_PCT = float(os.getenv("ADAPTIVE_TRAIN_TEST_SPLIT_PCT", "0.7"))
 # p-value threshold (two-sample z-test, normal approximation) below which a
 # simulated improvement counts as statistically significant, not noise.
@@ -258,9 +264,7 @@ BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "5"))
 # real book-depth replay isn't possible; this is a documented approximation.
 BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "10"))
 BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME = float(os.getenv("BACKTEST_MAX_FILL_PCT_OF_BAR_VOLUME", "10"))
-BACKTEST_FILL_DELAY_BARS = int(os.getenv("BACKTEST_FILL_DELAY_BARS", "0"))
 BACKTEST_ORDER_EXPIRY_BARS = int(os.getenv("BACKTEST_ORDER_EXPIRY_BARS", "20"))
-BACKTEST_MAX_RETRY_ATTEMPTS = int(os.getenv("BACKTEST_MAX_RETRY_ATTEMPTS", "3"))
 # Mirrors CoinDCX's real ~₹100 min_notional (see README's real-execution
 # caveat) as a rejection floor for simulated orders.
 BACKTEST_MIN_NOTIONAL_INR = float(os.getenv("BACKTEST_MIN_NOTIONAL_INR", "100"))
@@ -403,6 +407,18 @@ CAPITAL_ALLOC_CONFIDENCE_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_CONFIDENCE_MA
 CAPITAL_ALLOC_TOTAL_MIN_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MIN_MULT", "0.5"))
 CAPITAL_ALLOC_TOTAL_MAX_MULT = float(os.getenv("CAPITAL_ALLOC_TOTAL_MAX_MULT", "1.5"))
 
+# --- Fees ---------------------------------------------------------------------
+# CoinDCX spot: 0.5% trading fee on trade value (both sides), +18% GST on
+# that fee. Sells additionally carry 1% TDS (Income Tax Act s.194S) on trade
+# value — a separate tax deduction, not something GST applies to, and not
+# charged on buys (no "transfer" of the asset on acquisition). Shared by
+# src/agents/execution/paper.py (simulates the fee) and real.py (adds TDS on
+# top of the exchange's own reported fee_amount, which already includes GST).
+TRADING_FEE_PCT = float(os.getenv("TRADING_FEE_PCT", "0.5"))
+GST_PCT_ON_FEE = float(os.getenv("GST_PCT_ON_FEE", "18"))
+SELL_TDS_PCT = float(os.getenv("SELL_TDS_PCT", "1"))
+SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
+
 # --- Execution Optimizer ----------------------------------------------------
 # src/execution_optimizer/optimizer.py. Real trades: recommendation is
 # computed and audit-logged only, RealExecutionAgent stays market-only
@@ -470,3 +486,9 @@ RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
 RETRY_BASE_DELAY_SECONDS = float(os.getenv("RETRY_BASE_DELAY_SECONDS", "1"))
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
 CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "300"))
+# groq_client.py's per-model retry chain — same backoff_delay() formula as
+# retry_with_backoff above, a separate attempt count/base delay since it's a
+# genuinely different concern (retries before falling to the next model in
+# the chain, not a flat retry).
+LLM_MAX_RETRIES_PER_MODEL = int(os.getenv("LLM_MAX_RETRIES_PER_MODEL", "2"))
+LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0"))

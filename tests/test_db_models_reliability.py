@@ -1,14 +1,7 @@
 from unittest.mock import Mock
 
 from src.db import models
-
-
-def _fluent_mock(execute_result):
-    m = Mock()
-    for method in ("select", "eq", "neq", "insert", "update", "upsert", "order", "limit", "in_", "gte"):
-        getattr(m, method).return_value = m
-    m.execute.return_value = Mock(data=execute_result)
-    return m
+from tests.conftest import _fluent_mock
 
 
 # --- data_quality_log ---
@@ -98,12 +91,12 @@ def test_get_latest_strategy_health_score_none_when_missing(monkeypatch):
     assert models.get_latest_strategy_health_score(5) is None
 
 
-def test_set_strategy_version_status_updates_by_id(monkeypatch):
+def test_update_strategy_version_status_updates_by_id(monkeypatch):
     table = _fluent_mock([])
     client = Mock(table=Mock(return_value=table))
     monkeypatch.setattr(models, "get_client", lambda: client)
 
-    models.set_strategy_version_status(5, "suspended")
+    models.update_strategy_version_status(5, "suspended")
 
     table.update.assert_called_with({"status": "suspended"})
     table.eq.assert_called_with("id", 5)

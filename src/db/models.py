@@ -23,6 +23,13 @@ def get_client() -> Client:
     return _client
 
 
+def ping() -> None:
+    """Trivial reachability check — used by monitoring/diagnostics.py's
+    database health check, which needs no real data, just confirmation the
+    connection works."""
+    get_client().table("capital_config").select("mode").limit(1).execute()
+
+
 def _execute(builder):
     """Retries a read/upsert query builder on a transient Supabase error —
     safe here because select/upsert are naturally idempotent (a repeat
@@ -435,6 +442,26 @@ def get_feature_importance(mode: str, timeframe: str | None = None) -> list[dict
     if timeframe is not None:
         query = query.eq("timeframe", timeframe)
     return query.execute().data
+
+
+def get_opportunity_evaluations_for_trail(
+    mode: str,
+    trade_id: int | None = None,
+    symbol: str | None = None,
+    since=None,
+) -> list[dict]:
+    """Chronological rows for src.audit.trail.get_decision_trail — the one
+    query that module needs, routed through here (rather than a raw
+    get_client().table() call in audit/trail.py) so every DB access in
+    src/ goes through this file, per this repo's own convention."""
+    query = get_client().table("opportunity_evaluations").select("*").eq("mode", mode)
+    if trade_id is not None:
+        query = query.eq("trade_id", trade_id)
+    if symbol is not None:
+        query = query.eq("symbol", symbol)
+    if since is not None:
+        query = query.gte("timestamp", since.isoformat())
+    return query.order("timestamp").execute().data
 
 
 def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
@@ -1059,7 +1086,7 @@ def get_latest_strategy_health_score(strategy_version_id: int) -> dict | None:
     return res.data[0] if res.data else None
 
 
-def set_strategy_version_status(version_id: int, status: str) -> None:
+def update_strategy_version_status(version_id: int, status: str) -> None:
     """Status-only marking (active/suspended) — never a delete. A human can
     always flip it back in Supabase; nothing in code reverses it the other
     direction automatically."""

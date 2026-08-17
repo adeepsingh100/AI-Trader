@@ -22,6 +22,7 @@ from src.config import (
 )
 from src.db import models
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
+from src.utils import clamp
 
 # Each component contributes 0-100, weighted equally — a simple, explicit
 # blend rather than an opaque learned weighting (this whole learning
@@ -29,16 +30,12 @@ from src.learning.statistics import compute_bucket_statistics, z_test_two_means
 _COMPONENT_WEIGHT = 1 / 4
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, value))
-
-
 def _sharpe_component(sharpe_ratio: float | None) -> float | None:
     if sharpe_ratio is None:
         return None
     # Sharpe of 2.0+ is excellent by conventional standards, 0 is neutral,
     # negative is bad — maps [-1, 2] -> [0, 100].
-    return _clamp((sharpe_ratio + 1) / 3 * 100)
+    return clamp((sharpe_ratio + 1) / 3 * 100, 0, 100)
 
 
 def _drawdown_component(max_drawdown_pct: float | None) -> float | None:
@@ -48,18 +45,18 @@ def _drawdown_component(max_drawdown_pct: float | None) -> float | None:
 
     # 0% drawdown -> 100, PROMOTION_MAX_DRAWDOWN_PCT (the existing
     # "acceptable" bar) -> 0 — reused, not a second drawdown anchor.
-    return _clamp(100 - (max_drawdown_pct / PROMOTION_MAX_DRAWDOWN_PCT) * 100)
+    return clamp(100 - (max_drawdown_pct / PROMOTION_MAX_DRAWDOWN_PCT) * 100, 0, 100)
 
 
 def _win_rate_component(win_rate: float | None) -> float | None:
-    return _clamp(win_rate * 100) if win_rate is not None else None
+    return clamp(win_rate * 100, 0, 100) if win_rate is not None else None
 
 
 def _profit_factor_component(profit_factor: float | None) -> float | None:
     if profit_factor is None:
         return None
     # profit_factor of 1.0 (breakeven) -> 50, 3.0+ -> 100, 0 -> 0.
-    return _clamp(profit_factor / 3 * 100)
+    return clamp(profit_factor / 3 * 100, 0, 100)
 
 
 def _recent_vs_historical_component(recent_stats: dict, historical_stats: dict) -> float | None:
@@ -100,7 +97,7 @@ def _walk_forward_component(run_id: int | None) -> float | None:
     passed = [f for f in folds if f.get("passed") is not None]
     if not passed:
         return None
-    return _clamp(sum(1 for f in passed if f["passed"]) / len(passed) * 100)
+    return clamp(sum(1 for f in passed if f["passed"]) / len(passed) * 100, 0, 100)
 
 
 def _tier(score: float | None) -> str:
@@ -166,7 +163,7 @@ def run_strategy_health(mode: str = "paper") -> dict:
             and result["tier"] == "critical"
             and result["breakdown"]["trades_count"] >= RECOMMENDATION_MIN_SAMPLE_SIZE
         ):
-            models.set_strategy_version_status(version["id"], "suspended")
+            models.update_strategy_version_status(version["id"], "suspended")
             suspended.append(version["id"])
 
     return {"scored": len(scored), "suspended": suspended}

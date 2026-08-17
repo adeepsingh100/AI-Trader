@@ -26,12 +26,12 @@ from __future__ import annotations
 import time
 
 from src.agents.execution.base import ExecutionAgent
+from src.agents.execution.paper import sell_tds
 from src.coindcx_client import create_order, get_balances, get_markets_details, get_order_status
 from src.db import models
 
 FILL_POLL_INTERVAL_SECONDS = 1.0
 FILL_POLL_ATTEMPTS = 10
-SELL_TDS_PCT = 1
 
 
 def _inr_balance() -> float:
@@ -95,7 +95,7 @@ class RealExecutionAgent(ExecutionAgent):
         fill_price = float(fill["avg_price"])
         fees = float(fill["fee_amount"])
         if side == "sell":
-            fees += fill_price * qty * (SELL_TDS_PCT / 100)
+            fees += sell_tds(fill_price * qty)
         return {"fill_price": fill_price, "fees": fees}
 
     def flatten_all(self, mode: str) -> list[dict]:

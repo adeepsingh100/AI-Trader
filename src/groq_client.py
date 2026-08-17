@@ -18,14 +18,17 @@ from groq import Groq
 from src.config import (
     GROQ_API_KEY,
     GROQ_MODEL_CHAIN,
+    LLM_BACKOFF_BASE_SECONDS,
+    LLM_MAX_RETRIES_PER_MODEL,
     LLM_PROVIDER,
     OLLAMA_API_KEY,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL_CHAIN,
 )
+from src.resilience import backoff_delay
 
-MAX_RETRIES_PER_MODEL = 2
-BACKOFF_BASE_SECONDS = 1.0
+MAX_RETRIES_PER_MODEL = LLM_MAX_RETRIES_PER_MODEL
+BACKOFF_BASE_SECONDS = LLM_BACKOFF_BASE_SECONDS
 # openai/gpt-oss-120b on Groq caps context at 8K tokens, input+output
 # combined. Our prompts are small (a strategy prompt + a market snapshot,
 # or a metrics summary), so the real risk is unbounded *output* eating
@@ -106,7 +109,7 @@ def chat(
                 latency_ms = int((time.monotonic() - start) * 1000)
                 events.append(ModelUsageEvent(model, fallback_reason, latency_ms, False))
                 if attempt < MAX_RETRIES_PER_MODEL:
-                    time.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
+                    time.sleep(backoff_delay(BACKOFF_BASE_SECONDS, attempt))
                 else:
                     fallback_reason = f"{model} failed: {e}"
 
