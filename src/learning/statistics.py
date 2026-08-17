@@ -37,6 +37,7 @@ _DIMENSION_TYPES = (
     "strategy_version",
     "weekday",
     "hour",
+    "exit_reason",
 )
 
 
@@ -229,6 +230,8 @@ def _bucket_memberships(trade: dict, opportunity_score: float | None, confidence
     }
     if trade.get("market_regime"):
         memberships["market_regime"] = trade["market_regime"]
+    if trade.get("exit_reason"):
+        memberships["exit_reason"] = trade["exit_reason"]
     score_bucket = _bucket_label(opportunity_score, OPPORTUNITY_SCORE_BUCKET_WIDTH)
     if score_bucket:
         memberships["opportunity_score_bucket"] = score_bucket
@@ -279,6 +282,8 @@ def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], cap
             bucket_trades = [t for t in all_recent if t.get("market_regime") == dimension_value]
         elif dimension_type == "strategy_version":
             bucket_trades = [t for t in all_recent if str(t["version_id"]) == dimension_value]
+        elif dimension_type == "exit_reason":
+            bucket_trades = [t for t in all_recent if t.get("exit_reason") == dimension_value]
         elif dimension_type in ("weekday", "hour"):
             bucket_trades = [
                 t
@@ -336,3 +341,25 @@ def process_closed_trades(mode: str) -> list[dict]:
 
     _update_statistics_buckets(mode, touched_buckets, capital_to_use)
     return new_trades
+
+
+def _accuracy_pct(rows: list[dict], field: str, good_values: set) -> float | None:
+    tagged = [r[field] for r in rows if r.get(field) is not None]
+    return (sum(1 for v in tagged if v in good_values) / len(tagged) * 100) if tagged else None
+
+
+def accuracy_rates(trade_ids: list[int]) -> dict:
+    """Aggregate accuracy percentages over already-computed trade_evaluations
+    rows (Performance Analyzer, Scientific Strategy Optimization Framework).
+    _evaluate_trade() already tags every closed trade with these booleans/
+    strings per-trade; this is the first place anything rolls them up into
+    a plain report metric rather than only feeding drift_detection's
+    baseline-vs-recent alerting."""
+    rows = models.get_trade_evaluations(trade_ids)
+    return {
+        "confidence_accuracy_pct": _accuracy_pct(rows, "confidence_was_accurate", {True}),
+        "opportunity_score_accuracy_pct": _accuracy_pct(rows, "opportunity_score_was_accurate", {True}),
+        "risk_accuracy_pct": _accuracy_pct(rows, "risk_assessment", {"appropriate"}),
+        "stop_loss_accuracy_pct": _accuracy_pct(rows, "stop_loss_assessment", {"appropriate"}),
+        "target_accuracy_pct": _accuracy_pct(rows, "target_assessment", {"realistic"}),
+    }

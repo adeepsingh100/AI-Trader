@@ -21,6 +21,12 @@ from src.config import (
     STRATEGY_HEALTH_WARNING_THRESHOLD,
 )
 from src.db import models
+from src.learning.fitness import (
+    drawdown_component as _drawdown_component,
+    profit_factor_component as _profit_factor_component,
+    sharpe_component as _sharpe_component,
+    win_rate_component as _win_rate_component,
+)
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
 from src.utils import clamp
 
@@ -28,35 +34,6 @@ from src.utils import clamp
 # blend rather than an opaque learned weighting (this whole learning
 # subsystem is pure statistics, never ML).
 _COMPONENT_WEIGHT = 1 / 4
-
-
-def _sharpe_component(sharpe_ratio: float | None) -> float | None:
-    if sharpe_ratio is None:
-        return None
-    # Sharpe of 2.0+ is excellent by conventional standards, 0 is neutral,
-    # negative is bad — maps [-1, 2] -> [0, 100].
-    return clamp((sharpe_ratio + 1) / 3 * 100, 0, 100)
-
-
-def _drawdown_component(max_drawdown_pct: float | None) -> float | None:
-    if max_drawdown_pct is None:
-        return None
-    from src.config import PROMOTION_MAX_DRAWDOWN_PCT
-
-    # 0% drawdown -> 100, PROMOTION_MAX_DRAWDOWN_PCT (the existing
-    # "acceptable" bar) -> 0 — reused, not a second drawdown anchor.
-    return clamp(100 - (max_drawdown_pct / PROMOTION_MAX_DRAWDOWN_PCT) * 100, 0, 100)
-
-
-def _win_rate_component(win_rate: float | None) -> float | None:
-    return clamp(win_rate * 100, 0, 100) if win_rate is not None else None
-
-
-def _profit_factor_component(profit_factor: float | None) -> float | None:
-    if profit_factor is None:
-        return None
-    # profit_factor of 1.0 (breakeven) -> 50, 3.0+ -> 100, 0 -> 0.
-    return clamp(profit_factor / 3 * 100, 0, 100)
 
 
 def _recent_vs_historical_component(recent_stats: dict, historical_stats: dict) -> float | None:

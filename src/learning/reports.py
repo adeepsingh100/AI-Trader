@@ -15,7 +15,9 @@ from datetime import datetime, timedelta, timezone
 
 from src.config import LEARNING_HISTORY_WINDOW_DAYS
 from src.db import models
+from src.learning.rejection_analysis import rejection_breakdown
 from src.learning.statistics import streaks as _compute_streaks
+from src.learning.weakness_detection import identify_weaknesses
 
 
 def _sorted_stats(mode: str, dimension_type: str) -> list[dict]:
@@ -87,23 +89,46 @@ def generate_adaptive_strategy_report_html(mode: str) -> str:
             "No recommendations yet.",
         )
 
-    def _simulation_rows(rows: list[dict]) -> str:
+    def _simulation_rows(rows: list[dict], fitness_by_simulation_id: dict) -> str:
         table_rows = [
             [
                 html.escape(str(r["created_at"])),
                 "PASSED" if r.get("passed") else "rejected",
                 "-" if r.get("p_value") is None else f"{r['p_value']:.4f}",
+                "-" if fitness_by_simulation_id.get(r["id"]) is None else f"{fitness_by_simulation_id[r['id']]:.1f}",
+                html.escape((r.get("research_note") or "").replace("\n", " | ")),
             ]
             for r in rows
         ]
-        return _table(["Simulated", "Result", "p-value"], table_rows, "No simulations run yet.")
+        return _table(
+            ["Simulated", "Result", "p-value", "Fitness", "Research note"], table_rows, "No simulations run yet."
+        )
 
     def _version_rows(rows: list[dict]) -> str:
         table_rows = [
-            [str(r["version_number"]), html.escape(r["status"]), html.escape(str(r["created_at"]))]
+            [
+                str(r["version_number"]),
+                html.escape(r["status"]),
+                "-" if r.get("fitness_score") is None else f"{r['fitness_score']:.1f}",
+                html.escape(str(r["created_at"])),
+            ]
             for r in rows
         ]
-        return _table(["Version", "Status", "Created"], table_rows, "No adaptive strategy candidates yet.")
+        return _table(["Version", "Status", "Fitness", "Created"], table_rows, "No adaptive strategy candidates yet.")
+
+    def _weakness_rows(weaknesses: dict) -> str:
+        table_rows = [
+            [html.escape(dimension_type), html.escape(str(bucket["value"])), f"{bucket['expectancy']:.2f}", str(bucket["trades_count"])]
+            for dimension_type, bucket in weaknesses.get("worst_by_dimension", {}).items()
+        ]
+        return _table(["Dimension", "Worst bucket", "Expectancy", "Trades"], table_rows, "Not enough data yet.")
+
+    def _rejection_rows(rows: list[dict]) -> str:
+        table_rows = [
+            [html.escape(str(r["reason"])), str(r["count"]), f"{r['pct_of_rejections']:.1f}%"]
+            for r in rows
+        ]
+        return _table(["Rejection reason", "Count", "% of rejections"], table_rows, "No rejected candidates logged yet.")
 
     all_recs = models.get_recommendations(mode)
     pending = [r for r in all_recs if r.get("status") == "pending"]
@@ -113,9 +138,18 @@ def generate_adaptive_strategy_report_html(mode: str) -> str:
 
     simulations = models.get_strategy_simulations(mode)
     versions = models.get_adaptive_strategy_versions(mode)
+    fitness_by_simulation_id = {
+        v["source_simulation_id"]: v.get("fitness_score") for v in versions if v.get("source_simulation_id")
+    }
+    weaknesses = identify_weaknesses(mode)
+    rejections = rejection_breakdown(mode)
 
     return f"""
     <section>
+      <h3>Weaknesses found</h3>
+      {_weakness_rows(weaknesses)}
+      <h3>Rejection breakdown (root cause of "no trade")</h3>
+      {_rejection_rows(rejections)}
       <h3>Best pending recommendations</h3>
       {_recommendation_rows(best)}
       <h3>Accepted recommendations</h3>
@@ -123,7 +157,7 @@ def generate_adaptive_strategy_report_html(mode: str) -> str:
       <h3>Rejected recommendations</h3>
       {_recommendation_rows(rejected)}
       <h3>Simulation results</h3>
-      {_simulation_rows(simulations)}
+      {_simulation_rows(simulations, fitness_by_simulation_id)}
       <h3>Adaptive strategy versions (candidate/approved — never auto-applied)</h3>
       {_version_rows(versions)}
     </section>

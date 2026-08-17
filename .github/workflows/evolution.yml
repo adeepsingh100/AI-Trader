@@ -16,20 +16,17 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # Promotion-readiness monitor only (Scientific Strategy Optimization
+      # Framework) — no LLM call anymore, so no LLM secrets needed.
       - run: python -m src.agents.evolution_agent
         env:
-          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-          OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — pure
-      # statistics, no LLM calls, so no LLM secrets needed. Runs after
-      # evolution_agent so its weight/threshold recommendations and
-      # feature-importance rows are already fresh for the day.
+      # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — the
+      # sole authoritative strategy-change pipeline (Scientific Strategy
+      # Optimization Framework). Pure statistics, no LLM calls; makes one
+      # best-effort, fail-open public CoinDCX call (market list, no auth)
+      # for the optional backtest-replay candidate validation.
       - run: python -m src.learning.adaptive_strategy_engine
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

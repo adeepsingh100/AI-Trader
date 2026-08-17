@@ -1,13 +1,7 @@
 import datetime
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from src.agents.evolution_agent import (
-    compute_metrics,
-    promotion_ready,
-    propose_next_version,
-    run_evolution,
-)
-from src.groq_client import AllModelsFailedError, ModelUsageEvent
+from src.agents.evolution_agent import compute_metrics, promotion_eligible, promotion_ready, run_evolution
 
 
 def _trade(pnl, closed_at):
@@ -66,12 +60,13 @@ def test_max_drawdown_zero_when_only_winners():
 # --- promotion_ready ---
 
 
-def _version(days_ago, promoted=False):
+def _version(days_ago, promoted=False, promotion_eligible=False):
     created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)
     return {
         "id": 1,
         "created_at": created.isoformat(),
         "promoted_to_real": promoted,
+        "promotion_eligible": promotion_eligible,
     }
 
 
@@ -106,116 +101,121 @@ def test_promotion_blocked_when_drawdown_too_deep():
     assert promotion_ready(_version(days_ago=14), _metrics(max_drawdown_pct=16)) is False
 
 
-# --- propose_next_version ---
+# --- promotion_eligible (Scientific Strategy Optimization Framework) ---
 
 
-def test_propose_next_version_parses_json():
-    with patch(
-        "src.agents.evolution_agent.chat",
-        return_value=('{"prompt_text": "new prompt", "params_json": {"x": 1}, "notes": "n"}', []),
-    ):
-        proposal, _events = propose_next_version({}, "old prompt", {})
-    assert proposal["prompt_text"] == "new prompt"
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
+@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
+def test_promotion_eligible_false_when_promotion_ready_fails():
+    trades = [_trade(100, "2026-01-01T00:00:00Z")]
+    assert promotion_eligible(_version(days_ago=1), _metrics(), trades, fitness_score=90.0) is False
 
 
-def test_propose_next_version_falls_back_on_bad_json():
-    with patch("src.agents.evolution_agent.chat", return_value=("garbage", [])):
-        proposal, _events = propose_next_version({}, "old prompt", {"y": 2})
-    assert proposal["prompt_text"] == "old prompt"
-    assert proposal["params_json"] == {"y": 2}
-    assert "unparseable" in proposal["notes"]
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
+@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
+@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
+def test_promotion_eligible_false_when_bootstrap_ci_crosses_zero(mock_bootstrap):
+    mock_bootstrap.return_value = {"ci_low": -0.5, "ci_high": 50.0}
+    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(-90, "2026-01-02T00:00:00Z")]
+    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=90.0) is False
 
 
-def test_propose_next_version_carries_forward_when_all_models_fail():
-    # a total LLM outage must not crash the nightly evolution run — carry
-    # the current prompt/params forward, same as the bad-JSON fallback
-    failure_events = [ModelUsageEvent("model-a", None, 50, False)]
-    with patch(
-        "src.agents.evolution_agent.chat",
-        side_effect=AllModelsFailedError("all models in chain failed: [...]", failure_events),
-    ):
-        proposal, returned_events = propose_next_version({}, "old prompt", {"y": 2})
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
+@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
+@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
+def test_promotion_eligible_false_when_fitness_below_floor(mock_bootstrap):
+    mock_bootstrap.return_value = {"ci_low": 5.0, "ci_high": 50.0}
+    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(90, "2026-01-02T00:00:00Z")]
+    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=40.0) is False
 
-    assert proposal["prompt_text"] == "old prompt"
-    assert proposal["params_json"] == {"y": 2}
-    assert "LLM call failed" in proposal["notes"]
-    assert returned_events == failure_events
+
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
+@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
+@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
+def test_promotion_eligible_true_when_everything_clears(mock_bootstrap):
+    mock_bootstrap.return_value = {"ci_low": 5.0, "ci_high": 50.0}
+    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(90, "2026-01-02T00:00:00Z")]
+    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=90.0) is True
 
 
 # --- run_evolution ---
+# No LLM call, no new strategy_versions row — a promotion-readiness
+# monitor only. Trades are real (small, deterministic) so
+# compute_bucket_statistics/compute_fitness_score/bootstrap_confidence_interval
+# run for real rather than being mocked away, proving the wiring actually
+# works end to end.
+
+_CLEARLY_PROFITABLE_TRADES = [
+    {"pnl": pnl, "closed_at": f"2026-01-{i + 1:02d}T00:00:00Z"}
+    for i, pnl in enumerate([45, 50, 55, 48, 52, 60, 47, 53, 49, 51])
+]
 
 
-@patch("src.learning.recommendations.generate_recommendations")
-@patch("src.learning.feature_importance.compute_feature_importance")
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
+@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
+@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
 @patch("src.agents.evolution_agent.models")
-@patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_inserts_next_version_and_promotes_when_ready(
-    mock_propose, mock_models, mock_feature_importance, mock_recommendations
-):
-    mock_feature_importance.return_value = []
-    mock_recommendations.return_value = []
+def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models):
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20)
-    version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})
+    version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
-    mock_models.get_closed_trades.return_value = [_trade(100, 1)]
-    mock_propose.return_value = (
-        {"prompt_text": "improved", "params_json": {"a": 1}, "notes": "tweak"},
-        [],
-    )
-    mock_models.insert_strategy_version.return_value = {"id": 2, "version_number": 4}
+    mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
 
     result = run_evolution(mode="paper")
 
-    mock_models.insert_strategy_version.assert_called_once_with(
-        version_number=4, prompt_text="improved", params_json={"a": 1}, notes="tweak"
-    )
-    mock_models.promote_version.assert_called_once_with(1)
-    assert result["promoted"] is True
-    assert result["new_version"] == {"id": 2, "version_number": 4}
-
-
-@patch("src.learning.recommendations.generate_recommendations")
-@patch("src.learning.feature_importance.compute_feature_importance")
-@patch("src.agents.evolution_agent.models")
-@patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_does_not_promote_when_criteria_unmet(
-    mock_propose, mock_models, mock_feature_importance, mock_recommendations
-):
-    mock_feature_importance.return_value = []
-    mock_recommendations.return_value = []
-    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
-    version = _version(days_ago=2)  # too young
-    version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})
-    mock_models.get_latest_version.return_value = version
-    mock_models.get_closed_trades.return_value = [_trade(100, 1)]
-    mock_propose.return_value = ({"prompt_text": "improved", "params_json": {}, "notes": ""}, [])
-    mock_models.insert_strategy_version.return_value = {"id": 2, "version_number": 4}
-
-    result = run_evolution(mode="paper")
-
+    assert result["promotion_eligible"] is True
+    mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, True)
+    mock_models.insert_strategy_version.assert_not_called()
     mock_models.promote_version.assert_not_called()
-    assert result["promoted"] is False
 
 
-@patch("src.learning.recommendations.generate_recommendations")
-@patch("src.learning.feature_importance.compute_feature_importance")
+@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
 @patch("src.agents.evolution_agent.models")
-@patch("src.agents.evolution_agent.propose_next_version")
-def test_run_evolution_skips_promotion_check_for_real_mode(
-    mock_propose, mock_models, mock_feature_importance, mock_recommendations
-):
-    mock_feature_importance.return_value = []
-    mock_recommendations.return_value = []
+def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models):
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
-    version = _version(days_ago=20, promoted=True)
-    version.update({"id": 1, "version_number": 3, "prompt_text": "old", "params_json": {}})
+    # Starts eligible=True (e.g. a manual test fixture) so the too-young
+    # check genuinely flips it to False, proving the guard actually fires
+    # rather than the flag simply staying at its already-False default.
+    version = _version(days_ago=2, promotion_eligible=True)  # too young
+    version.update({"id": 1, "version_number": 3})
+    mock_models.get_latest_version.return_value = version
+    mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
+
+    result = run_evolution(mode="paper")
+
+    assert result["promotion_eligible"] is False
+    mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, False)
+
+
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_skips_setting_flag_when_unchanged(mock_models):
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    version = _version(days_ago=2, promotion_eligible=False)  # too young -> stays False
+    version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = []
-    mock_propose.return_value = ({"prompt_text": "improved", "params_json": {}, "notes": ""}, [])
-    mock_models.insert_strategy_version.return_value = {"id": 2, "version_number": 4}
+
+    run_evolution(mode="paper")
+
+    mock_models.set_strategy_version_promotion_eligible.assert_not_called()
+
+
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_never_eligible_for_real_mode(mock_models):
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    version = _version(days_ago=20, promoted=True)
+    version.update({"id": 1, "version_number": 3})
+    mock_models.get_latest_version.return_value = version
+    mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
 
     result = run_evolution(mode="real")
 
-    mock_models.promote_version.assert_not_called()
-    assert result["promoted"] is False
+    assert result["promotion_eligible"] is False

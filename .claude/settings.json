@@ -23,7 +23,13 @@
       "Bash(python3 -m pytest -q tests/test_backtest_data_provider.py -v)",
       "Bash(xargs python3 -m py_compile)",
       "Bash(python3 /private/tmp/claude-501/-Users-amandeepsingh-Desktop-AI-Trader/5fc59ebf-97ec-4273-a652-361f8e594e66/scratchpad/reliability_smoke_test.py)",
-      "Bash(python3 -m pytest -q tests/test_portfolio_intelligence.py tests/test_risk_manager.py)"
+      "Bash(python3 -m pytest -q tests/test_portfolio_intelligence.py tests/test_risk_manager.py)",
+      "Bash(python3 -m pytest tests/test_learning_statistics.py -q)",
+      "Bash(python3 -m pytest tests/test_fitness.py -q)",
+      "Bash(python3 -m pytest tests/test_recommendations.py -q)",
+      "Bash(python3 -m pytest tests/test_adaptive_strategy_engine.py -q)",
+      "Bash(python3 -m pytest tests/test_reports.py -q)",
+      "Bash(python3 /private/tmp/claude-501/-Users-amandeepsingh-Desktop-AI-Trader/5fc59ebf-97ec-4273-a652-361f8e594e66/scratchpad/scientific_optimization_smoke_test.py)"
     ]
   }
 }

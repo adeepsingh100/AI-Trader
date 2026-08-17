@@ -39,15 +39,28 @@ are binding unless the user says otherwise. Everything marked
   gap and orders can fail. Once triggered, no new positions open again
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
-  `strategy_versions.promoted_to_real = true`. Promotion is decided by
-  the Evolution Agent against **configurable** criteria (env vars, not a
-  DB table — these change rarely and don't need versioning):
+  `strategy_versions.promoted_to_real = true`. Since the Scientific
+  Strategy Optimization Framework (§3e), this is a **human-approved**
+  flag, not an automatic one: `evolution_agent.py`'s nightly
+  `run_evolution()` sets `strategy_versions.promotion_eligible = true`
+  when the version clears every gate below, but never flips
+  `promoted_to_real` itself — a human reviews eligible rows in Supabase
+  and flips it themselves, closing what used to be the one place in this
+  codebase real money moved with zero human click. Gates, all
+  **configurable** (env vars, not a DB table — these change rarely and
+  don't need versioning):
   - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
     trading history for the version.
   - `PROMOTION_MIN_CUMULATIVE_PNL` (default 0) — cumulative paper PnL
     over that window must exceed this.
   - `PROMOTION_MAX_DRAWDOWN_PCT` (default 15) — max peak-to-trough
     drawdown over the window must stay under this.
+  - Statistical significance: a bootstrap confidence interval (§3e) over
+    the version's trade PnLs, requiring the lower bound to still be
+    positive — paper profitability clearing the 3 thresholds above isn't
+    enough on its own if it's plausibly noise.
+  - `PROMOTION_MIN_FITNESS_SCORE` (default 60) — the version's blended
+    fitness score (§3e) must clear this floor.
 
 ## 3. Multi-agent architecture
 
@@ -199,17 +212,21 @@ because scoring is pure math.
 
 ### Evolution/Learning Agent (`src/agents/evolution_agent.py`)
 - Runs nightly (separate GH Actions workflow, §7).
-- Computes win rate, avg win/loss, drawdown from the day's (and trailing
-  window's) trades per mode.
-- Asks the LLM to propose an updated strategy prompt/params; result is
-  saved as a new row in `strategy_versions` (never mutates an existing
-  version — versions are immutable once created).
-- Checks promotion criteria (§2) for the current paper version and sets
-  `promoted_to_real` when met.
-- Also runs the Learning Engine's periodic passes (§3a): `compute_feature_importance`
-  and `generate_recommendations` — piggybacked on this existing nightly
-  cron rather than a new workflow, since both are batch statistical
-  passes over a growing dataset, not per-cycle work.
+- **Promotion-readiness monitor only** since the Scientific Strategy
+  Optimization Framework (§3e) — no LLM call, no new `strategy_versions`
+  row. Computes win rate, avg win/loss, drawdown, and a blended fitness
+  score (§3e) from the current version's trades, checks every promotion
+  gate (§2), and sets `strategy_versions.promotion_eligible` (never
+  `promoted_to_real` itself — a human flips that).
+- Previously also asked an LLM to freely rewrite the strategy's
+  prompt_text/params_json every night and auto-promoted the instant 3
+  simple thresholds cleared — retired entirely (§3e explains why).
+  `strategy_versions`/`prompt_text` still exist and are still what
+  `signal_agent`/`risk_manager` read every cycle; the prompt is just
+  stable/human-edited now instead of nightly-LLM-mutated. Strategy
+  evolution (including `stop_loss_pct`/`take_profit_pct`, previously only
+  ever LLM-guessed) happens exclusively through the Adaptive Strategy
+  Intelligence Engine's candidate pipeline (§3b/§3e) now.
 
 ### Reporting Agent (`src/agents/reporting_agent.py`)
 - Generates an HTML report covering both modes side by side: PnL vs
@@ -356,14 +373,17 @@ inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
   mode-wide `MIN_OPPORTUNITY_SCORE` threshold recommendation; regime-/
   symbol-scoped recommendations stay recommend-only (each already needs
   the full sample floor per bucket just to be generated once).
-- **`adaptive_strategy_engine.py`** (new): `AdaptiveStrategyEngine.analyze(mode)`
+- **`adaptive_strategy_engine.py`**: `AdaptiveStrategyEngine.analyze(mode)`
   — the single composed entry point, calling every generator above plus
   the simulations, then logging a summary. Never executes a trade, never
   writes to `config.py` or any trading table. Runs as its own nightly
-  step in `evolution.yml` (after `evolution_agent`, no new workflow) —
-  deliberately NOT called from `run_evolution()` itself, so
-  `evolution_agent.py`'s existing `generate_recommendations`/
-  `compute_feature_importance` calls stay untouched.
+  step in `evolution.yml` (after `evolution_agent`, no new workflow). As
+  of the Scientific Strategy Optimization Framework (§3e) this is the
+  **sole** source of strategy-change candidates —
+  `evolution_agent.py`'s own `generate_recommendations`/
+  `compute_feature_importance` calls (previously duplicated here and
+  there, kept only for a log line) were removed when its LLM-tuning loop
+  was retired, not merged into this module.
 - **Adaptive confidence chain** (`confidence_calibration.py`, extended):
   `calibrate_confidence` gains optional `regime_modifier`/
   `symbol_modifier`/`recent_performance_modifier` params — each a bounded
@@ -677,6 +697,103 @@ infrastructure (there's no persistent daemon to checkpoint).
 No new dependency of any kind — everything above is stdlib plus this
 repo's own existing modules, matching the zero-numpy/scipy discipline the
 codebase already prides itself on.
+
+## 3e. Scientific Strategy Optimization Framework
+
+Replaces the old "no trades → LLM guesses new prompt/params → auto-promote"
+loop with a research pipeline: Trade Memory → Performance Analysis →
+Weakness Detection → Hypothesis Generation → Candidate Strategy →
+Statistical Validation (walk-forward, bootstrap CI, optional backtest
+replay) → Promotion, all human-approved. Never modifies a strategy because
+trade count, confidence, or win rate alone moved — every change is backed
+by statistical evidence.
+
+**The retirement**: `evolution_agent.py::propose_next_version` sent the LLM
+a bare `{current_prompt, current_params, metrics}` blob with an open-ended
+"propose an improved prompt and params" instruction, and saved whatever
+came back as a new `strategy_versions` row every single night, no
+statistical gate — plus auto-flipped `promoted_to_real` the instant 3 raw
+thresholds cleared, the only place in this codebase real money moved with
+zero human approval. Both are deleted. `strategy_versions`/`prompt_text`
+still exist (still what `signal_agent`/`risk_manager` read every cycle) but
+the prompt is stable/human-edited now; `evolution_agent.run_evolution()`
+shrinks to a promotion-readiness monitor (§2). Strategy evolution —
+including `stop_loss_pct`/`take_profit_pct`, previously only ever
+LLM-guessed — moved entirely into `adaptive_strategy_versions`' already-
+rigorous candidate pipeline (§3b), extended rather than rebuilt:
+
+- **`rejection_analysis.py`** (new): `rejection_breakdown(mode)` — ranks
+  WHY candidates didn't trade ("38% blocked by concentration limit, 24%
+  below MIN_OPPORTUNITY_SCORE, ..."), reading `opportunity_evaluations`
+  rows `orchestrator.py` already writes for every scanned symbol every
+  cycle (`final_decision="hold"`, `reason`/`risk_manager_result`) — fully
+  captured data, previously never read back by anything.
+- **`weakness_detection.py`** (new): `identify_weaknesses(mode)` — worst/
+  best bucket per dimension (a thin ranking over `learning_statistics`,
+  which already covers symbol/market_regime/opportunity_score_bucket/
+  confidence_bucket/strategy_version/weekday/hour, plus a new
+  `exit_reason` dimension) and worst/best indicator (over
+  `feature_importance`'s existing point-biserial correlations).
+- **`fitness.py`** (new): a configurable multi-objective blend — default
+  30% profit factor / 25% Sharpe / 20% expectancy / 15% win rate / 10%
+  drawdown penalty (`FITNESS_WEIGHT_*`), reusing
+  `opportunity_scorer.weighted_average`'s renormalize-among-available
+  convention so a missing component never skews the score. The 4 metric→
+  0-100 component functions were previously private duplicates inside
+  `strategy_health.py`; consolidated here as the one authoritative
+  implementation, `strategy_health.py` imports them back.
+- **`recommendations.py`** (extended): `generate_exit_params_recommendations`
+  — sweeps candidate `stop_loss_pct`/`take_profit_pct` against expectancy
+  using each trade's `mfe_pct`/`mae_pct` to approximate the outcome under a
+  candidate distance (the same approximation `_assess_stop_loss`/
+  `_assess_target` already made per-trade, generalized into a sweep — not
+  a full price-path replay, a stated limitation). `generate_recommendations`
+  gained an optional `weakness_context` param so a rationale can cite a
+  corroborating weakness-detection finding as evidence.
+- **`simulation.py`** (extended): every `simulate_*` function now also
+  runs a bootstrap confidence-interval gate
+  (`backtest.statistical_validation.bootstrap_confidence_interval`,
+  previously orphaned — zero callers) after its z-test passes, requiring
+  the CI's lower bound to still be positive (skipped for weight
+  candidates, whose validation is win/loss *separation*, not a returns
+  series, so a returns-CI doesn't apply). `simulate_exit_params_recommendation`
+  additionally runs a real `BacktestEngine` replay — baseline vs candidate
+  params over the same historical window, compared via
+  `backtest.strategy_comparison.compare` (previously orphaned) — plus
+  `backtest.walk_forward_validator.run_walk_forward` (previously
+  orphaned) for multi-fold out-of-sample stability, whenever historical
+  candle data exists for the traded symbols and a caller supplies a
+  `symbol_to_pair` mapping (the one thing here that needs a network-
+  derived value — `adaptive_strategy_engine.py` builds it best-effort,
+  fail-open, from a public unauthenticated CoinDCX call; omitted, the
+  function still runs its always-available checks). Every simulation now
+  writes a `research_note` (Observation/Weakness/Hypothesis/Simulation/
+  Walk Forward/Decision prose, not a changelog line) and a
+  `validation_detail` jsonb bundle with the raw numbers, and a passing
+  candidate's `adaptive_strategy_versions` row carries its `fitness_score`.
+- **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
+  confidence/opportunity-score/risk/stop-loss/target accuracy percentages
+  over `trade_evaluations`, which `_evaluate_trade` already tagged
+  per-trade; previously only ever consumed by `drift_detection.py`'s
+  baseline-vs-recent alerting, never rolled up as a plain report metric.
+  Average R-multiple stayed out of scope — not every trade has a
+  well-defined initial risk (`stop_loss_pct` optional), and a shaky
+  approximation would be worse than the honest gap.
+- **`adaptive_strategy_engine.py`** is now the sole authoritative
+  strategy-change pipeline (see the §3b update above) — its `analyze()`
+  wires weakness detection and rejection analysis in before generating
+  recommendations, and validates exit-params candidates with the network-
+  optional `symbol_to_pair` built above.
+- **`reports.py`** (extended): the adaptive-strategy HTML section gained
+  Weaknesses Found, Rejection Breakdown, and Fitness columns on the
+  simulation/version tables — additive to the existing report, not a
+  parallel one.
+
+Migration `0010_scientific_optimization.sql`: `strategy_versions.
+promotion_eligible` (§2), `strategy_simulations.research_note`/
+`.validation_detail`, `adaptive_strategy_versions.fitness_score` — all
+nullable/safe-defaulted, zero behavior change until the corresponding code
+ships. No new dependency — stdlib plus this repo's own modules throughout.
 
 ## 4. LLM integration (Groq default, Ollama Cloud alternative)
 
@@ -1008,6 +1125,17 @@ so unlike every prior migration (which only left a *new* feature dark
 until run), **this one must be applied before its corresponding code
 deploys** — those two functions gate every live trading cycle.
 
+**Refinement pass, migration `0009`** — drops one confirmed-exact-duplicate
+index on `backtest_portfolio_snapshots` (`0007` had created both a unique
+index and a plain index on the identical column tuple); pure cleanup, no
+behavior change.
+
+**Scientific Strategy Optimization Framework (§3e), migration `0010`** —
+`strategy_versions.promotion_eligible` (default `false`, §2),
+`strategy_simulations.research_note`/`.validation_detail`,
+`adaptive_strategy_versions.fitness_score` — all nullable/safe-defaulted,
+same non-urgent deployment order as every migration except `0008`.
+
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.
 - Row-level security: dashboard's Supabase anon key is read-only across
@@ -1105,17 +1233,21 @@ funds exist, before trusting it beyond the promotion gate.
 │   ├── features/                    # deterministic, zero-LLM scoring pipeline
 │   │   ├── feature_engine.py
 │   │   └── opportunity_scorer.py    # includes classify_market_regime
-│   ├── learning/                    # Trade Memory + Learning Engine (§3a) + Adaptive Strategy Engine (§3b)
+│   ├── learning/                    # Trade Memory + Learning Engine (§3a) + Adaptive Strategy Engine (§3b/§3e)
 │   │   ├── statistics.py
 │   │   ├── trade_memory.py
 │   │   ├── confidence_calibration.py
 │   │   ├── feature_importance.py
 │   │   ├── recommendations.py
-│   │   ├── simulation.py            # walk-forward validation, §3b
-│   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b
+│   │   ├── simulation.py            # walk-forward validation, §3b/§3e
+│   │   ├── adaptive_strategy_engine.py  # AdaptiveStrategyEngine, §3b/§3e
+│   │   ├── fitness.py               # multi-objective fitness score, §3e
+│   │   ├── rejection_analysis.py    # root cause analysis, §3e
+│   │   ├── weakness_detection.py    # §3e
 │   │   ├── reports.py
 │   │   ├── drift_detection.py       # Feature Drift Detection, §3d
 │   │   └── strategy_health.py       # Strategy Health Engine, §3d
+│   ├── utils.py                      # shared pure-math helpers (clamp, parse_timestamp, ...)
 │   ├── backtest/                    # Event-Driven Backtesting Engine (§3c) — on-demand CLI, not scheduled
 │   │   ├── events.py
 │   │   ├── simulation_clock.py
@@ -1156,7 +1288,9 @@ funds exist, before trusting it beyond the promotion gate.
 │           ├── 0005_learning_engine.sql
 │           ├── 0006_adaptive_strategy_engine.sql
 │           ├── 0007_backtesting_engine.sql
-│           └── 0008_reliability_layer.sql
+│           ├── 0008_reliability_layer.sql
+│           ├── 0009_drop_redundant_index.sql
+│           └── 0010_scientific_optimization.sql
 ├── tests/
 │   └── test_risk_manager.py
 ├── dashboard/                      # Next.js app — deferred to step 10

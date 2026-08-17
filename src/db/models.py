@@ -131,6 +131,15 @@ def promote_version(version_id: int) -> None:
     ).execute()
 
 
+def set_strategy_version_promotion_eligible(version_id: int, eligible: bool) -> None:
+    """Code sets this flag only — never promoted_to_real itself (Scientific
+    Strategy Optimization Framework). A human reviews eligible rows in
+    Supabase and flips promoted_to_real themselves."""
+    get_client().table("strategy_versions").update({"promotion_eligible": eligible}).eq(
+        "id", version_id
+    ).execute()
+
+
 def get_all_strategy_versions() -> list[dict]:
     res = (
         get_client()
@@ -590,7 +599,13 @@ def insert_strategy_simulation(
     candidate_metrics: dict | None,
     p_value: float | None,
     passed: bool,
+    research_note: str | None = None,
+    validation_detail: dict | None = None,
 ) -> dict:
+    """research_note/validation_detail (Scientific Strategy Optimization
+    Framework) — a narrative Observation/Weakness/Hypothesis/Simulation/
+    Walk Forward/Decision report and the raw numbers behind it (bootstrap
+    CI, walk-forward folds, strategy-comparison result where run)."""
     res = (
         get_client()
         .table("strategy_simulations")
@@ -606,6 +621,8 @@ def insert_strategy_simulation(
                 "candidate_metrics": candidate_metrics,
                 "p_value": p_value,
                 "passed": passed,
+                "research_note": research_note,
+                "validation_detail": validation_detail,
             }
         )
         .execute()
@@ -630,6 +647,7 @@ def insert_adaptive_strategy_version(
     source_recommendation_batch_id: str | None,
     source_simulation_id: int | None,
     notes: str | None = None,
+    fitness_score: float | None = None,
 ) -> dict:
     res = (
         get_client()
@@ -642,6 +660,7 @@ def insert_adaptive_strategy_version(
                 "source_recommendation_batch_id": source_recommendation_batch_id,
                 "source_simulation_id": source_simulation_id,
                 "notes": notes,
+                "fitness_score": fitness_score,
             }
         )
         .execute()
@@ -988,6 +1007,24 @@ def get_entry_evaluations_since(mode: str, since: datetime) -> list[dict]:
         .select("*")
         .eq("mode", mode)
         .eq("final_decision", "buy")
+        .gte("timestamp", since.isoformat())
+        .execute()
+    )
+    return res.data
+
+
+def get_hold_evaluations_since(mode: str, since: datetime) -> list[dict]:
+    """Non-trade opportunity_evaluations rows (final_decision='hold') since
+    `since` — every scanned-but-not-traded candidate, each carrying its own
+    reason/risk_manager_result (Root Cause Analysis, Scientific Strategy
+    Optimization Framework). Same shape as get_entry_evaluations_since,
+    filtering the opposite final_decision value."""
+    res = (
+        get_client()
+        .table("opportunity_evaluations")
+        .select("*")
+        .eq("mode", mode)
+        .eq("final_decision", "hold")
         .gte("timestamp", since.isoformat())
         .execute()
     )

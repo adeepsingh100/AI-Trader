@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from src.learning.simulation import (
     _train_test_split,
+    simulate_exit_params_recommendation,
     simulate_threshold_recommendation,
     simulate_weight_recommendation,
 )
@@ -9,6 +10,20 @@ from src.learning.simulation import (
 
 def _trade(trade_id, pnl, closed_at):
     return {"id": trade_id, "pnl": pnl, "closed_at": closed_at, "opened_at": "2025-12-01T00:00:00Z"}
+
+
+def _exit_trade(trade_id, pnl, closed_at, mae_pct=0.0, mfe_pct=0.0, entry_price=100.0, qty=1.0, symbol="BTCINR"):
+    return {
+        "id": trade_id,
+        "pnl": pnl,
+        "closed_at": closed_at,
+        "opened_at": "2025-12-01T00:00:00Z",
+        "entry_price": entry_price,
+        "qty": qty,
+        "mae_pct": mae_pct,
+        "mfe_pct": mfe_pct,
+        "symbol": symbol,
+    }
 
 
 # --- _train_test_split ---
@@ -158,3 +173,165 @@ def test_simulate_threshold_recommendation_evaluates_only_test_window(mock_model
 
     assert result is not None
     mock_models.insert_strategy_simulation.assert_called_once()
+
+
+# --- simulate_exit_params_recommendation ---
+
+
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 100)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_empty_when_insufficient_trades(mock_models):
+    mock_models.get_latest_recommendation.return_value = {"recommended_value": 0.02, "status": "pending"}
+    mock_models.get_recently_closed_trades.return_value = [_exit_trade(1, 10, "2026-01-01T00:00:00Z")]
+    assert simulate_exit_params_recommendation("paper") == []
+    mock_models.insert_strategy_simulation.assert_not_called()
+
+
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_skips_leg_with_no_pending_recommendation(mock_models):
+    mock_models.get_latest_recommendation.return_value = None
+    assert simulate_exit_params_recommendation("paper") == []
+
+
+@patch("src.learning.simulation.bootstrap_confidence_interval")
+@patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_models, mock_bootstrap):
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+        {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
+        if name == "stop_loss_pct"
+        else None
+    )
+    train_trades = [_exit_trade(i, pnl=10, closed_at=f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 6)]
+    test_trades = [
+        _exit_trade(6, pnl=-30, closed_at="2026-01-06T00:00:00Z", mae_pct=5.0),
+        _exit_trade(7, pnl=-40, closed_at="2026-01-07T00:00:00Z", mae_pct=5.0),
+        _exit_trade(8, pnl=-35, closed_at="2026-01-08T00:00:00Z", mae_pct=5.0),
+    ]
+    mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_adaptive_strategy_version.return_value = None
+    mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_bootstrap.return_value = {
+        "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
+    }
+
+    results = simulate_exit_params_recommendation("paper")
+
+    assert len(results) == 1
+    mock_models.insert_strategy_simulation.assert_called_once()
+    kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
+    assert kwargs["passed"] is True
+    assert "Observation:" in kwargs["research_note"]
+    assert "Decision: Promoted" in kwargs["research_note"]
+    assert kwargs["validation_detail"]["bootstrap_ci"]["ci_low"] == 0.001
+    mock_models.insert_adaptive_strategy_version.assert_called_once()
+    assert mock_models.insert_adaptive_strategy_version.call_args.kwargs["fitness_score"] is not None
+
+
+@patch("src.learning.simulation.bootstrap_confidence_interval")
+@patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_zero(mock_models, mock_bootstrap):
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+        {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
+        if name == "stop_loss_pct"
+        else None
+    )
+    train_trades = [_exit_trade(i, pnl=10, closed_at=f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 6)]
+    test_trades = [
+        _exit_trade(6, pnl=-30, closed_at="2026-01-06T00:00:00Z", mae_pct=5.0),
+        _exit_trade(7, pnl=-40, closed_at="2026-01-07T00:00:00Z", mae_pct=5.0),
+        _exit_trade(8, pnl=-35, closed_at="2026-01-08T00:00:00Z", mae_pct=5.0),
+    ]
+    mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    # CI lower bound crosses zero -> the z-test passed but the bootstrap
+    # gate must still block promotion.
+    mock_bootstrap.return_value = {
+        "point_estimate": 0.01, "ci_low": -0.001, "ci_high": 0.03, "confidence_pct": 95.0, "iterations": 1000,
+    }
+
+    simulate_exit_params_recommendation("paper")
+
+    kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
+    assert kwargs["passed"] is False
+    mock_models.insert_adaptive_strategy_version.assert_not_called()
+
+
+@patch("src.learning.simulation._has_historical_candles", return_value=False)
+@patch("src.learning.simulation.bootstrap_confidence_interval")
+@patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candle_data(
+    mock_models, mock_bootstrap, mock_has_candles
+):
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+        {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
+        if name == "stop_loss_pct"
+        else None
+    )
+    train_trades = [_exit_trade(i, pnl=10, closed_at=f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 6)]
+    test_trades = [
+        _exit_trade(6, pnl=-30, closed_at="2026-01-06T00:00:00Z", mae_pct=5.0),
+        _exit_trade(7, pnl=-40, closed_at="2026-01-07T00:00:00Z", mae_pct=5.0),
+        _exit_trade(8, pnl=-35, closed_at="2026-01-08T00:00:00Z", mae_pct=5.0),
+    ]
+    mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_adaptive_strategy_version.return_value = None
+    mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_bootstrap.return_value = {
+        "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
+    }
+
+    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"})
+
+    mock_has_candles.assert_called_once()
+    kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
+    assert "strategy_comparison" not in (kwargs["validation_detail"] or {})
+    assert kwargs["passed"] is True
+
+
+@patch("src.learning.simulation._backtest_replay_gate")
+@patch("src.learning.simulation._has_historical_candles", return_value=True)
+@patch("src.learning.simulation.bootstrap_confidence_interval")
+@patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.simulation.models")
+def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseline_wins(
+    mock_models, mock_bootstrap, mock_has_candles, mock_replay
+):
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+        {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
+        if name == "stop_loss_pct"
+        else None
+    )
+    train_trades = [_exit_trade(i, pnl=10, closed_at=f"2026-01-{i:02d}T00:00:00Z") for i in range(1, 6)]
+    test_trades = [
+        _exit_trade(6, pnl=-30, closed_at="2026-01-06T00:00:00Z", mae_pct=5.0),
+        _exit_trade(7, pnl=-40, closed_at="2026-01-07T00:00:00Z", mae_pct=5.0),
+        _exit_trade(8, pnl=-35, closed_at="2026-01-08T00:00:00Z", mae_pct=5.0),
+    ]
+    mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_bootstrap.return_value = {
+        "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
+    }
+    mock_replay.return_value = {"winner": "a", "promotion_recommended": False, "p_values": {}}
+
+    simulate_exit_params_recommendation("paper", symbol_to_pair={"BTCINR": "I-BTC_INR"})
+
+    kwargs = mock_models.insert_strategy_simulation.call_args.kwargs
+    assert kwargs["passed"] is False
+    assert kwargs["validation_detail"]["strategy_comparison"]["winner"] == "a"
+    mock_models.insert_adaptive_strategy_version.assert_not_called()
