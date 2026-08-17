@@ -7,6 +7,7 @@ const LINKS = [
   { href: "/", label: "Overview" },
   { href: "/trades", label: "Trades" },
   { href: "/evolution", label: "Evolution" },
+  { href: "/learning", label: "Learning" },
   { href: "/model-health", label: "Model health" },
   { href: "/config", label: "Config" },
 ];
