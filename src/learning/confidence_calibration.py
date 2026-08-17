@@ -21,10 +21,7 @@ MIN_FINAL_CONFIDENCE defaults to 0."""
 from __future__ import annotations
 
 from src.config import CONFIDENCE_AI_WEIGHT, CONFIDENCE_HISTORICAL_WEIGHT, MIN_SIMILAR_TRADES
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+from src.utils import clamp
 
 
 def calibrate_confidence(
@@ -54,7 +51,7 @@ def calibrate_confidence(
         modifier_total = sum(
             m for m in (regime_modifier, symbol_modifier, recent_performance_modifier) if m is not None
         )
-        final_confidence = _clamp(final_confidence + modifier_total, 0, 100)
+        final_confidence = clamp(final_confidence + modifier_total, 0, 100)
 
     return {
         "final_confidence": final_confidence,

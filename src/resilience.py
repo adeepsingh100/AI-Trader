@@ -5,11 +5,12 @@ persistent daemon exists to checkpoint) — see PROJECT_SPEC.md §3d.
 
 groq_client.py's LLM chain keeps its own retry loop (it needs a
 ModelUsageEvent per attempt for model_usage logging, a genuinely different
-shape from a flat retry), but shares this module's backoff constants so the
-formula lives in one place."""
+shape from a flat retry), but calls this module's backoff_delay() so the
+exponential-backoff formula itself lives in one place."""
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Callable, TypeVar
 
@@ -23,14 +24,27 @@ from src.config import (
 T = TypeVar("T")
 
 
+def backoff_delay(base: float, attempt: int) -> float:
+    return base * (2**attempt)
+
+
+def log_fail_open(component: str, err: Exception) -> None:
+    """A fail-open `except Exception: pass` site's failure is otherwise
+    invisible — this repo runs as GitHub Actions cron, so stderr already
+    surfaces in the run log, no new logging framework needed. Never raises,
+    never changes what the caller returns."""
+    print(f"[fail-open] {component}: {type(err).__name__}: {err}", file=sys.stderr)
+
+
 def retry_with_backoff(
     fn: Callable[[], T],
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     base_delay: float = RETRY_BASE_DELAY_SECONDS,
     exceptions: tuple[type[BaseException], ...] = (Exception,),
 ) -> T:
-    """Calls fn() up to max_attempts times, sleeping base_delay*(2**attempt)
-    between attempts. Re-raises the last exception if every attempt fails."""
+    """Calls fn() up to max_attempts times, sleeping backoff_delay(base_delay,
+    attempt) between attempts. Re-raises the last exception if every attempt
+    fails."""
     last_exc: BaseException | None = None
     for attempt in range(max_attempts):
         try:
@@ -38,7 +52,7 @@ def retry_with_backoff(
         except exceptions as e:
             last_exc = e
             if attempt < max_attempts - 1:
-                time.sleep(base_delay * (2**attempt))
+                time.sleep(backoff_delay(base_delay, attempt))
     assert last_exc is not None
     raise last_exc
 
@@ -64,7 +78,8 @@ def check_circuit_breaker(component: str) -> None:
 
     try:
         state = models.get_circuit_breaker_state(component)
-    except Exception:
+    except Exception as e:
+        log_fail_open(component, e)
         return
     if state is None:
         return
@@ -80,8 +95,8 @@ def record_success(component: str) -> None:
 
     try:
         models.reset_circuit_breaker(component)
-    except Exception:
-        pass
+    except Exception as e:
+        log_fail_open(component, e)
 
 
 def record_failure(component: str) -> None:
@@ -98,8 +113,8 @@ def record_failure(component: str) -> None:
         if consecutive_failures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD:
             tripped_until = _now_ms() + CIRCUIT_BREAKER_COOLDOWN_SECONDS * 1000
         models.upsert_circuit_breaker_state(component, consecutive_failures, tripped_until)
-    except Exception:
-        pass
+    except Exception as e:
+        log_fail_open(component, e)
 
 
 def call_with_circuit_breaker(

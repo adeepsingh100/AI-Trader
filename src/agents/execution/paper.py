@@ -4,17 +4,21 @@ import random
 
 from src.agents.execution.base import ExecutionAgent
 from src.backtest.order_manager import OrderType
-from src.config import EXECUTION_OPTIMIZER_ENABLED
+from src.config import (
+    EXECUTION_OPTIMIZER_ENABLED,
+    GST_PCT_ON_FEE,
+    SELL_TDS_PCT,
+    SLIPPAGE_BPS,
+    TRADING_FEE_PCT,
+)
 from src.execution_optimizer.optimizer import OrderContext, recommend
 
-# CoinDCX spot: 0.5% trading fee on trade value (both sides), +18% GST on
-# that fee. Sells additionally carry 1% TDS (Income Tax Act s.194S) on
-# trade value — a separate tax deduction, not something GST applies to,
-# and not charged on buys (no "transfer" of the asset on acquisition).
-TRADING_FEE_PCT = 0.5
-GST_PCT_ON_FEE = 18
-SELL_TDS_PCT = 1
-SLIPPAGE_BPS = 5
+
+def sell_tds(notional: float) -> float:
+    """1% TDS (Income Tax Act s.194S) on a sell's trade value — public,
+    reused as-is by src/agents/execution/real.py so both paths compute the
+    exact same tax figure off the same config constant."""
+    return notional * (SELL_TDS_PCT / 100)
 
 
 def fees(notional: float, side: str) -> float:
@@ -24,7 +28,7 @@ def fees(notional: float, side: str) -> float:
     trading_fee = notional * (TRADING_FEE_PCT / 100)
     total = trading_fee + trading_fee * (GST_PCT_ON_FEE / 100)
     if side == "sell":
-        total += notional * (SELL_TDS_PCT / 100)
+        total += sell_tds(notional)
     return total
 
 

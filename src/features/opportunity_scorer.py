@@ -31,6 +31,7 @@ from src.config import (
     VOLATILITY_SCORE_EXTREME,
     VOLUME_SCORE_SCALE,
 )
+from src.utils import clamp
 
 # Same timeframe score_opportunity() itself trusts most (highest configured
 # weight) — used for the point-in-time context (ADX/volatility_regime)
@@ -38,14 +39,10 @@ from src.config import (
 PRIMARY_TIMEFRAME = max(TIMEFRAME_WEIGHTS, key=TIMEFRAME_WEIGHTS.get)
 
 
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
 def _linear_score(value: float | None, floor: float, ceil: float) -> float | None:
     if value is None:
         return None
-    return _clamp((value - floor) / (ceil - floor) * 100, 0, 100)
+    return clamp((value - floor) / (ceil - floor) * 100, 0, 100)
 
 
 def _bool_score(condition: bool | None) -> float | None:
@@ -94,7 +91,7 @@ def _score_momentum_for_timeframe(f: dict) -> float | None:
 def _score_volume_for_timeframe(f: dict) -> float | None:
     rel_vol = f["relative_volume"]
     components = {
-        "relative_volume": _clamp((rel_vol - 1) * VOLUME_SCORE_SCALE, 0, 100) if rel_vol is not None else None,
+        "relative_volume": clamp((rel_vol - 1) * VOLUME_SCORE_SCALE, 0, 100) if rel_vol is not None else None,
         "obv": _bool_score(f["obv_rising"]),
     }
     return weighted_average(components, {"relative_volume": 0.5, "obv": 0.5})
@@ -111,7 +108,7 @@ def _score_risk_for_timeframe(f: dict) -> float | None:
     distance = f["distance_from_resistance_pct"]
     if distance is None:
         return None
-    return _clamp(distance / RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE * 100, 0, 100)
+    return clamp(distance / RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE * 100, 0, 100)
 
 
 # --- blended across timeframes ------------------------------------------

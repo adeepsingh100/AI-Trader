@@ -64,7 +64,7 @@ def test_run_strategy_health_suspends_critical_version(monkeypatch):
     monkeypatch.setattr(models, "get_closed_trades", lambda mode, version_id: closed_trades)
     monkeypatch.setattr(models, "insert_strategy_health_score", Mock())
     suspend_mock = Mock()
-    monkeypatch.setattr(models, "set_strategy_version_status", suspend_mock)
+    monkeypatch.setattr(models, "update_strategy_version_status", suspend_mock)
 
     with patch("src.learning.strategy_health.STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED", True):
         result = run_strategy_health("paper")
@@ -84,7 +84,7 @@ def test_run_strategy_health_never_suspends_when_auto_suspend_disabled(monkeypat
     monkeypatch.setattr(models, "get_closed_trades", lambda mode, version_id: closed_trades)
     monkeypatch.setattr(models, "insert_strategy_health_score", Mock())
     suspend_mock = Mock()
-    monkeypatch.setattr(models, "set_strategy_version_status", suspend_mock)
+    monkeypatch.setattr(models, "update_strategy_version_status", suspend_mock)
 
     with patch("src.learning.strategy_health.STRATEGY_HEALTH_AUTO_SUSPEND_ENABLED", False):
         result = run_strategy_health("paper")

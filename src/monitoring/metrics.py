@@ -13,6 +13,8 @@ import shutil
 import time
 from contextlib import contextmanager
 
+from src.resilience import log_fail_open
+
 
 @contextmanager
 def track(component: str, name: str, extra: dict | None = None):
@@ -44,8 +46,8 @@ def track(component: str, name: str, extra: dict | None = None):
                     }
                 ]
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log_fail_open(f"monitoring.track.{component}", e)
 
 
 def resource_snapshot() -> dict:
@@ -74,5 +76,5 @@ def log_resource_snapshot(component: str = "orchestrator") -> None:
         models.insert_system_metrics(
             [{"component": component, "metric_name": k, "value": v, "metadata": {}} for k, v in snapshot.items()]
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log_fail_open(f"monitoring.resource_snapshot.{component}", e)

@@ -60,15 +60,7 @@ def get_decision_trail(
     'calibration'. Read-only — no new table, no new write path."""
     from src.db import models
 
-    client = models.get_client()
-    query = client.table("opportunity_evaluations").select("*").eq("mode", mode)
-    if trade_id is not None:
-        query = query.eq("trade_id", trade_id)
-    if symbol is not None:
-        query = query.eq("symbol", symbol)
-    if since is not None:
-        query = query.gte("timestamp", since.isoformat())
-    rows = query.order("timestamp").execute().data
+    rows = models.get_opportunity_evaluations_for_trail(mode, trade_id=trade_id, symbol=symbol, since=since)
 
     trail = []
     for row in rows:

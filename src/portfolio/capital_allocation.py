@@ -43,10 +43,7 @@ from src.config import (
     VOLATILITY_HIGH_MIN_PCT,
     VOLATILITY_LOW_MAX_PCT,
 )
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+from src.utils import clamp
 
 
 def _linear(value: float, low: float, high: float, mult_at_low: float, mult_at_high: float) -> float:
@@ -59,7 +56,7 @@ def _linear(value: float, low: float, high: float, mult_at_low: float, mult_at_h
     naming makes the correct argument unambiguous at each call site."""
     if high == low:
         return (mult_at_low + mult_at_high) / 2
-    frac = _clamp((value - low) / (high - low), 0.0, 1.0)
+    frac = clamp((value - low) / (high - low), 0.0, 1.0)
     return mult_at_low + frac * (mult_at_high - mult_at_low)
 
 
@@ -149,7 +146,7 @@ def regime_factor(market_regime: str | None) -> float:
 def confidence_factor(confidence: float | None) -> float:
     if confidence is None:
         return 1.0
-    fraction = _clamp(confidence / 100.0, 0.0, 1.0)
+    fraction = clamp(confidence / 100.0, 0.0, 1.0)
     return CAPITAL_ALLOC_CONFIDENCE_MIN_MULT + fraction * (
         CAPITAL_ALLOC_CONFIDENCE_MAX_MULT - CAPITAL_ALLOC_CONFIDENCE_MIN_MULT
     )
@@ -177,7 +174,7 @@ def compute_dynamic_size(
     combined = 1.0
     for f in factors.values():
         combined *= f
-    combined = _clamp(combined, CAPITAL_ALLOC_TOTAL_MIN_MULT, CAPITAL_ALLOC_TOTAL_MAX_MULT)
+    combined = clamp(combined, CAPITAL_ALLOC_TOTAL_MIN_MULT, CAPITAL_ALLOC_TOTAL_MAX_MULT)
     return {
         "trade_capital": base_trade_capital * combined,
         "combined_multiplier": combined,

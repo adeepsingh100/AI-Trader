@@ -32,6 +32,7 @@ from src.features.feature_engine import FEATURE_KEYS
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME
 from src.learning.feature_importance import _EXCLUDED_FEATURE_KEYS
 from src.learning.statistics import z_test_two_proportions
+from src.utils import parse_timestamp
 
 _NUMERIC_FEATURE_KEYS = [k for k in FEATURE_KEYS if k not in _EXCLUDED_FEATURE_KEYS]
 
@@ -72,7 +73,7 @@ def _split_by_window(trades: list[dict], now: datetime) -> tuple[list[dict], lis
     cutoff = now - timedelta(days=DRIFT_RECENT_WINDOW_DAYS)
     recent, baseline = [], []
     for t in trades:
-        closed_at = datetime.fromisoformat(t["closed_at"].replace("Z", "+00:00"))
+        closed_at = parse_timestamp(t["closed_at"])
         (recent if closed_at >= cutoff else baseline).append(t)
     return baseline, recent
 

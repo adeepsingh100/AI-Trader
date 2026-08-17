@@ -26,6 +26,7 @@ from src.config import (
 )
 from src.db import models
 from src.learning.feature_importance import BLENDED_TIMEFRAME, SUB_SCORE_KEYS
+from src.utils import normalize_positive_weights, parse_timestamp as _parse_ts
 
 _SUB_SCORE_KEYS = ("trend_score", "momentum_score", "volume_score", "volatility_score", "risk_score")
 
@@ -37,10 +38,6 @@ _EMPTY_RESULT = {
     "avg_loss_pct": None,
     "avg_holding_time_seconds": None,
 }
-
-
-def _parse_ts(raw: str) -> datetime:
-    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 def _distance(a: dict, b: dict, weights: dict[str, float] | None = None) -> float | None:
@@ -71,9 +68,7 @@ def _feature_importance_weights(mode: str) -> dict[str, float] | None:
     }
     if not correlations:
         return None
-    positive = {k: max(0.0, v) for k, v in correlations.items()}
-    total = sum(positive.values())
-    return {k: v / total for k, v in positive.items()} if total > 0 else None
+    return normalize_positive_weights(correlations)
 
 
 def find_similar_trades(

@@ -2,25 +2,7 @@ from unittest.mock import Mock
 
 from src.db import models
 from src.groq_client import ModelUsageEvent
-
-
-def _fluent_mock(execute_result):
-    """A mock whose chained methods (select/eq/neq/insert/update/upsert/
-    order/limit/in_/gte) all return itself, so call args land on the same
-    mock and .execute() returns a fixed result."""
-    m = Mock()
-    m.select.return_value = m
-    m.eq.return_value = m
-    m.neq.return_value = m
-    m.insert.return_value = m
-    m.update.return_value = m
-    m.upsert.return_value = m
-    m.order.return_value = m
-    m.limit.return_value = m
-    m.in_.return_value = m
-    m.gte.return_value = m
-    m.execute.return_value = Mock(data=execute_result)
-    return m
+from tests.conftest import _fluent_mock
 
 
 def test_open_trade_inserts_expected_row(monkeypatch):

@@ -14,6 +14,7 @@ import random
 from collections.abc import Callable
 
 from src.config import BACKTEST_BOOTSTRAP_ITERATIONS, BACKTEST_MONTE_CARLO_ITERATIONS, BACKTEST_RANDOM_SEED
+from src.utils import max_drawdown_pct as _max_drawdown_pct
 
 
 def bootstrap_confidence_interval(
@@ -40,15 +41,6 @@ def bootstrap_confidence_interval(
         "confidence_pct": confidence_pct,
         "iterations": iterations,
     }
-
-
-def _max_drawdown_pct(pnls: list[float], starting_capital: float) -> float:
-    running = peak = max_dd = 0.0
-    for pnl in pnls:
-        running += pnl
-        peak = max(peak, running)
-        max_dd = max(max_dd, peak - running)
-    return (max_dd / starting_capital * 100) if starting_capital else 0.0
 
 
 def monte_carlo_drawdown_distribution(

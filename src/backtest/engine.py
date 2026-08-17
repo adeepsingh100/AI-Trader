@@ -22,7 +22,6 @@ survivorship bias. Every report built from a run should say this."""
 
 from __future__ import annotations
 
-import uuid
 from datetime import date, datetime, time, timedelta, timezone
 
 from src.agents.risk_manager import (
@@ -30,7 +29,6 @@ from src.agents.risk_manager import (
     circuit_breaker_triggered,
     evaluate,
     exit_reason,
-    target_hit,
 )
 from src.backtest.data_provider import CandleStore
 from src.backtest.execution_simulator import execute_market_order
@@ -48,11 +46,12 @@ from src.config import (
     EXIT_SCORE_THRESHOLD,
     FEATURE_CANDLE_LIMIT,
     FEATURE_TIMEFRAMES,
-    MIN_OPPORTUNITY_SCORE,
+    PORTFOLIO_CORRELATION_LOOKBACK_BARS,
 )
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME, score_opportunity, select_top_candidates
+from src.portfolio.intelligence import Position as IntelligencePosition
 
 from src.backtest.simulation_clock import SimulationClock
 
@@ -193,6 +192,29 @@ class BacktestEngine:
     def _open_trades_as_dicts(self) -> list[dict]:
         return [{"qty": p.qty, "entry_price": p.entry_price} for p in self.portfolio.positions.values()]
 
+    def _price_history(self, as_of_ms: int) -> dict[str, list[float]]:
+        """Daily closes per symbol, visible as of as_of_ms — mirrors
+        orchestrator._price_history_from_snapshot's daily-close convention.
+        Already look-ahead-safe: CandleStore.visible_slice only returns bars
+        closed as of as_of_ms, same guarantee portfolio/intelligence.py
+        requires of its caller."""
+        history: dict[str, list[float]] = {}
+        for symbol, tf_stores in self.stores.items():
+            daily_store = tf_stores.get("1d")
+            if daily_store is None:
+                continue
+            candles = daily_store.visible_slice(as_of_ms, PORTFOLIO_CORRELATION_LOOKBACK_BARS)
+            closes = [c["close"] for c in candles if c.get("close") is not None]
+            if closes:
+                history[symbol] = closes
+        return history
+
+    def _portfolio_positions_for_intelligence(self, prices: dict[str, float]) -> list[IntelligencePosition]:
+        return [
+            IntelligencePosition(p.symbol, p.qty, p.entry_price, prices.get(p.symbol, p.entry_price))
+            for p in self.portfolio.positions.values()
+        ]
+
     def _flatten_all(self, time_ms: int, prices: dict[str, float]) -> None:
         now = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc)
         for symbol in list(self.portfolio.positions.keys()):
@@ -278,6 +300,7 @@ class BacktestEngine:
 
         not_held = [r for r in scored if r["symbol"] not in self.portfolio.positions]
         candidate_symbols = {r["symbol"] for r in select_top_candidates(not_held)}
+        price_history = self._price_history(time_ms)
 
         for record in scored:
             if circuit_breaker_triggered(self.daily_pnl, self.capital_config):
@@ -293,7 +316,13 @@ class BacktestEngine:
                 if not accept:
                     continue
                 decision: RiskDecision = evaluate(
-                    self.capital_config, self.daily_pnl, self._open_trades_as_dicts(), record["last_price"]
+                    self.capital_config,
+                    self.daily_pnl,
+                    self._open_trades_as_dicts(),
+                    record["last_price"],
+                    symbol=symbol,
+                    portfolio_positions=self._portfolio_positions_for_intelligence(prices),
+                    price_history=price_history,
                 )
                 if decision.action != "size":
                     continue

@@ -150,6 +150,34 @@ def test_decision_pass_opens_position_for_qualifying_candidate():
     assert pos.confidence is None  # quant-only default, no LLM verdict
 
 
+def test_decision_pass_blocks_oversized_candidate_via_concentration_gate():
+    """Backtest/live parity (PROJECT_SPEC.md §3d): risk_manager.evaluate()'s
+    concentration cap, already live in real/paper trading, must also gate
+    backtest entries now that engine.py passes symbol/portfolio_positions/
+    price_history — mirrors test_risk_manager.py's own oversized-candidate
+    case (position_size_pct=50 of a 20-slot book's ~5% fair share)."""
+    engine = _engine(position_size_pct=50, max_concurrent_positions=20)
+    engine._score_symbol = MagicMock(
+        return_value={
+            "symbol": "TESTINR",
+            "last_price": 100.0,
+            "features_by_tf": {},
+            "trend_score": 90.0,
+            "momentum_score": 90.0,
+            "volume_score": 90.0,
+            "volatility_score": 90.0,
+            "risk_score": 90.0,
+            "opportunity_score": 90.0,
+            "market_regime": "strong_bull",
+        }
+    )
+    engine._bar_volume = MagicMock(return_value=1_000_000)
+
+    engine._decision_pass(engine.clock.now_ms, {"TESTINR": 100.0})
+
+    assert "TESTINR" not in engine.portfolio.positions
+
+
 # --- day rollover ---
 
 

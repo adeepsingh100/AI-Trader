@@ -6,7 +6,6 @@ configurable promotion bar. See PROJECT_SPEC.md §2 and §3."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 from src.agents.risk_manager import today_ist
 from src.config import (
@@ -17,6 +16,7 @@ from src.config import (
 from src.db import models
 from src.groq_client import AllModelsFailedError, chat
 from src.lenient_json import parse_llm_json
+from src.utils import max_drawdown_pct, parse_timestamp
 
 # Local imports (inside run_evolution, not here) — both learning-engine
 # modules import compute_metrics from this file, so importing them at
@@ -39,21 +39,14 @@ def compute_metrics(trades: list[dict], capital_to_use: float) -> dict:
 
 
 def _max_drawdown_pct(closed_trades: list[dict], capital_to_use: float) -> float:
-    if not closed_trades or capital_to_use <= 0:
-        return 0.0
     ordered = sorted(closed_trades, key=lambda t: t["closed_at"])
-    running = peak = max_dd = 0.0
-    for t in ordered:
-        running += t["pnl"]
-        peak = max(peak, running)
-        max_dd = max(max_dd, peak - running)
-    return (max_dd / capital_to_use) * 100
+    return max_drawdown_pct([t["pnl"] for t in ordered], capital_to_use)
 
 
 def _created_date(version: dict):
     raw = version["created_at"]
     if isinstance(raw, str):
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        return parse_timestamp(raw).date()
     return raw.date()
 
 

@@ -34,10 +34,7 @@ from src.db import models
 from src.learning.feature_importance import compute_subscore_correlation_weights, score_separation_p_value
 from src.learning.recommendations import current_weights
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
-
-
-def _parse_ts(raw: str) -> datetime:
-    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+from src.utils import parse_timestamp as _parse_ts
 
 
 def _fetch_trades(mode: str) -> list[dict]:

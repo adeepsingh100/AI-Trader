@@ -17,6 +17,7 @@ from src.coindcx_client import (
 )
 from src.data_quality.repair import DataRepairEngine
 from src.data_quality.validator import MarketDataValidator
+from src.resilience import log_fail_open
 
 _validator = MarketDataValidator()
 _repairer = DataRepairEngine()
@@ -51,8 +52,8 @@ def _validated_candles(pair: str, interval: str) -> list[dict]:
                     for i in report.issues
                 ]
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log_fail_open("data_agent.data_quality_log", e)
 
     return repaired
 

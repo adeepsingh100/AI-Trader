@@ -27,6 +27,7 @@ from src.config import (
     SORTINO_MAR_PCT,
 )
 from src.db import models
+from src.utils import parse_timestamp as _parse_ts
 
 _DIMENSION_TYPES = (
     "symbol",
@@ -37,10 +38,6 @@ _DIMENSION_TYPES = (
     "weekday",
     "hour",
 )
-
-
-def _parse_ts(raw: str) -> datetime:
-    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 def _downside_deviation(returns: list[float], mar: float) -> float | None:
