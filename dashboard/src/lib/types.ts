@@ -31,6 +31,8 @@ export interface Trade {
   qty: number;
   entry_price: number;
   exit_price: number | null;
+  stop_loss_price: number | null;
+  take_profit_price: number | null;
   pnl: number | null;
   fees: number;
   status: "open" | "closed" | "flattened";

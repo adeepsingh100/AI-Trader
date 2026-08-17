@@ -68,6 +68,8 @@ export default function TradesClient() {
                   "Side",
                   "Qty",
                   "Entry",
+                  "Stop-loss",
+                  "Target",
                   "Exit",
                   "Bought for",
                   "Sold for",
@@ -103,6 +105,12 @@ export default function TradesClient() {
                   </td>
                   <td className="px-3 py-2.5 tabular-nums">{t.qty}</td>
                   <td className="px-3 py-2.5 tabular-nums">{t.entry_price}</td>
+                  <td className="px-3 py-2.5 tabular-nums" style={{ color: STATUS.critical }}>
+                    {t.stop_loss_price ?? "-"}
+                  </td>
+                  <td className="px-3 py-2.5 tabular-nums" style={{ color: STATUS.good }}>
+                    {t.take_profit_price ?? "-"}
+                  </td>
                   <td className="px-3 py-2.5 tabular-nums">{t.exit_price ?? "-"}</td>
                   <td className="px-3 py-2.5 tabular-nums whitespace-nowrap">
                     ₹{(t.qty * t.entry_price).toLocaleString("en-IN", { maximumFractionDigits: 2 })}
