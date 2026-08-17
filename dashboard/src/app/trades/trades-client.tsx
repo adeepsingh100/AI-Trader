@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
@@ -12,10 +12,36 @@ const STATUS_COLOR: Record<Trade["status"], string> = {
   flattened: STATUS.critical,
 };
 
+// How often to re-poll the latest close price for open positions. Supabase
+// Realtime would push updates instantly, but needs the table added to the
+// realtime publication (unconfirmed for this project) — polling is the
+// simpler, dependency-free way to get a "live" column without that setup.
+const PRICE_POLL_MS = 20_000;
+
+function timeframeMinutes(timeframe: string): number {
+  const match = timeframe.match(/^(\d+)([mhd])$/);
+  if (!match) return Infinity;
+  const n = Number(match[1]);
+  return match[2] === "m" ? n : match[2] === "h" ? n * 60 : n * 1440;
+}
+
+// The freshest close price across whatever timeframes this evaluation row's
+// features cover — the shortest timeframe available (e.g. "1m" over "1h")
+// is the closest proxy for "current price" a live UI column can get without
+// a dedicated tick feed.
+function latestClose(features: Record<string, { close?: number | null }> | null): number | null {
+  if (!features) return null;
+  const withClose = Object.entries(features).filter(([, v]) => typeof v?.close === "number");
+  if (withClose.length === 0) return null;
+  withClose.sort((a, b) => timeframeMinutes(a[0]) - timeframeMinutes(b[0]));
+  return withClose[0][1].close as number;
+}
+
 export default function TradesClient() {
   const mode = useMode();
   const [trades, setTrades] = useState<Trade[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [currentPrices, setCurrentPrices] = useState<Map<string, number>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
@@ -34,6 +60,47 @@ export default function TradesClient() {
       cancelled = true;
     };
   }, [mode]);
+
+  const openSymbols = useMemo(
+    () => Array.from(new Set((trades ?? []).filter((t) => t.status === "open").map((t) => t.symbol))).sort(),
+    [trades]
+  );
+  const openSymbolsKey = openSymbols.join(",");
+
+  useEffect(() => {
+    // Nothing to poll when no trade is open — stale entries from a since-
+    // closed symbol are harmless since the render below only reads this
+    // map for rows whose status is still "open".
+    if (openSymbols.length === 0) return;
+    let cancelled = false;
+
+    async function loadPrices() {
+      const { data } = await supabase
+        .from("opportunity_evaluations")
+        .select("symbol,timestamp,features")
+        .eq("mode", mode)
+        .in("symbol", openSymbols)
+        .order("timestamp", { ascending: false })
+        .limit(200);
+      if (cancelled || !data) return;
+
+      const bySymbol = new Map<string, number>();
+      for (const row of data) {
+        if (bySymbol.has(row.symbol)) continue; // rows are newest-first, keep the first hit per symbol
+        const close = latestClose(row.features);
+        if (close != null) bySymbol.set(row.symbol, close);
+      }
+      setCurrentPrices(bySymbol);
+    }
+
+    loadPrices();
+    const interval = setInterval(loadPrices, PRICE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- openSymbolsKey is the stable primitive form of openSymbols
+  }, [mode, openSymbolsKey]);
 
   return (
     <div className="space-y-6">
@@ -70,6 +137,7 @@ export default function TradesClient() {
                   "Entry",
                   "Stop-loss",
                   "Target",
+                  "Current",
                   "Exit",
                   "Bought for",
                   "Sold for",
@@ -110,6 +178,18 @@ export default function TradesClient() {
                   </td>
                   <td className="px-3 py-2.5 tabular-nums" style={{ color: STATUS.good }}>
                     {t.take_profit_price ?? "-"}
+                  </td>
+                  <td className="px-3 py-2.5 tabular-nums">
+                    {(() => {
+                      if (t.status !== "open") return "-";
+                      const current = currentPrices.get(t.symbol);
+                      if (current == null) return "-";
+                      return (
+                        <span style={{ color: current >= t.entry_price ? STATUS.good : STATUS.critical }}>
+                          {current}
+                        </span>
+                      );
+                    })()}
                   </td>
                   <td className="px-3 py-2.5 tabular-nums">{t.exit_price ?? "-"}</td>
                   <td className="px-3 py-2.5 tabular-nums whitespace-nowrap">
