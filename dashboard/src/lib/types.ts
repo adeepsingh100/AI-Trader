@@ -56,3 +56,44 @@ export interface ModelUsage {
   latency_ms: number;
   success: boolean;
 }
+
+export interface LearningStatistic {
+  dimension_type: string;
+  dimension_value: string;
+  expectancy: number | null;
+  trades_count: number;
+}
+
+export interface HoldEvaluation {
+  reason: string | null;
+  risk_manager_result: string | null;
+}
+
+export interface Recommendation {
+  category: string;
+  metric_name: string;
+  current_value: number | null;
+  recommended_value: number | null;
+  confidence: number | null;
+  sample_size: number;
+  rationale: string | null;
+  status: string;
+  created_at: string;
+}
+
+export interface StrategySimulation {
+  id: number;
+  created_at: string;
+  passed: boolean;
+  p_value: number | null;
+  research_note: string | null;
+}
+
+export interface AdaptiveStrategyVersion {
+  version_number: number;
+  status: string;
+  fitness_score: number | null;
+  notes: string | null;
+  created_at: string;
+  source_simulation_id: number | null;
+}

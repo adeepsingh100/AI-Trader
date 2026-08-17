@@ -29,7 +29,16 @@
       "Bash(python3 -m pytest tests/test_recommendations.py -q)",
       "Bash(python3 -m pytest tests/test_adaptive_strategy_engine.py -q)",
       "Bash(python3 -m pytest tests/test_reports.py -q)",
-      "Bash(python3 /private/tmp/claude-501/-Users-amandeepsingh-Desktop-AI-Trader/5fc59ebf-97ec-4273-a652-361f8e594e66/scratchpad/scientific_optimization_smoke_test.py)"
+      "Bash(python3 /private/tmp/claude-501/-Users-amandeepsingh-Desktop-AI-Trader/5fc59ebf-97ec-4273-a652-361f8e594e66/scratchpad/scientific_optimization_smoke_test.py)",
+      "Bash(lsof -i :3000 -sTCP:LISTEN -t)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:3000/learning?mode=paper)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" \"http://localhost:3000/learning?mode=paper\")",
+      "Bash(node -e \"require.resolve\\('playwright'\\)\")",
+      "Bash(npx --no-install playwright --version)",
+      "Bash(npm ls *)",
+      "Bash(npm init *)",
+      "Bash(npm install *)",
+      "Bash(npx playwright *)"
     ]
   }
 }
