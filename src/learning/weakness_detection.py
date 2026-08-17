@@ -8,7 +8,7 @@ statistics; it only ranks what's already stored."""
 
 from __future__ import annotations
 
-from src.config import RECOMMENDATION_MIN_SAMPLE_SIZE
+from src.config import LEARNING_STAGE_OBSERVATION_MIN_TRADES
 from src.db import models
 
 
@@ -22,10 +22,11 @@ def _summarize(row: dict) -> dict:
 
 def identify_weaknesses(mode: str) -> dict:
     """worst/best bucket per dimension_type (gated on
-    RECOMMENDATION_MIN_SAMPLE_SIZE, ranked by expectancy) plus worst/best
-    indicator by correlation magnitude — never fabricated from a thin
-    bucket, same "None below the sample floor" policy as everywhere else
-    in src/learning/."""
+    LEARNING_STAGE_OBSERVATION_MIN_TRADES — Progressive Learning Stages,
+    Stage 1 OBSERVATION's flagship output, ranked by expectancy) plus
+    worst/best indicator by correlation magnitude — never fabricated from a
+    thin bucket, same "None below the sample floor" policy as everywhere
+    else in src/learning/."""
     stats_rows = models.get_learning_statistics(mode)
     dimension_types = {r["dimension_type"] for r in stats_rows}
 
@@ -35,7 +36,7 @@ def identify_weaknesses(mode: str) -> dict:
             r
             for r in stats_rows
             if r["dimension_type"] == dimension_type
-            and (r.get("trades_count") or 0) >= RECOMMENDATION_MIN_SAMPLE_SIZE
+            and (r.get("trades_count") or 0) >= LEARNING_STAGE_OBSERVATION_MIN_TRADES
             and r.get("expectancy") is not None
         ]
         if not eligible:
@@ -49,7 +50,7 @@ def identify_weaknesses(mode: str) -> dict:
     indicators = [
         r
         for r in models.get_feature_importance(mode)
-        if r.get("timeframe") != "blended" and (r.get("sample_count") or 0) >= RECOMMENDATION_MIN_SAMPLE_SIZE
+        if r.get("timeframe") != "blended" and (r.get("sample_count") or 0) >= LEARNING_STAGE_OBSERVATION_MIN_TRADES
     ]
     worst_indicator = min(indicators, key=lambda r: r["correlation_score"], default=None)
     best_indicator = max(indicators, key=lambda r: r["correlation_score"], default=None)

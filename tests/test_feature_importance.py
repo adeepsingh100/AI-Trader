@@ -33,6 +33,7 @@ def test_pearson_correlation_none_on_zero_variance():
 
 
 @patch("src.learning.feature_importance.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.feature_importance.LEARNING_FEATURE_IMPORTANCE_MIN_TRADES", 2)
 @patch("src.learning.feature_importance.PRIMARY_TIMEFRAME", "1h")
 @patch("src.learning.feature_importance.models")
 def test_compute_feature_importance_defaults_to_primary_timeframe(mock_models):
@@ -55,6 +56,7 @@ def test_compute_feature_importance_defaults_to_primary_timeframe(mock_models):
 
 
 @patch("src.learning.feature_importance.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
+@patch("src.learning.feature_importance.LEARNING_FEATURE_IMPORTANCE_MIN_TRADES", 2)
 @patch("src.learning.feature_importance.models")
 def test_compute_feature_importance_multiple_timeframes_are_independent(mock_models):
     mock_models.get_recently_closed_trades.return_value = [
@@ -74,7 +76,7 @@ def test_compute_feature_importance_multiple_timeframes_are_independent(mock_mod
     assert mock_models.get_entry_evaluation_for_trade.call_count == 2
 
 
-@patch("src.learning.feature_importance.RECOMMENDATION_MIN_SAMPLE_SIZE", 20)
+@patch("src.learning.feature_importance.LEARNING_FEATURE_IMPORTANCE_MIN_TRADES", 20)
 @patch("src.learning.feature_importance.models")
 def test_compute_feature_importance_below_sample_size_returns_empty(mock_models):
     mock_models.get_recently_closed_trades.return_value = [{"id": 1, "pnl": 100}]

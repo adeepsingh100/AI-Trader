@@ -1,4 +1,4 @@
-import type { HoldEvaluation, LearningStatistic } from "@/lib/types";
+import type { HoldEvaluation, LearningStage, LearningStatistic, LearningStatus } from "@/lib/types";
 
 export interface RejectionCount {
   reason: string;
@@ -37,7 +37,7 @@ export interface WeaknessBucket {
 // and the indicator extremes aren't surfaced there either).
 export function worstBucketByDimension(
   rows: LearningStatistic[],
-  minSampleSize = 20
+  minSampleSize = 25
 ): Record<string, WeaknessBucket> {
   const byDimension = new Map<string, LearningStatistic[]>();
   for (const row of rows) {
@@ -57,4 +57,67 @@ export function worstBucketByDimension(
     };
   }
   return worst;
+}
+
+// Progressive Learning Stages boundaries — mirrors
+// LEARNING_STAGE_OBSERVATION/HYPOTHESIS/SIMULATION/VALIDATION_MIN_TRADES
+// (src/config.py) and src/learning/learning_status.py::compute_learning_status.
+const OBSERVATION_MIN_TRADES = 25;
+const HYPOTHESIS_MIN_TRADES = 100;
+const SIMULATION_MIN_TRADES = 250;
+const VALIDATION_MIN_TRADES = 500;
+
+const STAGE_ACTIVITY: Record<LearningStage, string> = {
+  BOOTSTRAP: "Collecting trade data, rejection reasons, and feature distributions only. No analysis yet.",
+  OBSERVATION: "Analyzing rejection reasons, feature distributions, and weakness patterns. No strategy changes yet.",
+  HYPOTHESIS: "Generating hypotheses (weight/threshold/exit-parameter recommendations) from observed weaknesses. No candidate strategies yet.",
+  SIMULATION: "Testing hypotheses via backtest and walk-forward simulation. Candidates are validated but not yet created.",
+  VALIDATION: "Full validation active — passing simulations create candidate strategies, pending human approval for promotion.",
+};
+
+function stageFor(tradesCollected: number): [LearningStage, LearningStage | null, number | null] {
+  if (tradesCollected < OBSERVATION_MIN_TRADES) return ["BOOTSTRAP", "OBSERVATION", OBSERVATION_MIN_TRADES];
+  if (tradesCollected < HYPOTHESIS_MIN_TRADES) return ["OBSERVATION", "HYPOTHESIS", HYPOTHESIS_MIN_TRADES];
+  if (tradesCollected < SIMULATION_MIN_TRADES) return ["HYPOTHESIS", "SIMULATION", SIMULATION_MIN_TRADES];
+  if (tradesCollected < VALIDATION_MIN_TRADES) return ["SIMULATION", "VALIDATION", VALIDATION_MIN_TRADES];
+  return ["VALIDATION", null, null];
+}
+
+// Mirrors src/learning/learning_status.py::compute_learning_status — same
+// stage boundaries, same field set, so the dashboard and the HTML report
+// never disagree about what stage a mode is in.
+export function computeLearningStage(
+  closedTrades: { pnl: number | null }[],
+  rejectedTrades: number,
+  recommendationsCount: number,
+  simulationsCount: number,
+  candidatesCount: number,
+  promotionEligible: boolean
+): LearningStatus {
+  const tradesCollected = closedTrades.length;
+  const winningTrades = closedTrades.filter((t) => (t.pnl ?? 0) > 0).length;
+  const losingTrades = tradesCollected - winningTrades;
+  const [stage, nextStage, nextMin] = stageFor(tradesCollected);
+  const tradesToNextStage = nextMin != null ? Math.max(0, nextMin - tradesCollected) : 0;
+  const reason =
+    nextStage == null
+      ? `Full validation stage reached (${tradesCollected} trades collected).`
+      : `${tradesToNextStage} more closed trade(s) needed to reach ${nextStage} (requires ${nextMin}).`;
+
+  return {
+    stage,
+    tradesCollected,
+    rejectedTrades,
+    winningTrades,
+    losingTrades,
+    dataSufficiencyPct: Math.min(100, (tradesCollected / VALIDATION_MIN_TRADES) * 100),
+    recommendationsCount,
+    simulationsCount,
+    candidatesCount,
+    promotionEligible,
+    nextStage,
+    tradesToNextStage,
+    currentActivity: STAGE_ACTIVITY[stage],
+    reason,
+  };
 }
