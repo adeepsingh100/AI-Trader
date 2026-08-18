@@ -1,8 +1,9 @@
 name: Trading cycle
 
 on:
-  schedule:
-    - cron: "2-59/5 * * * *"
+  # No `schedule:` trigger — GitHub Actions' own cron is unreliable below
+  # ~15min cadence (observed 40-57min gaps on a nominal 5min schedule).
+  # Triggered externally via workflow_dispatch on a real clock instead.
   workflow_dispatch:
 
 jobs:
