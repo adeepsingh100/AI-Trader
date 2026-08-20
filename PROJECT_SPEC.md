@@ -39,14 +39,23 @@ are binding unless the user says otherwise. Everything marked
   gap and orders can fail. Once triggered, no new positions open again
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
-  `strategy_versions.promoted_to_real = true`. Since the Scientific
-  Strategy Optimization Framework (§3e), this is a **human-approved**
-  flag, not an automatic one: `evolution_agent.py`'s nightly
-  `run_evolution()` sets `strategy_versions.promotion_eligible = true`
-  when the version clears every gate below, but never flips
-  `promoted_to_real` itself — a human reviews eligible rows in Supabase
-  and flips it themselves, closing what used to be the one place in this
-  codebase real money moved with zero human click. Gates, all
+  `strategy_versions.promoted_to_real = true`. `evolution_agent.py`'s
+  nightly `run_evolution()` sets `strategy_versions.promotion_eligible =
+  true` when the version clears every gate below, and — full automation,
+  reintroduced after the Scientific Strategy Optimization Framework
+  (§3e) made the gate itself rigorous — auto-flips `promoted_to_real` in
+  the same run via `models.promote_version()`. This is deliberately
+  different from the pre-§3e auto-promote it replaces: that one flipped
+  the flag off 3 raw thresholds with no statistical check at all (§3e);
+  this one only fires after all 5 gates below pass, including a bootstrap
+  CI on trade PnLs. `promote_version()` existed as a function for a while
+  with zero callers (a human was expected to invoke it by hand in
+  Supabase; nobody ever built the UI for it) before being wired in here.
+  A structural safety property survives regardless: promotion metrics are
+  scoped to `get_closed_trades(mode, version["id"])` — that specific
+  version's own trade history — so a freshly created version always
+  starts its own `PROMOTION_MIN_PAPER_DAYS` clock at zero and cannot
+  reach real money the same night it's created. Gates, all
   **configurable** (env vars, not a DB table — these change rarely and
   don't need versioning):
   - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
@@ -321,12 +330,20 @@ this is expected to be noisy until real trade history accumulates.
 
 Closes the loop from the Learning Engine's statistics into recommended
 parameter changes — walk-forward validated and simulated before a
-candidate is even created, then requiring explicit human approval before
-being treated as adopted. Two trust levels: everything that could change
-what the bot trades (weights, thresholds, avoid-symbol/avoid-regime)
-stays advisory, human-approved in Supabase, same as `recommendations`
-already worked before this. The one automatic piece is the confidence
-modifier chain, an extension of the already-automatic (and
+candidate is even created. Two trust levels, split by whether the
+candidate's target is a DB row or a deployment env var:
+**exit-params candidates** (`stop_loss_pct`/`take_profit_pct` — target
+`strategy_versions.params_json`, a DB row) **auto-activate** into a new
+`strategy_versions` row the moment they pass every statistical gate —
+`simulation.py::_activate_exit_params_candidate`. **Everything else**
+that could change what the bot trades (opportunity-scorer weights,
+thresholds, avoid-symbol/avoid-regime — these target `OPPORTUNITY_WEIGHT_*`-
+style `os.getenv()` constants in `config.py`, not a DB row) stays
+advisory, human-approved in Supabase, same as `recommendations` already
+worked before this — auto-applying those means rewriting deployment env
+vars and forcing a redeploy, a materially bigger change than a DB write,
+deliberately out of scope for now. The one other automatic piece is the
+confidence modifier chain, an extension of the already-automatic (and
 inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
 
 - **`feature_importance.py`** (extended): `compute_feature_importance`
@@ -704,9 +721,14 @@ Replaces the old "no trades → LLM guesses new prompt/params → auto-promote"
 loop with a research pipeline: Trade Memory → Performance Analysis →
 Weakness Detection → Hypothesis Generation → Candidate Strategy →
 Statistical Validation (walk-forward, bootstrap CI, optional backtest
-replay) → Promotion, all human-approved. Never modifies a strategy because
-trade count, confidence, or win rate alone moved — every change is backed
-by statistical evidence.
+replay) → Promotion. Never modifies a strategy because trade count,
+confidence, or win rate alone moved — every change is backed by
+statistical evidence. Originally shipped with every step past Statistical
+Validation gated on a human click (see the retirement note below); full
+automation of the exit-params-candidate → strategy_versions and
+promotion_eligible → promoted_to_real steps was reintroduced afterward —
+§2 and §3b above cover exactly what's automatic now and why it's a
+different, safer shape than what the retirement below describes.
 
 **The retirement**: `evolution_agent.py::propose_next_version` sent the LLM
 a bare `{current_prompt, current_params, metrics}` blob with an open-ended
@@ -1162,10 +1184,13 @@ strategy_simulations (
 -- adaptive_strategy_versions: versions QUANTITATIVE PARAMETERS (a
 -- params_json snapshot of tunable adaptive constants) — orthogonal to
 -- strategy_versions above, which versions LLM PROMPT TEXT. Created
--- lazily, only for simulations that pass. No separate "currently active"
--- table — `WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
--- answers that; auto-deploy is out of scope, a human still copies
--- approved values into env vars by hand.
+-- lazily, only for simulations that pass. Exit-params candidates
+-- auto-activate into a new strategy_versions row the same run
+-- (simulation.py::_activate_exit_params_candidate) — no separate
+-- "currently active" table needed there, get_latest_version() answers
+-- it. Weight/regime/symbol candidates still target env vars, not a DB
+-- row, so those stay advisory — a human still copies approved values
+-- into env vars by hand for those.
 adaptive_strategy_versions (
   id                             bigserial primary key,
   mode                           text not null,

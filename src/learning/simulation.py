@@ -185,11 +185,7 @@ def _create_candidate_version(
         params_json=params_json,
         source_recommendation_batch_id=batch_id,
         source_simulation_id=simulation_id,
-        notes=(
-            "Auto-generated candidate from a passing walk-forward simulation. "
-            "Not active — requires explicit human approval (status='approved') "
-            "before any manual promotion into live config."
-        ),
+        notes="Auto-generated candidate from a passing walk-forward simulation.",
         fitness_score=fitness_score,
     )
 
@@ -367,6 +363,39 @@ def simulate_threshold_recommendation(mode: str, status: LearningStatus | None =
     return simulation_row
 
 
+def _activate_exit_params_candidate(candidate: dict) -> dict | None:
+    """Auto-promotes an exit-params candidate straight into a new active
+    strategy_versions row — the only candidate type auto-activated today
+    (weight/regime/symbol candidates target OPPORTUNITY_WEIGHT_*-style env
+    vars, not a DB row, so there's no equivalent safe automated path for
+    those without a redeploy). Real money is unaffected by this step
+    alone: the new version only reaches real trading after independently
+    clearing evolution_agent.promotion_eligible() on ITS OWN paper trade
+    history — get_closed_trades(mode, version["id"]) scopes to the new
+    version's id, so its PROMOTION_MIN_PAPER_DAYS clock starts at zero."""
+    current = models.get_latest_version()
+    if current is None:
+        return None
+    current_params = current.get("params_json") or {}
+    merged_params = {**current_params, **candidate["params_json"]}
+    new_version = models.insert_strategy_version(
+        version_number=current["version_number"] + 1,
+        prompt_text=current["prompt_text"],
+        params_json=merged_params,
+        notes=(
+            f"Auto-activated from adaptive_strategy_versions candidate "
+            f"{candidate['id']} (fitness={candidate.get('fitness_score')})."
+        ),
+    )
+    models.log_agent_event(
+        "adaptive_strategy_engine",
+        "info",
+        f"AUTO-ACTIVATED strategy_versions id={new_version['id']} "
+        f"version_number={new_version['version_number']} from candidate {candidate['id']}",
+    )
+    return new_version
+
+
 def simulate_exit_params_recommendation(
     mode: str, symbol_to_pair: dict[str, str] | None = None, status: LearningStatus | None = None
 ) -> list[dict]:
@@ -502,10 +531,12 @@ def simulate_exit_params_recommendation(
 
         if candidate_created:
             fitness = compute_fitness_score(candidate_stats, capital_to_use)
-            _create_candidate_version(
+            candidate_row = _create_candidate_version(
                 mode, batch_id, simulation_row["id"], {param_name: candidate_value},
                 status=status, fitness_score=fitness["fitness_score"],
             )
+            if candidate_row is not None:
+                _activate_exit_params_candidate(candidate_row)
 
         results.append(simulation_row)
 

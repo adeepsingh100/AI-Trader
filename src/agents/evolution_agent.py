@@ -93,9 +93,14 @@ def promotion_eligible(version: dict, metrics: dict, trades: list[dict], fitness
 
 
 def run_evolution(mode: str = "paper") -> dict:
-    """Promotion-readiness monitor for the one live strategy_versions row —
-    no LLM call, no new version creation. Strategy evolution itself lives
-    entirely in adaptive_strategy_engine.py's candidate pipeline now."""
+    """Promotion monitor for the one live strategy_versions row — no LLM
+    call, no new version creation (that's adaptive_strategy_engine.py's
+    candidate pipeline). Newly clearing promotion_eligible()'s five gates
+    auto-flips promoted_to_real — no human click. Safe to automate
+    because the gates themselves (paper-days, cumulative PnL, drawdown,
+    bootstrap CI, fitness floor) are unchanged; trades are scoped to this
+    specific version's own history, so a freshly created version always
+    starts its own PROMOTION_MIN_PAPER_DAYS clock at zero regardless."""
     capital_config = models.get_capital_config(mode)
     if capital_config is None:
         raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
@@ -120,8 +125,12 @@ def run_evolution(mode: str = "paper") -> dict:
     eligible = mode == "paper" and not version["promoted_to_real"] and promotion_eligible(
         version, metrics, trades, fitness["fitness_score"]
     )
+    promoted = False
     if eligible != version.get("promotion_eligible"):
         models.set_strategy_version_promotion_eligible(version["id"], eligible)
+        if eligible:
+            models.promote_version(version["id"])
+            promoted = True
 
     learning_status = compute_learning_status(mode)
 
@@ -130,13 +139,15 @@ def run_evolution(mode: str = "paper") -> dict:
         "info",
         f"stage={learning_status.stage} trades_collected={learning_status.trades_collected} "
         f"evidence_readiness={learning_status.evidence_readiness_pct:.0f}% "
-        f"metrics={metrics} fitness_score={fitness['fitness_score']} promotion_eligible={eligible}",
+        f"metrics={metrics} fitness_score={fitness['fitness_score']} promotion_eligible={eligible}"
+        + (f" AUTO-PROMOTED version_id={version['id']} to real trading" if promoted else ""),
     )
 
     return {
         "metrics": metrics,
         "fitness": fitness,
         "promotion_eligible": eligible,
+        "promoted": promoted,
         "learning_status": learning_status,
     }
 
