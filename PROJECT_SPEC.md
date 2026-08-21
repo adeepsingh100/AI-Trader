@@ -39,14 +39,23 @@ are binding unless the user says otherwise. Everything marked
   gap and orders can fail. Once triggered, no new positions open again
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
-  `strategy_versions.promoted_to_real = true`. Since the Scientific
-  Strategy Optimization Framework (§3e), this is a **human-approved**
-  flag, not an automatic one: `evolution_agent.py`'s nightly
-  `run_evolution()` sets `strategy_versions.promotion_eligible = true`
-  when the version clears every gate below, but never flips
-  `promoted_to_real` itself — a human reviews eligible rows in Supabase
-  and flips it themselves, closing what used to be the one place in this
-  codebase real money moved with zero human click. Gates, all
+  `strategy_versions.promoted_to_real = true`. `evolution_agent.py`'s
+  hourly `run_evolution()` sets `strategy_versions.promotion_eligible =
+  true` when the version clears every gate below, and — full automation,
+  reintroduced after the Scientific Strategy Optimization Framework
+  (§3e) made the gate itself rigorous — auto-flips `promoted_to_real` in
+  the same run via `models.promote_version()`. This is deliberately
+  different from the pre-§3e auto-promote it replaces: that one flipped
+  the flag off 3 raw thresholds with no statistical check at all (§3e);
+  this one only fires after all 5 gates below pass, including a bootstrap
+  CI on trade PnLs. `promote_version()` existed as a function for a while
+  with zero callers (a human was expected to invoke it by hand in
+  Supabase; nobody ever built the UI for it) before being wired in here.
+  A structural safety property survives regardless: promotion metrics are
+  scoped to `get_closed_trades(mode, version["id"])` — that specific
+  version's own trade history — so a freshly created version always
+  starts its own `PROMOTION_MIN_PAPER_DAYS` clock at zero regardless of
+  how often `run_evolution()` re-checks it. Gates, all
   **configurable** (env vars, not a DB table — these change rarely and
   don't need versioning):
   - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
@@ -285,7 +294,7 @@ this is expected to be noisy until real trade history accumulates.
   path-independent catch-up entry point: finds closed trades without a
   `trade_evaluations` row yet (Python-side diff, not a DB join — no
   precedent for embedded Supabase queries in this codebase), regardless
-  of whether they closed via the SL/TP sweep, an LLM-validated exit, or a
+  of whether they closed via the SL/TP sweep, a score-drop exit, or a
   circuit-breaker flatten, self-evaluates each, and upserts every
   `learning_statistics` bucket (symbol / market_regime /
   opportunity_score_bucket / confidence_bucket / strategy_version /
@@ -296,10 +305,11 @@ this is expected to be noisy until real trade history accumulates.
   time-windowed pool of past entries with known outcomes, filtered by
   `SIMILARITY_MAX_DISTANCE` then requiring `MIN_SIMILAR_TRADES` survivors
   before returning a historical win rate at all.
-- **`confidence_calibration.py`**: `calibrate_confidence` blends the
-  LLM's own stated confidence (new `confidence` field in
-  `validate_opportunity`'s JSON contract) with the historical win rate,
-  configurable weights, collapsing to AI-only when history is thin.
+- **`confidence_calibration.py`**: `calibrate_confidence` blends a
+  quant confidence signal (the Opportunity Scorer's own `opportunity_score`
+  — there's no LLM in this path anymore, see §4) with the historical win
+  rate, configurable weights, collapsing to score-only when history is
+  thin.
 - **`feature_importance.py`**: point-biserial correlation (hand-rolled
   sums — `statistics.correlation` needs Python 3.10+, this repo's local
   dev interpreter is 3.9) between each raw Feature Engine value (primary
@@ -324,12 +334,20 @@ this is expected to be noisy until real trade history accumulates.
 
 Closes the loop from the Learning Engine's statistics into recommended
 parameter changes — walk-forward validated and simulated before a
-candidate is even created, then requiring explicit human approval before
-being treated as adopted. Two trust levels: everything that could change
-what the bot trades (weights, thresholds, avoid-symbol/avoid-regime)
-stays advisory, human-approved in Supabase, same as `recommendations`
-already worked before this. The one automatic piece is the confidence
-modifier chain, an extension of the already-automatic (and
+candidate is even created. Two trust levels, split by whether the
+candidate's target is a DB row or a deployment env var:
+**exit-params candidates** (`stop_loss_pct`/`take_profit_pct` — target
+`strategy_versions.params_json`, a DB row) **auto-activate** into a new
+`strategy_versions` row the moment they pass every statistical gate —
+`simulation.py::_activate_exit_params_candidate`. **Everything else**
+that could change what the bot trades (opportunity-scorer weights,
+thresholds, avoid-symbol/avoid-regime — these target `OPPORTUNITY_WEIGHT_*`-
+style `os.getenv()` constants in `config.py`, not a DB row) stays
+advisory, human-approved in Supabase, same as `recommendations` already
+worked before this — auto-applying those means rewriting deployment env
+vars and forcing a redeploy, a materially bigger change than a DB write,
+deliberately out of scope for now. The one other automatic piece is the
+confidence modifier chain, an extension of the already-automatic (and
 inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
 
 - **`feature_importance.py`** (extended): `compute_feature_importance`
@@ -705,9 +723,14 @@ Replaces the old "no trades → LLM guesses new prompt/params → auto-promote"
 loop with a research pipeline: Trade Memory → Performance Analysis →
 Weakness Detection → Hypothesis Generation → Candidate Strategy →
 Statistical Validation (walk-forward, bootstrap CI, optional backtest
-replay) → Promotion, all human-approved. Never modifies a strategy because
-trade count, confidence, or win rate alone moved — every change is backed
-by statistical evidence.
+replay) → Promotion. Never modifies a strategy because trade count,
+confidence, or win rate alone moved — every change is backed by
+statistical evidence. Originally shipped with every step past Statistical
+Validation gated on a human click (see the retirement note below); full
+automation of the exit-params-candidate → strategy_versions and
+promotion_eligible → promoted_to_real steps was reintroduced afterward —
+§2 and §3b above cover exactly what's automatic now and why it's a
+different, safer shape than what the retirement below describes.
 
 **The retirement**: `evolution_agent.py::propose_next_version` sent the LLM
 a bare `{current_prompt, current_params, metrics}` blob with an open-ended
