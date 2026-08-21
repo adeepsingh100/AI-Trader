@@ -47,6 +47,7 @@ from src.learning.feature_importance import compute_feature_importance
 from src.learning.recommendations import (
     generate_ai_exit_params_recommendations,
     generate_exit_params_recommendations,
+    generate_indicator_bucket_recommendations,
     generate_recommendations,
     generate_regime_recommendations,
     generate_symbol_recommendations,
@@ -103,6 +104,7 @@ class AdaptiveStrategyEngine:
         weight_recs = generate_weight_recommendations(mode, status=status)
         regime_recs = generate_regime_recommendations(mode, status=status)
         symbol_recs = generate_symbol_recommendations(mode, status=status)
+        indicator_recs = generate_indicator_bucket_recommendations(mode, status=status)
         threshold_recs = generate_recommendations(mode, weakness_context=weaknesses, status=status)
         exit_params_recs = generate_exit_params_recommendations(mode, status=status)
         ai_exit_params_recs = generate_ai_exit_params_recommendations(mode, status=status)
@@ -132,7 +134,8 @@ class AdaptiveStrategyEngine:
             f"stage={status.stage} trades_collected={status.trades_collected} "
             f"evidence_readiness={status.evidence_readiness_pct:.0f}% "
             f"weight_recs={len(weight_recs)} regime_recs={len(regime_recs)} "
-            f"symbol_recs={len(symbol_recs)} threshold_recs={len(threshold_recs)} "
+            f"symbol_recs={len(symbol_recs)} indicator_recs={len(indicator_recs)} "
+            f"threshold_recs={len(threshold_recs)} "
             f"exit_params_recs={len(exit_params_recs)} ai_exit_params_recs={len(ai_exit_params_recs)} "
             f"timeframe_feature_rows={len(timeframe_importance)} simulations={len(simulations)} "
             f"candidates_created={candidates_created} rejection_reasons={len(rejections)}",
@@ -145,6 +148,7 @@ class AdaptiveStrategyEngine:
             "weight_recommendations": weight_recs,
             "regime_recommendations": regime_recs,
             "symbol_recommendations": symbol_recs,
+            "indicator_bucket_recommendations": indicator_recs,
             "threshold_recommendations": threshold_recs,
             "exit_params_recommendations": exit_params_recs,
             "ai_exit_params_recommendations": ai_exit_params_recs,

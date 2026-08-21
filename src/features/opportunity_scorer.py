@@ -105,6 +105,19 @@ def _score_volatility_for_timeframe(f: dict) -> float | None:
 
 
 def _score_risk_for_timeframe(f: dict) -> float | None:
+    """Despite the "risk" name (kept for the DB column/OPPORTUNITY_WEIGHT_RISK
+    config/dashboard, which a rename would need a migration to touch),
+    this measures ONLY resistance headroom — room to run before the next
+    resistance level, not overall trade risk (stop distance, volatility,
+    liquidity, exposure, drawdown history). Those real risk factors are
+    each independently measured and gated elsewhere, not blended into this
+    sub-score: src.agents.risk_manager.compute_net_expectancy_pct (cost/
+    spread/liquidity risk), risk_manager.evaluate's stop_loss_pct cap
+    (stop-distance risk), src.portfolio.intelligence's concentration caps
+    (exposure risk), and the circuit breaker/drawdown promotion gate
+    (drawdown risk) — see PROJECT_SPEC.md §2/§3d. A single composite "risk"
+    number would just re-blend values that are already enforced more
+    precisely at their own control points."""
     distance = f["distance_from_resistance_pct"]
     if distance is None:
         return None

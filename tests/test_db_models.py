@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 from src.db import models
@@ -323,3 +324,47 @@ def test_get_trade_evaluation_ids_returns_set(monkeypatch):
     monkeypatch.setattr(models, "get_client", lambda: client)
 
     assert models.get_trade_evaluation_ids([1, 2, 3]) == {1, 3}
+
+
+# --- purge_old_data (Data Retention) ---
+
+
+def test_purge_old_data_deletes_rows_past_cutoff_per_table(monkeypatch):
+    tables = {
+        "opportunity_evaluations": _fluent_mock([{"id": 1}, {"id": 2}]),
+        "agent_logs": _fluent_mock([{"id": 5}]),
+    }
+    client = Mock(table=Mock(side_effect=lambda name: tables[name]))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    result = models.purge_old_data({"opportunity_evaluations": cutoff, "agent_logs": cutoff})
+
+    assert result == {"opportunity_evaluations": 2, "agent_logs": 1}
+    tables["opportunity_evaluations"].lt.assert_called_with("timestamp", cutoff.isoformat())
+    tables["agent_logs"].lt.assert_called_with("timestamp", cutoff.isoformat())
+    tables["opportunity_evaluations"].delete.assert_called_once()
+
+
+def test_purge_old_data_skips_tables_without_a_cutoff(monkeypatch):
+    calls = []
+
+    def _table(name):
+        calls.append(name)
+        return _fluent_mock([])
+
+    client = Mock(table=Mock(side_effect=_table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.purge_old_data({"agent_logs": datetime.now(timezone.utc)})
+
+    assert calls == ["agent_logs"]  # every other _RETENTION_TABLES entry skipped, no query at all
+    assert result == {"agent_logs": 0}
+
+
+def test_purge_old_data_empty_cutoffs_touches_nothing(monkeypatch):
+    client = Mock()
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    assert models.purge_old_data({}) == {}
+    client.table.assert_not_called()

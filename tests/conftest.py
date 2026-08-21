@@ -2,6 +2,7 @@ from unittest.mock import Mock
 
 _FLUENT_METHODS = (
     "select", "eq", "neq", "insert", "update", "upsert", "order", "limit", "in_", "gte", "lte",
+    "delete", "lt",
 )
 
 

@@ -106,6 +106,15 @@ RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE = float(
     os.getenv("RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE", "5.0")
 )
 
+# Evidence-only 5-way volatility bucket for learning_statistics
+# (dimension_type="atr_volatility_bucket", src/learning/statistics.py) —
+# very_low/extreme add 2 boundaries around the existing 3-way live-scoring
+# split (VOLATILITY_LOW_MAX_PCT/VOLATILITY_HIGH_MIN_PCT above, which stays
+# untouched for live opportunity scoring). Reporting/recommendations only,
+# never read by the live scorer.
+VOLATILITY_VERY_LOW_MAX_PCT = float(os.getenv("VOLATILITY_VERY_LOW_MAX_PCT", "0.2"))
+VOLATILITY_EXTREME_MIN_PCT = float(os.getenv("VOLATILITY_EXTREME_MIN_PCT", "10.0"))
+
 # Final opportunity_score = weighted blend of the 5 sub-scores. Scorer
 # renormalizes these to sum to 1.0 at call time, so a misconfigured sum
 # doesn't silently distort the 0-100 scale.
@@ -409,6 +418,35 @@ TRADING_FEE_PCT = float(os.getenv("TRADING_FEE_PCT", "0.5"))
 GST_PCT_ON_FEE = float(os.getenv("GST_PCT_ON_FEE", "18"))
 SELL_TDS_PCT = float(os.getenv("SELL_TDS_PCT", "1"))
 SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
+# Synthetic half-spread cost for the live Net Expectancy Gate
+# (risk_manager.compute_net_expectancy_pct) — live has no real order-book
+# data any more than backtest does (see BACKTEST_SPREAD_BPS's docstring),
+# so this mirrors that same documented approximation. Market impact isn't
+# modeled as a separate cost — no order-book depth data exists to model it
+# from, so it's treated as already covered by SLIPPAGE_BPS, same as every
+# other execution-cost estimate in this codebase.
+EXPECTANCY_SPREAD_BPS = float(os.getenv("EXPECTANCY_SPREAD_BPS", "10"))
+
+# --- Net Expectancy Gate + Risk-Based Sizing + ATR Stop Fallback -------------
+# src/agents/risk_manager.py. A candidate must clear opportunity_score AND
+# net expectancy (fees+GST+TDS+spread+slippage-aware) before it can trade —
+# net_expectancy_pct <= 0 is itself the "no trade" decision, not a bug.
+# Position sizing gets an ADDITIONAL cap derived from stop distance (never
+# grows size beyond what the existing flat/dynamic formula already allows,
+# only ever shrinks it). Stop-loss/take-profit stay primarily whatever the
+# evidence-validated strategy_versions.params_json says (unchanged, still
+# the walk-forward-gated learned value) — ATR-derived values are a FALLBACK
+# only for a leg params_json doesn't configure, closing the "no stop
+# configured = unbounded downside" gap statistics.py's _assess_risk already
+# flags, without overriding anything the learning pipeline has validated.
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+# Multiplier on atr_pct (already computed by the Feature Engine) to derive
+# a fallback stop/target distance. 1.5/3.0 gives a natural 1:2 risk/reward
+# baseline before anything's been learned. Reuses EXIT_PARAM_SWEEP_MIN_PCT/
+# MAX_PCT (below, Scientific Strategy Optimization section) as the sane
+# clamp bounds on the result — no separate min/max constants needed.
+STOP_LOSS_ATR_MULTIPLIER = float(os.getenv("STOP_LOSS_ATR_MULTIPLIER", "1.5"))
+TAKE_PROFIT_ATR_MULTIPLIER = float(os.getenv("TAKE_PROFIT_ATR_MULTIPLIER", "3.0"))
 
 # --- Execution Optimizer ----------------------------------------------------
 # src/execution_optimizer/optimizer.py. Real trades: recommendation is
@@ -483,6 +521,19 @@ CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECON
 # the chain, not a flat retry).
 LLM_MAX_RETRIES_PER_MODEL = int(os.getenv("LLM_MAX_RETRIES_PER_MODEL", "2"))
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0"))
+
+# --- Data Retention ------------------------------------------------------------
+# src/db/models.py::purge_old_data(), called hourly from evolution_agent.py's
+# already-scheduled run_evolution() (no new cron). Keeps the free-tier
+# Supabase disk from maxing out the way it did earlier (opportunity_evaluations
+# is written every scanned symbol every cycle — the highest-volume table by
+# far). learning_statistics/trades/strategy_versions/recommendations/etc.
+# stay permanent (small row counts or the actual ledger) — only the noisy,
+# never-queried-past-their-window log/eval tables get purged.
+# opportunity_evaluations/confidence_calibration reuse LEARNING_HISTORY_WINDOW_DAYS
+# (above) rather than a second constant, since nothing ever queries either
+# table beyond that window anyway.
+OPERATIONAL_LOG_RETENTION_DAYS = int(os.getenv("OPERATIONAL_LOG_RETENTION_DAYS", "30"))
 
 # --- Scientific Strategy Optimization ----------------------------------------
 # src/learning/fitness.py + recommendations.py/simulation.py's extended

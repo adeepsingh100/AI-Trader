@@ -244,3 +244,49 @@ def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_s
     assert result["promotion_eligible"] is False
     assert result["promoted"] is False
     mock_models.promote_version.assert_not_called()
+
+
+# --- data retention purge (piggybacked on this already-hourly step) ---
+
+
+@patch("src.learning.learning_status.compute_learning_status")
+@patch("src.agents.evolution_agent.OPERATIONAL_LOG_RETENTION_DAYS", 30)
+@patch("src.agents.evolution_agent.LEARNING_HISTORY_WINDOW_DAYS", 180)
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_purges_old_data_with_correct_cutoffs(mock_models, mock_learning_status):
+    mock_learning_status.return_value = _status("BOOTSTRAP", 3)
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_latest_version.return_value = _version(days_ago=1)
+    mock_models.get_closed_trades.return_value = []
+    mock_models.purge_old_data.return_value = {"opportunity_evaluations": 5, "agent_logs": 2}
+
+    run_evolution(mode="paper")
+
+    cutoffs = mock_models.purge_old_data.call_args[0][0]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    assert set(cutoffs) == {
+        "opportunity_evaluations", "confidence_calibration", "agent_logs",
+        "model_usage", "system_metrics", "data_quality_log",
+    }
+    # learning-relevant tables reuse LEARNING_HISTORY_WINDOW_DAYS (180d);
+    # pure operational logs use the shorter OPERATIONAL_LOG_RETENTION_DAYS (30d)
+    assert abs((now - cutoffs["opportunity_evaluations"]).days - 180) <= 1
+    assert abs((now - cutoffs["agent_logs"]).days - 30) <= 1
+    mock_models.log_agent_event.assert_any_call(
+        "evolution_agent", "info", "data retention purge: {'opportunity_evaluations': 5, 'agent_logs': 2}"
+    )
+
+
+@patch("src.learning.learning_status.compute_learning_status")
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_purge_failure_fails_open(mock_models, mock_learning_status):
+    # a purge error must never block the promotion-monitor result above it.
+    mock_learning_status.return_value = _status("BOOTSTRAP", 3)
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_latest_version.return_value = _version(days_ago=1)
+    mock_models.get_closed_trades.return_value = []
+    mock_models.purge_old_data.side_effect = RuntimeError("supabase unavailable")
+
+    result = run_evolution(mode="paper")
+
+    assert result["promotion_eligible"] is False

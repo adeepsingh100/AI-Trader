@@ -53,6 +53,12 @@ def generate_learning_report_html(mode: str) -> str:
       {_bucket_rows(_sorted_stats(mode, "symbol"))}
       <h3>Opportunity score ranges</h3>
       {_bucket_rows(sorted(_sorted_stats(mode, "opportunity_score_bucket"), key=lambda r: r["dimension_value"]))}
+      <h3>RSI ranges</h3>
+      {_bucket_rows(_sorted_stats(mode, "rsi_bucket"))}
+      <h3>Stochastic RSI ranges</h3>
+      {_bucket_rows(_sorted_stats(mode, "stoch_rsi_bucket"))}
+      <h3>Volatility (ATR%) ranges</h3>
+      {_bucket_rows(_sorted_stats(mode, "atr_volatility_bucket"))}
       <h3>Hour of day (IST)</h3>
       {_bucket_rows(_sorted_stats(mode, "hour"))}
       <h3>Weekday</h3>

@@ -138,7 +138,9 @@ def test_collect_learning_coverage_pct_from_dimension_types_present(mock_models)
 
     evidence = EvidenceEngine().collect("paper")
 
-    assert evidence["learning_coverage_pct"] == 25.0  # 2 of 8 tracked dimension types
+    # 2 of 11 tracked dimension types (8 original + rsi_bucket/
+    # stoch_rsi_bucket/atr_volatility_bucket)
+    assert evidence["learning_coverage_pct"] == pytest.approx(2 / 11 * 100)
 
 
 # --- compute_evidence_readiness ---

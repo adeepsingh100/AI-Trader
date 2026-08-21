@@ -123,7 +123,16 @@ and where an LLM is still used elsewhere, offline from this cycle).
   via fixed formulas over named config weights/thresholds
   (`OPPORTUNITY_WEIGHT_*`, `RSI_SCORE_FLOOR/CEIL`, `TIMEFRAME_WEIGHTS`,
   etc. — see `.env.example` for the full list), then a weighted
-  `opportunity_score` (0–100) from the 5 sub-scores.
+  `opportunity_score` (0–100) from the 5 sub-scores. The "risk" sub-score
+  is, despite the name, resistance headroom only (distance from the next
+  resistance level) — kept as-is (DB column/`OPPORTUNITY_WEIGHT_RISK`/
+  dashboard would need a migration to rename) but never treated as a
+  stand-in for actual trade risk. Real risk (execution cost/liquidity,
+  stop-distance, portfolio exposure, drawdown) is measured and gated
+  independently — Net Expectancy Gate, risk-based position sizing,
+  Portfolio Intelligence concentration caps, circuit breaker/promotion
+  drawdown gate respectively (see Trade decisions and Risk Manager Agent
+  below) — not blended into this one number.
 - Every aggregation step (timeframe components → a timeframe's
   sub-score, per-timeframe scores → the blended sub-score, sub-scores →
   the final score) goes through one shared weighted-average helper that
@@ -141,13 +150,44 @@ and where an LLM is still used elsewhere, offline from this cycle).
   forced-to-exit-if-held.
 
 ### Trade decisions — fully quant, zero LLM calls (`src/orchestrator.py`)
-- There is no validation gate between the Opportunity Scorer and a trade
-  anymore. Reaching `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or
-  dropping below `EXIT_SCORE_THRESHOLD` (exit) **is** the decision —
-  deterministic, no network call, no token budget, no parse failure ever
-  in the path that opens or closes a position. (The module that used to
-  sit here, `src/agents/signal_agent.py`, an LLM accept/reject gate, was
-  removed entirely — see §4 for why.)
+- There is no LLM validation gate between the Opportunity Scorer and a
+  trade. Reaching `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or
+  dropping below `EXIT_SCORE_THRESHOLD` (exit) is necessary but not
+  sufficient — an entry candidate must also clear the **Net Expectancy
+  Gate** (`risk_manager.compute_net_expectancy_pct`) before an order is
+  placed. Both gates are deterministic, no network call, no token budget,
+  no parse failure ever in the path that opens or closes a position. (The
+  module that used to sit here, `src/agents/signal_agent.py`, an LLM
+  accept/reject gate, was removed entirely — see §4 for why.)
+- **Net Expectancy Gate**: fees (`TRADING_FEE_PCT`+`GST_PCT_ON_FEE`, both
+  legs, via `src/agents/execution/paper.py::fees()` reused directly so
+  this is the exact fee the trade would actually pay) + TDS
+  (`SELL_TDS_PCT`, sell leg) + spread (`EXPECTANCY_SPREAD_BPS`) +
+  slippage (`SLIPPAGE_BPS`) netted against the resolved stop/target
+  (below) and the system's own calibrated win-probability estimate
+  (`calibrate_confidence`'s `final_confidence`, falling back to
+  `opportunity_score` when there's no historical blend yet — never a new
+  probability estimator). `net_expectancy_pct <= 0` is itself the "no
+  trade" decision — code is allowed to do nothing. Pure percentage-of-
+  notional math, no qty/entry_price needed, since every cost scales
+  linearly with notional.
+- **Stop-loss/take-profit resolution** (`risk_manager.resolve_exit_params`):
+  the active strategy version's evidence-validated `params_json.
+  stop_loss_pct`/`take_profit_pct` (already cleared the walk-forward/
+  bootstrap/fitness gate, §3b/§3e) wins when configured. A leg
+  `params_json` doesn't configure falls back to an ATR-derived value
+  (`atr_pct * STOP_LOSS_ATR_MULTIPLIER`/`TAKE_PROFIT_ATR_MULTIPLIER`,
+  clamped to `EXIT_PARAM_SWEEP_MIN_PCT`/`MAX_PCT`) — never both at once
+  for the same leg, and never overriding a configured value. Closes the
+  "no stop configured = unbounded downside" gap `statistics.py::
+  _assess_risk` already self-flags as `"too_aggressive"`.
+- **Risk-based position sizing**: `risk_manager.evaluate`'s existing flat/
+  dynamic capital-fraction qty gets one additional cap —
+  `(capital_to_use * RISK_PER_TRADE_PCT / 100) / (stop_loss_pct *
+  last_price)` — so no single trade risks more than `RISK_PER_TRADE_PCT`
+  of capital if its stop is hit. Strictly additive: `min()` with the
+  existing formula, so it can only shrink qty, never grow it past what
+  flat/dynamic sizing already allows.
 - The confidence that gates position sizing (`calibrate_confidence`,
   `MIN_FINAL_CONFIDENCE`) now blends the scorer's own `opportunity_score`
   with historical win-rate on similar past trades, instead of an LLM's
@@ -168,12 +208,17 @@ and where an LLM is still used elsewhere, offline from this cycle).
 - Enforces, in order: circuit-breaker state check → capital limit check
   → position sizing → daily target/loss bookkeeping.
 - Position sizing (resolved decision, §9): **fixed % of `capital_to_use`
-  per trade**, capped at `max_concurrent_positions` open positions
-  simultaneously. Both are new **configurable** columns on
+  per trade** (or the Capital Allocation Engine's dynamic multiplier,
+  §3d — `capital_config.sizing_mode`), capped at `max_concurrent_positions`
+  open positions simultaneously. Both are new **configurable** columns on
   `capital_config` (see §6): `position_size_pct` (default 10%),
   `max_concurrent_positions` (default 5). At the default settings, at
   most 50% of allocated capital is deployed at once — deliberate buffer,
-  not a hard requirement.
+  not a hard requirement. On top of that, whichever formula ran gets one
+  additional **risk-based cap** derived from stop distance
+  (`RISK_PER_TRADE_PCT` of capital per trade, evaluate()'s optional
+  `stop_loss_pct` kwarg) — `min()` with the existing qty, never a
+  replacement, so it can only shrink size, never grow it.
 - Owns the circuit-breaker: tracks realized PnL for the current IST
   trading day, flips `circuit_breaker_triggered` and instructs Execution
   Agent to flatten when `max_daily_loss` is breached.
@@ -184,9 +229,14 @@ and where an LLM is still used elsewhere, offline from this cycle).
   version's `params_json.stop_loss_pct`/`take_profit_pct` (decimal
   fraction of entry price, e.g. `0.02` = 2%) are enforced against every
   open trade's live ticker price every cycle — a hit closes the position
-  immediately, not deferred to any other check. Either key can be
-  omitted to leave that side unenforced. See `orchestrator.run_risk_check()`
-  and §5.
+  immediately, not deferred to any other check, and this live-recomputed
+  check retroactively protects already-open positions when `params_json`
+  changes. When a leg isn't configured in `params_json`, `exit_reason()`
+  falls back to that specific trade's own frozen-at-entry stored
+  `stop_loss_price`/`take_profit_price` (set at open time via
+  `resolve_exit_params`'s ATR fallback — see Trade decisions above) rather
+  than leaving that side unenforced — every position always has a defined
+  risk boundary. See `orchestrator.run_risk_check()` and §5.
   **Not a guarantee, same caveat as the circuit breaker above**: CoinDCX's
   spot API has no exchange-side stop order (confirmed against their docs —
   `market_order`/`limit_order` only; stop-limit/take-profit exist solely
@@ -260,20 +310,24 @@ and where an LLM is still used elsewhere, offline from this cycle).
   split into not-held/held, `select_top_candidates` picks the entry
   candidate set → **Pass 2**: for each scanned symbol, circuit-breaker
   check (same position as before every buy, preserved from the original
-  design) → entry candidates: `find_similar_trades` (§3a) first, its
-  result feeds both the Signal Agent's prompt and, after the LLM
-  responds, `calibrate_confidence` blends the LLM's own confidence with
-  the historical figure — a `MIN_FINAL_CONFIDENCE` gate (default 0,
-  permissive) sits alongside the existing Risk Manager check before
-  `place_order` → score-deteriorated held positions go straight to Signal
-  Agent exit validation (no similarity search on exits — the SL/TP sweep
-  and `EXIT_SCORE_THRESHOLD` already cover that path) → every symbol
-  reaching Pass 2 gets exactly one `opportunity_evaluations` row logged
-  regardless of outcome (most with `llm_decision = null` — the checkable
-  proof LLM call volume actually dropped), plus `trades` / `daily_pnl` /
-  `agent_logs` / `model_usage` as before → `process_closed_trades` (§3a)
-  runs once at the end, catching up self-evaluation/statistics for any
-  trade closed since the last pass, regardless of which path closed it.
+  design) → entry candidates: reaching this branch already means the
+  quant scorer accepted the candidate — `find_similar_trades` (§3a) feeds
+  `calibrate_confidence`, which blends `opportunity_score` with the
+  historical win-rate figure (no LLM confidence, no LLM call anywhere in
+  this path) behind the `MIN_FINAL_CONFIDENCE` gate (default 0,
+  permissive) → `resolve_exit_params` resolves the effective stop/target
+  → the **Net Expectancy Gate** (`compute_net_expectancy_pct`) must clear
+  before the Risk Manager's `evaluate()` (capital + risk-based-sizing +
+  concentration checks) and `place_order` → score-deteriorated held
+  positions close unconditionally on `EXIT_SCORE_THRESHOLD`, no
+  similarity search or extra validation (the SL/TP sweep already covers
+  that path) → every symbol reaching Pass 2 gets exactly one
+  `opportunity_evaluations` row logged regardless of outcome (`reason`
+  distinguishes `not_a_candidate`/`confidence gated`/`net_expectancy
+  gated`/a Risk Manager block/an actual fill), plus `trades` / `daily_pnl`
+  / `agent_logs` as before → `process_closed_trades` (§3a) runs once at
+  the end, catching up self-evaluation/statistics for any trade closed
+  since the last pass, regardless of which path closed it.
 
 ## 3a. Trade Memory + Learning Engine (`src/learning/`)
 
@@ -300,8 +354,19 @@ this is expected to be noisy until real trade history accumulates.
   circuit-breaker flatten, self-evaluates each, and upserts every
   `learning_statistics` bucket (symbol / market_regime /
   opportunity_score_bucket / confidence_bucket / strategy_version /
-  weekday / hour — IST-converted) it belongs to, bounded by
-  `LEARNING_HISTORY_WINDOW_DAYS`.
+  weekday / hour — IST-converted / exit_reason / rsi_bucket /
+  stoch_rsi_bucket / atr_volatility_bucket) it belongs to, bounded by
+  `LEARNING_HISTORY_WINDOW_DAYS`. The RSI/StochRSI/volatility buckets
+  (Phases 7-9 of the strategy-refinement audit) read the entry-time
+  indicator snapshot already stored on every `opportunity_evaluations`
+  row (`features` jsonb) — no new data collection. RSI/StochRSI share the
+  same fixed 0-100-scale edges (`<30, 30-40, ..., >80`); the volatility
+  bucket is a 5-way evidence-only split (very_low/low/medium/high/extreme)
+  distinct from the Feature Engine's 3-way live-scoring split, which is
+  untouched. `recommendations.py::generate_indicator_bucket_recommendations`
+  flags "avoid bucket X" via the same generic two-proportion z-test as the
+  existing regime/symbol "avoid" recommendations — advisory only, never
+  auto-applied, same `RECOMMENDATION_MIN_SAMPLE_SIZE` gate.
 - **`trade_memory.py`**: `find_similar_trades` — Euclidean distance over
   the 5 already-computed sub-scores (not raw candles) against a bounded,
   time-windowed pool of past entries with known outcomes, filtered by
@@ -714,6 +779,25 @@ remaining symbol in the cycle even though the cycle is otherwise safe to
 retry from a clean DB-read state; this is the actual root-cause fix for
 "crash recovery" in a stateless cron architecture, not new checkpointing
 infrastructure (there's no persistent daemon to checkpoint).
+
+**Data Retention** (`db/models.py::purge_old_data`): plain `DELETE ...
+WHERE <column> < cutoff` on the highest-write-volume, non-permanent
+tables — `opportunity_evaluations`/`confidence_calibration` (cutoff =
+`LEARNING_HISTORY_WINDOW_DAYS`, reused rather than a second constant,
+since nothing ever queries either table beyond that window anyway) and
+`agent_logs`/`model_usage`/`system_metrics`/`data_quality_log` (cutoff =
+the new `OPERATIONAL_LOG_RETENTION_DAYS`, default 30 — pure debug/ops
+logs, never read past recent history). `trades`/`strategy_versions`/
+`recommendations`/`adaptive_strategy_versions`/`strategy_simulations`/
+`learning_statistics`/`feature_importance`/`drift_alerts`/
+`strategy_health_scores`/`historical_candles` are never purged — the
+actual ledger, small-row-count decision history, compact rollups, or
+low-volume/valuable backtest data respectively. Runs every hour,
+piggybacked on `evolution_agent.run_evolution()` (already scheduled, no
+new cron) — fails open, a purge error never blocks the promotion-monitor
+logic it shares a step with. Exists because `opportunity_evaluations` is
+written every scanned symbol every cycle — the table that actually filled
+the free-tier Supabase disk once already.
 
 No new dependency of any kind — everything above is stdlib plus this
 repo's own existing modules, matching the zero-numpy/scipy discipline the

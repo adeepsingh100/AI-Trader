@@ -19,14 +19,19 @@ that same recommendations.py pipeline."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from src.agents.risk_manager import today_ist
 from src.config import (
+    LEARNING_HISTORY_WINDOW_DAYS,
+    OPERATIONAL_LOG_RETENTION_DAYS,
     PROMOTION_MAX_DRAWDOWN_PCT,
     PROMOTION_MIN_CUMULATIVE_PNL,
     PROMOTION_MIN_FITNESS_SCORE,
     PROMOTION_MIN_PAPER_DAYS,
 )
 from src.db import models
+from src.resilience import log_fail_open
 from src.utils import max_drawdown_pct, parse_timestamp
 
 # Local imports (inside run_evolution, not here) — src.learning.statistics
@@ -135,6 +140,29 @@ def run_evolution(mode: str = "paper") -> dict:
             promoted = True
 
     learning_status = compute_learning_status(mode)
+
+    # Data Retention (runs hourly, piggybacked on this already-scheduled
+    # step rather than a new cron job — see src/db/models.py::purge_old_data
+    # and src/config.py's Data Retention section). Fails open: a purge
+    # error must never block the promotion-monitor logic above it.
+    try:
+        now = datetime.now(timezone.utc)
+        learning_cutoff = now - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
+        operational_cutoff = now - timedelta(days=OPERATIONAL_LOG_RETENTION_DAYS)
+        purged = models.purge_old_data(
+            {
+                "opportunity_evaluations": learning_cutoff,
+                "confidence_calibration": learning_cutoff,
+                "agent_logs": operational_cutoff,
+                "model_usage": operational_cutoff,
+                "system_metrics": operational_cutoff,
+                "data_quality_log": operational_cutoff,
+            }
+        )
+        if any(purged.values()):
+            models.log_agent_event("evolution_agent", "info", f"data retention purge: {purged}")
+    except Exception as e:
+        log_fail_open("evolution_agent.purge_old_data", e)
 
     models.log_agent_event(
         "evolution_agent",

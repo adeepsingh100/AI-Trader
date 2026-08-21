@@ -1191,3 +1191,43 @@ def reset_circuit_breaker(component: str) -> None:
         {"component": component, "consecutive_failures": 0, "tripped_until": None},
         on_conflict="component",
     ).execute()
+
+
+# --- Data Retention ---
+# Keeps the free-tier Supabase disk from maxing out again the way it did
+# earlier — opportunity_evaluations is written every scanned symbol every
+# cycle, the highest-volume table by far. trades/strategy_versions/
+# recommendations/adaptive_strategy_versions/strategy_simulations/
+# learning_statistics/feature_importance/drift_alerts/
+# strategy_health_scores/historical_candles are deliberately NOT here: the
+# actual ledger, small-row-count decision history, compact rollups, or
+# low-volume/valuable backtest data respectively — see src/config.py's
+# Data Retention section.
+_RETENTION_TABLES = (
+    ("opportunity_evaluations", "timestamp"),
+    ("confidence_calibration", "created_at"),
+    ("agent_logs", "timestamp"),
+    ("model_usage", "timestamp"),
+    ("system_metrics", "recorded_at"),
+    ("data_quality_log", "created_at"),
+)
+
+
+def purge_old_data(cutoffs: dict[str, datetime]) -> dict[str, int]:
+    """Deletes rows older than `cutoffs[table]` for every table in
+    _RETENTION_TABLES a cutoff was supplied for (a table with no entry in
+    `cutoffs` is skipped, not purged with some default). Delete is
+    naturally idempotent (re-deleting an already-gone row is a no-op), so
+    this goes through _execute's retry like every other idempotent write
+    in this module. Returns {table: rows_deleted} for the caller to log —
+    the Supabase Python client's .delete() returns the deleted rows by
+    default (Prefer: return=representation), so the count is read straight
+    off that response with no separate count query."""
+    deleted: dict[str, int] = {}
+    for table, column in _RETENTION_TABLES:
+        cutoff = cutoffs.get(table)
+        if cutoff is None:
+            continue
+        res = _execute(get_client().table(table).delete().lt(column, cutoff.isoformat()))
+        deleted[table] = len(res.data or [])
+    return deleted
