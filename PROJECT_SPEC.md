@@ -48,17 +48,28 @@ are binding unless the user says otherwise. Everything marked
   `models.promote_version()`. Auto-promotion itself isn't new (it
   survived the original 3-raw-threshold version this replaced, §3e); what
   changed is the bar: sample-size floors (backtest/paper/walk-forward/
-  champion-challenger trade counts, not just elapsed days), risk/
+  TRUE paired-observation counts, not just elapsed days), risk/
   statistical/Monte-Carlo gates, regime/symbol robustness, an overfitting
   verdict, and a statistically significant, same-market-data improvement
   over the current real-mode champion — not 3-5 simple thresholds. The
-  champion-vs-challenger significance test itself is PAIRED (candidate-
-  minus-champion equity delta at matching backtest-replay snapshots, same
-  symbols/date range/decision-cycle grid, gated at
-  `PROMOTION_MIN_CONFIDENCE_PCT`) — "is the challenger better than the
-  champion", not "is the challenger profitable on its own". Missing
-  required evidence (e.g. no historical candles ingested yet for the
-  walk-forward/champion-challenger backtest-replay gates) always yields
+  champion-vs-challenger significance test itself is PAIRED and is the
+  ONLY test — no fallback to a weaker unpaired test ever exists: candidate-
+  minus-champion equity delta at matching backtest-replay snapshots,
+  matched by their shared decision-cycle identifier (`snapshot_time`, via
+  explicit intersection, never by list index/position), gated at
+  `PROMOTION_MIN_CONFIDENCE_PCT` against an explicitly-named
+  `bootstrap_probability_candidate_better_pct` statistic — "is the
+  challenger better than the champion", not "is the challenger profitable
+  on its own". `PROMOTION_MIN_PAIRED_OBSERVATIONS` gates the TRUE matched-
+  observation count (never `min(champion_trades, challenger_trades)` —
+  independent trade counts don't imply matched market observations). A
+  bot's first-ever promotion (no champion) marks the champion-comparison
+  gate AND the paired-observations sample gate both `NOT_APPLICABLE`
+  rather than leaving the sample gate permanently unresolved — otherwise
+  every first promotion would deadlock at `EXTEND_VALIDATION` forever
+  regardless of how clean every other gate looked. Missing required
+  evidence (e.g. no historical candles ingested yet for the walk-forward/
+  paired-observation backtest-replay gates) always yields
   `EXTEND_VALIDATION`, never a silent skip and never a promotion on
   partial evidence — see `promotion_gate.py`'s own module docstring for
   the full gate-by-gate breakdown and §3e for how it composes almost
@@ -958,7 +969,20 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   not candidate-alone profitability; `execution_quality` in the Promotion
   Score is real per-trade `entry_slippage_pct` data scored against
   `SLIPPAGE_BPS` (or `None` + reweighted among the rest), never a neutral
-  50 placeholder.
+  50 placeholder. Second hardening pass, closing the remaining loopholes:
+  the paired comparison is now the ONLY significance test (the unpaired
+  fallback for when it couldn't be computed is gone — missing paired
+  evidence is `EXTEND_VALIDATION`, never a substitute pass); observations
+  are matched by their shared `snapshot_time` identifier via explicit
+  intersection, never by list index; `PROMOTION_MIN_PAIRED_OBSERVATIONS`
+  gates the TRUE matched count (retires `PROMOTION_MIN_CHAMPION_
+  CHALLENGER_TRADES`'s `min(champion_trades, challenger_trades)` proxy);
+  the statistic is explicitly named `bootstrap_probability_candidate_
+  better_pct`; and a bot's first-ever promotion marks both the champion-
+  improvement gate and the paired-observations sample gate
+  `NOT_APPLICABLE` so it can still reach `PROMOTE` (previously the sample
+  gate stayed permanently unresolved with no champion to pair against,
+  deadlocking every first promotion at `EXTEND_VALIDATION`).
 - **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
   confidence/opportunity-score/risk/stop-loss/target accuracy percentages
   over `trade_evaluations`, which `_evaluate_trade` already tagged

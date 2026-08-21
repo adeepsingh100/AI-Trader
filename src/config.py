@@ -54,7 +54,12 @@ PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15")
 PROMOTION_MIN_BACKTEST_TRADES = int(os.getenv("PROMOTION_MIN_BACKTEST_TRADES", "1000"))
 PROMOTION_MIN_WALK_FORWARD_TRADES = int(os.getenv("PROMOTION_MIN_WALK_FORWARD_TRADES", "300"))
 PROMOTION_MIN_PAPER_TRADES = int(os.getenv("PROMOTION_MIN_PAPER_TRADES", "300"))
-PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES = int(os.getenv("PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", "200"))
+# TRUE paired-observation count (champion and challenger backtest-replay
+# snapshots matched by shared decision-cycle timestamp) — deliberately NOT
+# min(champion_trade_count, challenger_trade_count), which counts
+# independent trades that don't necessarily correspond to the same market
+# observation at all.
+PROMOTION_MIN_PAIRED_OBSERVATIONS = int(os.getenv("PROMOTION_MIN_PAIRED_OBSERVATIONS", "200"))
 
 # Monte Carlo promotion gate (Phase 14) — reuses
 # statistical_validation.monte_carlo_drawdown_distribution (drawdown-path

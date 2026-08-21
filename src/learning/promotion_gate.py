@@ -33,6 +33,29 @@ Hardening pass (audit findings, same 3-way decision, same full automation
 - execution_quality in the Promotion Score is real per-trade slippage data
   (or None + reweighted among the rest) — never a neutral 50 placeholder.
 
+Second hardening pass (closes remaining loopholes in the first pass):
+- The paired champion-vs-challenger comparison is now the ONLY
+  significance test — no fallback to the older unpaired win-rate/
+  expectancy z-test when a paired comparison can't be computed. Missing
+  paired evidence is missing evidence, full stop (EXTEND_VALIDATION).
+- Observations are paired by their shared decision-cycle identifier
+  (backtest-replay snapshot_time — see PortfolioManager.snapshot), never
+  by list index/position. A length or ordering mismatch between the two
+  snapshot lists must never silently mispair an observation.
+- PROMOTION_MIN_PAIRED_OBSERVATIONS gates the TRUE matched-observation
+  count, replacing the old min(champion_trades, challenger_trades) proxy
+  (PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES, retired — independent trade
+  counts don't imply matched market observations at all).
+- The statistic is explicitly named bootstrap_probability_candidate_
+  better_pct (fraction of bootstrap resamples of the paired candidate-
+  minus-champion diffs whose sum is positive) — never a generic
+  "confidence" label.
+- A bot's first-ever promotion (no champion) marks BOTH the champion-
+  improvement gate AND the paired-observations sample gate NOT_APPLICABLE
+  — previously the sample gate stayed permanently None with no champion
+  to pair against, deadlocking every first promotion at EXTEND_VALIDATION
+  regardless of how good every other gate looked.
+
 Two gate categories, deliberately never conflated:
 - "extend-only" gates (sample sizes): a definite below-floor count is
   EXTEND_VALIDATION, never REJECT — "not enough evidence yet" is not the
@@ -55,6 +78,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from statistics import median
 
 from src.agents.evolution_agent import compute_metrics, promotion_ready
 from src.backtest.overfitting_detection import OverfittingReport, detect as detect_overfitting
@@ -75,10 +99,10 @@ from src.config import (
     PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT,
     PROMOTION_MC_MIN_PROFITABLE_PCT,
     PROMOTION_MIN_BACKTEST_TRADES,
-    PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES,
     PROMOTION_MIN_CONFIDENCE_PCT,
     PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT,
     PROMOTION_MIN_FITNESS_SCORE,
+    PROMOTION_MIN_PAIRED_OBSERVATIONS,
     PROMOTION_MIN_PAPER_TRADES,
     PROMOTION_MIN_PROFITABLE_SYMBOLS,
     PROMOTION_MIN_SCORE,
@@ -102,7 +126,7 @@ from src.learning.statistics import compute_bucket_statistics
 from src.utils import clamp
 from src.utils import parse_timestamp as _parse_ts
 
-_EXTEND_ONLY_GATES = ("paper_trades", "backtest_trades", "walk_forward_trades", "champion_challenger_trades")
+_EXTEND_ONLY_GATES = ("paper_trades", "backtest_trades", "walk_forward_trades", "paired_observations")
 _REJECT_CAPABLE_GATES = (
     "paper_days_pnl_drawdown", "bootstrap_ci", "fitness_floor", "monte_carlo",
     "regime_robustness", "symbol_robustness", "overfitting", "champion_improvement",
@@ -169,28 +193,45 @@ def _bootstrap_probability_of_profit(
 
 
 def _paired_champion_comparison(champion_result: dict, candidate_result: dict) -> dict | None:
-    """Issue 3's primary significance test: candidate MINUS champion, not
-    candidate-alone profitability. Both backtest engines replay the
-    identical symbols/date-range/decision-cycle grid, so snapshot i is the
-    same wall-clock instant in both runs — period-over-period equity
-    deltas are therefore genuinely paired, not two independent samples.
-    Reuses _bootstrap_probability_of_profit's resampling (built for the
-    Monte Carlo risk gate below) against the paired diff series instead of
-    raw pnls — "is this positive" is the same question either way."""
-    champ_eq = [s["equity"] for s in champion_result["snapshots"]]
-    cand_eq = [s["equity"] for s in candidate_result["snapshots"]]
-    n = min(len(champ_eq), len(cand_eq))
-    if n < 3:
+    """THE primary champion-vs-challenger significance test — candidate
+    MINUS champion, not candidate-alone profitability, and the only one:
+    no unpaired fallback exists anywhere downstream of this function.
+
+    Observations are paired by their shared decision-cycle identifier —
+    each backtest-replay snapshot's `snapshot_time` (BacktestEngine.run()
+    fires it off `self.clock`'s deterministic tick grid, identical for
+    both engines since both replay the same symbols/date range/decision-
+    cycle cadence, only params_json differs) — matched by explicit
+    identifier equality via dict-key intersection, NEVER by list index. A
+    length or ordering mismatch between the two snapshot lists (e.g. one
+    run circuit-breaking out earlier) must never silently mispair an
+    observation the way a blind zip(a, b) would.
+
+    paired_observation_count is the count of matched (champion, challenger)
+    snapshot pairs itself — the number actually compared against
+    PROMOTION_MIN_PAIRED_OBSERVATIONS — not the one-fewer count of period-
+    over-period diffs the bootstrap consumes internally. Reuses
+    _bootstrap_probability_of_profit's resampling (built for the Monte
+    Carlo risk gate below) against those diffs — "is this positive" is the
+    same question either way."""
+    champ_by_time = {s["snapshot_time"]: s["equity"] for s in champion_result["snapshots"]}
+    cand_by_time = {s["snapshot_time"]: s["equity"] for s in candidate_result["snapshots"]}
+    shared_times = sorted(set(champ_by_time) & set(cand_by_time))
+    paired_observation_count = len(shared_times)
+    if paired_observation_count < 3:  # need >= 2 diffs for the bootstrap below to mean anything
         return None
-    diffs = [(cand_eq[i] - cand_eq[i - 1]) - (champ_eq[i] - champ_eq[i - 1]) for i in range(1, n)]
-    confidence_pct = _bootstrap_probability_of_profit(diffs)
-    if confidence_pct is None:
+    champ_eq = [champ_by_time[t] for t in shared_times]
+    cand_eq = [cand_by_time[t] for t in shared_times]
+    diffs = [(cand_eq[i] - cand_eq[i - 1]) - (champ_eq[i] - champ_eq[i - 1]) for i in range(1, paired_observation_count)]
+    bootstrap_probability_candidate_better_pct = _bootstrap_probability_of_profit(diffs)
+    if bootstrap_probability_candidate_better_pct is None:
         return None
     return {
-        "mean_diff_per_period": sum(diffs) / len(diffs),
-        "statistical_confidence_pct": confidence_pct,
-        "significant": confidence_pct >= PROMOTION_MIN_CONFIDENCE_PCT,
-        "sample_size": len(diffs),
+        "paired_observation_count": paired_observation_count,
+        "mean_difference": sum(diffs) / len(diffs),
+        "median_difference": median(diffs),
+        "bootstrap_probability_candidate_better_pct": bootstrap_probability_candidate_better_pct,
+        "significant": bootstrap_probability_candidate_better_pct >= PROMOTION_MIN_CONFIDENCE_PCT,
     }
 
 
@@ -210,7 +251,8 @@ def _sample_size_gates(
     paper_count: int,
     backtest_count: int | None,
     walk_forward_count: int | None,
-    champion_challenger_count: int | None,
+    paired_observation_count: int | None,
+    champion_present: bool,
 ) -> dict:
     gates = {
         "paper_trades": {
@@ -220,7 +262,7 @@ def _sample_size_gates(
         }
     }
     # Issue 1: the actual backtest trade count (BacktestEngine's own
-    # closed_trades, never paper/walk-forward/champion-challenger counts
+    # closed_trades, never paper/walk-forward/paired-observation counts
     # substituted in) must independently clear PROMOTION_MIN_BACKTEST_TRADES
     # — previously imported/configured but never enforced.
     if backtest_count is None:
@@ -239,13 +281,24 @@ def _sample_size_gates(
             "count": walk_forward_count,
             "minimum": PROMOTION_MIN_WALK_FORWARD_TRADES,
         }
-    if champion_challenger_count is None:
-        gates["champion_challenger_trades"] = {"passed": None, "detail": "champion comparison not available"}
+    if not champion_present:
+        # Fix 3: nothing to pair against on a bot's first-ever promotion —
+        # NOT_APPLICABLE, never a perpetual EXTEND_VALIDATION deadlock.
+        gates["paired_observations"] = {
+            "passed": True,
+            "status": "NOT_APPLICABLE",
+            "detail": "no current champion — nothing to pair against (first-ever promotion)",
+        }
+    elif paired_observation_count is None:
+        gates["paired_observations"] = {
+            "passed": None,
+            "detail": "paired champion-challenger comparison not available (no historical data)",
+        }
     else:
-        gates["champion_challenger_trades"] = {
-            "passed": champion_challenger_count >= PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES,
-            "count": champion_challenger_count,
-            "minimum": PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES,
+        gates["paired_observations"] = {
+            "passed": paired_observation_count >= PROMOTION_MIN_PAIRED_OBSERVATIONS,
+            "count": paired_observation_count,
+            "minimum": PROMOTION_MIN_PAIRED_OBSERVATIONS,
         }
     return gates
 
@@ -363,7 +416,7 @@ def _backtest_evidence(candidate: dict, champion: dict | None, candidate_trades:
         "walk_forward_trades_count": None,
         "overfitting_report": None,
         "champion_challenger": None,
-        "champion_challenger_trades_count": None,
+        "paired_observation_count": None,
     }
     closed = [t for t in candidate_trades if t.get("closed_at")]
     if not closed or not symbol_to_pair:
@@ -402,17 +455,19 @@ def _backtest_evidence(candidate: dict, champion: dict | None, candidate_trades:
         champion_metrics = analyze(
             champion_result["closed_trades"], champion_result["snapshots"], champion_engine.portfolio.starting_capital
         )
+        paired_comparison = _paired_champion_comparison(champion_result, candidate_result)
         result["champion_challenger"] = {
             "comparison": compare_strategies(
                 champion_result["closed_trades"], candidate_result["closed_trades"], champion_metrics, candidate_metrics
             ),
-            "paired_comparison": _paired_champion_comparison(champion_result, candidate_result),
+            "paired_comparison": paired_comparison,
             "candidate_metrics": candidate_metrics,
             "champion_metrics": champion_metrics,
         }
-        result["champion_challenger_trades_count"] = min(
-            len(champion_result["closed_trades"]), len(candidate_result["closed_trades"])
-        )
+        # Fix 2: the TRUE matched-observation count, not
+        # min(champion_trades, candidate_trades) — independent trade
+        # counts don't imply matched market observations at all.
+        result["paired_observation_count"] = paired_comparison["paired_observation_count"] if paired_comparison else None
 
     return result
 
@@ -425,24 +480,34 @@ def _pct_improvement(old: float | None, new: float | None) -> float | None:
 
 def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -> dict:
     if champion is None:
-        # Issue 5: first-ever promotion has nothing to beat — vacuously
+        # Fix 3: first-ever promotion has nothing to beat — vacuously
         # passes this ONE gate, every other gate (sample sizes, risk,
         # regime/symbol robustness, overfitting) still runs independently.
         return {
             "passed": True,
             "status": "NOT_APPLICABLE",
+            "result": "NOT_APPLICABLE",
             "detail": "no current champion — vacuously passes (first-ever promotion)",
         }
 
     cc = backtest_evidence.get("champion_challenger")
     if cc is None:
-        return {"passed": None, "detail": "champion-challenger comparison not available (no historical data)"}
+        return {
+            "passed": None,
+            "status": "UNAVAILABLE",
+            "detail": "champion-challenger comparison not available (no historical data)",
+        }
 
-    comparison = cc["comparison"]
+    comparison = cc["comparison"]  # informational only — see Fix 1, never drives `passed`
     cand, champ = cc["candidate_metrics"], cc["champion_metrics"]
     expectancy_improvement_pct = _pct_improvement(champ.get("expectancy"), cand.get("expectancy"))
     if expectancy_improvement_pct is None:
-        return {"passed": None, "detail": "expectancy improvement not computable yet", "comparison": comparison}
+        return {
+            "passed": None,
+            "status": "UNAVAILABLE",
+            "detail": "expectancy improvement not computable yet",
+            "comparison": comparison,
+        }
 
     sharpe_improvement_pct = _pct_improvement(champ.get("sharpe_ratio"), cand.get("sharpe_ratio"))
     if sharpe_improvement_pct is None:
@@ -451,44 +516,55 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
         # let a null silently clear this gate, which is exactly backwards.
         return {
             "passed": None,
+            "status": "UNAVAILABLE",
             "detail": "Insufficient Sharpe evidence",
             "expectancy_improvement_pct": expectancy_improvement_pct,
             "comparison": comparison,
         }
 
     sortino_improvement_pct = _pct_improvement(champ.get("sortino_ratio"), cand.get("sortino_ratio"))
-    profit_factor_change = None
-    if champ.get("profit_factor") is not None and cand.get("profit_factor") is not None:
-        profit_factor_change = cand["profit_factor"] - champ["profit_factor"]
+    profit_factor_change_pct = _pct_improvement(champ.get("profit_factor"), cand.get("profit_factor"))
     drawdown_increase_pct = (cand.get("max_drawdown_pct") or 0) - (champ.get("max_drawdown_pct") or 0)
 
-    # Issue 3: the primary significance test is candidate MINUS champion,
-    # paired at matching backtest-replay snapshots (same symbols/date
-    # range/decision-cycle grid) — not "is the candidate profitable on its
-    # own". Falls back to the older unpaired win-rate/expectancy z-test
-    # only when the paired series couldn't be computed (e.g. fewer than 3
-    # aligned snapshots) — still real evidence, just weaker.
+    # Fix 1: the paired comparison is the ONLY significance test — no
+    # fallback to the older unpaired win-rate/expectancy z-test
+    # (`comparison`, still carried above for the audit record only) when
+    # the paired series can't be computed. Missing paired evidence is
+    # missing evidence, never a substitute pass and never inferred.
     paired = cc.get("paired_comparison")
-    if paired is not None:
-        significant = paired["significant"]
-        statistical_confidence_pct = paired["statistical_confidence_pct"]
-    else:
-        significant = comparison.get("winner") == "b"  # "b" = candidate, the 2nd trade set passed to compare()
-        statistical_confidence_pct = None
+    if paired is None:
+        return {
+            "passed": None,
+            "status": "UNAVAILABLE",
+            "detail": "paired champion-challenger comparison not available (insufficient matched observations)",
+            "expectancy_improvement_pct": expectancy_improvement_pct,
+            "sharpe_improvement_pct": sharpe_improvement_pct,
+            "sortino_improvement_pct": sortino_improvement_pct,
+            "profit_factor_change_pct": profit_factor_change_pct,
+            "drawdown_increase_pct": drawdown_increase_pct,
+            "comparison": comparison,
+        }
 
+    significant = paired["significant"]
     meets_minimums = (
         expectancy_improvement_pct >= PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT
         and sharpe_improvement_pct >= PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT
         and drawdown_increase_pct <= PROMOTION_MAX_DRAWDOWN_INCREASE_PCT
     )
+    passed = significant and meets_minimums
     return {
-        "passed": significant and meets_minimums,
+        "passed": passed,
+        "status": "AVAILABLE",
+        "result": "candidate_significantly_better" if significant else "not_significant",
         "significant": significant,
-        "statistical_confidence_pct": statistical_confidence_pct,
+        "paired_observation_count": paired["paired_observation_count"],
+        "mean_difference": paired["mean_difference"],
+        "median_difference": paired["median_difference"],
+        "bootstrap_probability_candidate_better_pct": paired["bootstrap_probability_candidate_better_pct"],
         "sharpe_improvement_pct": sharpe_improvement_pct,
         "sortino_improvement_pct": sortino_improvement_pct,
         "expectancy_improvement_pct": expectancy_improvement_pct,
-        "profit_factor_change": profit_factor_change,
+        "profit_factor_change_pct": profit_factor_change_pct,
         "drawdown_increase_pct": drawdown_increase_pct,
         "candidate_metrics": cand,
         "champion_metrics": champ,
@@ -618,7 +694,8 @@ def evaluate_promotion(
         len(closed_trades),
         backtest_evidence["backtest_trades_count"],
         backtest_evidence["walk_forward_trades_count"],
-        backtest_evidence["champion_challenger_trades_count"],
+        backtest_evidence["paired_observation_count"],
+        champion is not None,
     ))
     gates.update(_risk_gates(candidate, metrics, closed_trades, fitness_score, capital_to_use))
 
@@ -674,29 +751,34 @@ def evaluate_promotion(
 
     summary = {
         "candidate_id": candidate.get("id"),
-        "version_number": candidate.get("version_number"),
+        "version": candidate.get("version_number"),
         "champion_id": champion.get("id") if champion else None,
-        "champion_version_number": champion.get("version_number") if champion else None,
-        "backtest_trades": backtest_evidence["backtest_trades_count"],
-        "walk_forward_trades": backtest_evidence["walk_forward_trades_count"],
-        "paper_trades": len(closed_trades),
-        "champion_challenger_trades": backtest_evidence["champion_challenger_trades_count"],
+        "champion_version": champion.get("version_number") if champion else None,
+        "backtest_trade_count": backtest_evidence["backtest_trades_count"],
+        "walkforward_trade_count": backtest_evidence["walk_forward_trades_count"],
+        "paper_trade_count": len(closed_trades),
+        "paired_observation_count": backtest_evidence["paired_observation_count"],
+        "champion_comparison_status": champion_gate.get("status"),
+        "champion_comparison_result": champion_gate.get("result"),
+        "mean_difference": champion_gate.get("mean_difference"),
+        "median_difference": champion_gate.get("median_difference"),
+        "bootstrap_probability_candidate_better_pct": champion_gate.get("bootstrap_probability_candidate_better_pct"),
         "sharpe_improvement_pct": champion_gate.get("sharpe_improvement_pct"),
         "sortino_improvement_pct": champion_gate.get("sortino_improvement_pct"),
         "expectancy_improvement_pct": champion_gate.get("expectancy_improvement_pct"),
         "drawdown_change_pct": champion_gate.get("drawdown_increase_pct"),
-        "profit_factor_change": champion_gate.get("profit_factor_change"),
-        "statistical_confidence_pct": champion_gate.get("statistical_confidence_pct"),
-        "regime_robustness_passed": gates["regime_robustness"]["passed"],
-        "symbol_robustness_passed": gates["symbol_robustness"]["passed"],
+        "profit_factor_change_pct": champion_gate.get("profit_factor_change_pct"),
         "execution_quality": score_components.get("execution_quality"),
+        "regime_robustness": gates["regime_robustness"]["passed"],
+        "symbol_robustness": gates["symbol_robustness"]["passed"],
         "overfitting_status": overfitting_report.verdict if overfitting_report is not None else None,
         "risk_status": risk_status,
         "promotion_score": score,
-        "decision": decision,
-        "promotion_reason": "; ".join(reasons),
+        "passed_gates": [n for n, g in gates.items() if g.get("passed") is True],
         "failed_gates": [n for n, g in gates.items() if g.get("passed") is False],
         "missing_gates": [n for n, g in gates.items() if g.get("passed") is None],
+        "promotion_status": decision,
+        "promotion_reason": "; ".join(reasons),
     }
 
     breakdown = {
