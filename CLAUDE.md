@@ -20,7 +20,7 @@ Vercel) that reads the same Supabase DB read-only.
 
 ```bash
 pip install -r requirements.txt          # deps
-pytest                                   # full suite (272 tests, ~1s, all mocked — no network/DB)
+pytest                                   # full suite (589 tests, ~1s, all mocked — no network/DB)
 pytest tests/test_orchestrator.py        # one file
 pytest tests/test_orchestrator.py::test_name  # one test
 python3 -m py_compile $(find src -name "*.py")  # syntax-check whole src tree
@@ -46,22 +46,23 @@ npm run lint    # eslint
 
 ### Pipeline (`src/orchestrator.py::run_cycle`)
 
-Quant-first, LLM-gated, two-pass per cycle:
+Fully quant, zero LLM calls anywhere in this cycle:
 
 1. **Data Agent** (`src/agents/data_agent.py`) — pulls candles from CoinDCX for `FEATURE_TIMEFRAMES`.
 2. **Feature Engine** (`src/features/feature_engine.py`) — pure indicator math (RSI, MACD, StochRSI, ATR, Bollinger, OBV, ADX, EMAs, support/resistance), no LLM.
-3. **Opportunity Scorer** (`src/features/opportunity_scorer.py`) — deterministic weighted blend of 5 sub-scores (trend/momentum/volume/volatility/risk, `OPPORTUNITY_WEIGHT_*` in config) into one 0-100 score per symbol; also classifies market regime. `weighted_average()` is the public entry point other modules reuse. Only the `TOP_N_CANDIDATES` above `MIN_OPPORTUNITY_SCORE` go to the LLM at all — this is the cost/rate-limit control.
-4. **Signal Agent** (`src/agents/signal_agent.py`) — LLM (Groq default, Ollama Cloud alternative, model-chain fallback) validates/rejects the quant candidates and returns structured reasoning; never invents candidates itself.
-5. **Risk Manager** (`src/agents/risk_manager.py`) — position sizing, stop-loss/take-profit, circuit breaker, daily loss limits. Pure Python, no LLM.
-6. **Execution Agent** (`src/agents/execution/`) — `ExecutionAgent` ABC, `PaperExecutionAgent` (simulated fills) and `RealExecutionAgent` (live CoinDCX orders — wired in but its order-placement path is unverified against a live fill; stays inert until a strategy version clears the promotion bar in PROJECT_SPEC.md §2).
+3. **Opportunity Scorer** (`src/features/opportunity_scorer.py`) — deterministic weighted blend of 5 sub-scores (trend/momentum/volume/volatility/risk, `OPPORTUNITY_WEIGHT_*` in config) into one 0-100 score per symbol; also classifies market regime. `weighted_average()` is the public entry point other modules reuse. Clearing `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or dropping below `EXIT_SCORE_THRESHOLD` (exit) **is** the trade decision — there is no separate validation step asking anything for a second opinion (the module that used to sit here, `src/agents/signal_agent.py`, an LLM accept/reject gate, was removed entirely after a real incident where its provider's rate limit caused a multi-day trading outage — see below).
+4. **Risk Manager** (`src/agents/risk_manager.py`) — position sizing, stop-loss/take-profit, circuit breaker, daily loss limits. Pure Python, no LLM.
+5. **Execution Agent** (`src/agents/execution/`) — `ExecutionAgent` ABC, `PaperExecutionAgent` (simulated fills) and `RealExecutionAgent` (live CoinDCX orders — wired in but its order-placement path is unverified against a live fill; stays inert until a strategy version clears the promotion bar in PROJECT_SPEC.md §2).
+
+An LLM (Groq, auto-falling back to Gemini — no provider-select switch, see `src/groq_client.py`) is still used, but only **hourly**, inside `AdaptiveStrategyEngine.analyze()` (`src/learning/recommendations.py::generate_ai_exit_params_recommendations`), offline from live trading entirely: it proposes a `stop_loss_pct`/`take_profit_pct` candidate, which still has to clear the same walk-forward/bootstrap-CI/fitness-floor gate as every other candidate before it can matter (see Learning system below). A failed or unavailable LLM call there just skips that one hourly proposal — it never blocks a trade.
 
 Pass 1 of `run_cycle` handles open-position exits (stop-loss/take-profit/exit-score); pass 2 evaluates new entries against scored candidates. `.github/workflows/risk_check.yml` runs this exit sweep every 5 minutes independent of the full 10-minute signal cycle (`trading_cycle.yml`) — polling-based, not an exchange-side stop order, so it's not a hard guarantee.
 
 ### Learning system (`src/learning/`) — two trust tiers
 
-**Trade Memory + Learning Engine** (§3a in PROJECT_SPEC.md): `trade_memory.py` (nearest-neighbor similar-trade lookup for confidence blending), `feature_importance.py` (per-timeframe + blended sub-score correlation), `statistics.py` (Sharpe/Sortino/Calmar/expectancy/streaks/z-tests, all stdlib — no numpy/scipy anywhere in this repo), `confidence_calibration.py`, `recommendations.py`, `reports.py`. Runs nightly via `evolution_agent.py`.
+**Trade Memory + Learning Engine** (§3a in PROJECT_SPEC.md): `trade_memory.py` (nearest-neighbor similar-trade lookup for confidence blending), `feature_importance.py` (per-timeframe + blended sub-score correlation), `statistics.py` (Sharpe/Sortino/Calmar/expectancy/streaks/z-tests, all stdlib — no numpy/scipy anywhere in this repo), `confidence_calibration.py`, `recommendations.py`, `reports.py`. Runs hourly via `evolution_agent.py`.
 
-**Adaptive Strategy Intelligence Engine** (§3b, `adaptive_strategy_engine.py` + `simulation.py`) — layered on top, runs as its **own** independent nightly step (`python -m src.learning.adaptive_strategy_engine` in `evolution.yml`, after but not inside `evolution_agent.run_evolution()` — never merge these two call sites, it was deliberately kept as a separate step to avoid coupling). Generates weight/regime/symbol/threshold recommendations, walk-forward validates them (train/test time-split, no look-ahead), simulates against trades actually taken (never fabricates counterfactual trades — no backtester exists), and versions passing candidates into `adaptive_strategy_versions`.
+**Adaptive Strategy Intelligence Engine** (§3b, `adaptive_strategy_engine.py` + `simulation.py`) — layered on top, runs as its **own** independent hourly step (`python -m src.learning.adaptive_strategy_engine` in `evolution.yml`, after but not inside `evolution_agent.run_evolution()` — never merge these two call sites, it was deliberately kept as a separate step to avoid coupling). Generates weight/regime/symbol/threshold/exit-params recommendations — the exit-params one has an AI-assisted sibling, `generate_ai_exit_params_recommendations`, that proposes a candidate value via an LLM call instead of a pure-stat sweep, written as an ordinary `recommendations` row indistinguishable downstream from the pure-stat one — walk-forward validates them all (train/test time-split, no look-ahead), simulates against trades actually taken (never fabricates counterfactual trades — no backtester exists), and versions passing candidates into `adaptive_strategy_versions`.
 
 **Hard invariant across all of this**: nothing in `src/learning/` ever auto-writes to `config.py` or live scoring weights. Everything is advisory — a human reviews `recommendations`/`adaptive_strategy_versions` rows directly in Supabase's table editor (no approve/reject UI exists) and manually promotes values into env vars. The one automatic exception is the confidence-modifier chain in `confidence_calibration.py` (regime/symbol/recent-performance modifiers), which extends an already-automatic, already-inert-by-default gate (`MIN_FINAL_CONFIDENCE=0`) rather than introducing a new bypass — don't treat this as precedent for auto-applying anything else.
 
@@ -79,7 +80,7 @@ Next.js App Router, client components fetch Supabase directly (anon key, RLS-gat
 
 ### Testing conventions
 
-All 272 tests mock `src.db.models` / external clients — no real network or DB calls in the suite (a slow/hanging test run is a signal something is leaking a real client, not just flakiness). New statistical or DB-touching code gets its own `tests/test_<module>.py`; don't rely on indirect coverage through a caller's mocked test.
+All 589 tests mock `src.db.models` / external clients — no real network or DB calls in the suite (a slow/hanging test run is a signal something is leaking a real client, not just flakiness). New statistical or DB-touching code gets its own `tests/test_<module>.py`; don't rely on indirect coverage through a caller's mocked test.
 
 ## Workflow Orchestration
 

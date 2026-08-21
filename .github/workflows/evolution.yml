@@ -1,10 +1,14 @@
 name: Evolution
 
 on:
-  # 18:45 UTC = 00:15 IST — just after the IST trading-day rollover
-  # (PROJECT_SPEC.md §2/§9), so it reviews the day that just closed.
+  # Hourly — GH Actions' native schedule: is only unreliable below ~15min
+  # cadence (observed this session on the 5/10-min trading workflows),
+  # hourly is well clear of that. Every gate downstream (PROMOTION_MIN_
+  # PAPER_DAYS, learning-stage trade-count thresholds) is keyed off
+  # accumulated data/elapsed calendar time, not run frequency, so the
+  # extra runs before there's new data to act on are harmless no-ops.
   schedule:
-    - cron: "45 18 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -24,13 +28,22 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — the
       # sole authoritative strategy-change pipeline (Scientific Strategy
-      # Optimization Framework). Pure statistics, no LLM calls; makes one
+      # Optimization Framework). Mostly pure statistics; makes one
       # best-effort, fail-open public CoinDCX call (market list, no auth)
-      # for the optional backtest-replay candidate validation.
+      # for the optional backtest-replay candidate validation, and one
+      # LLM call (Groq, auto-falling back to Gemini) proposing an
+      # exit-params candidate — that proposal still has to clear the same
+      # walk-forward/bootstrap/fitness gate as every other candidate
+      # before it can matter, and a failed/unavailable call here just
+      # skips that one candidate, never blocks this step.
       - run: python -m src.learning.adaptive_strategy_engine
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
       # Feature Drift Detection + Strategy Health Engine (PROJECT_SPEC.md
       # §3d) — each its own step, after but never merged into the two
       # steps above (same "independent learning steps stay independent"

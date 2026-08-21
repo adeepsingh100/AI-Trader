@@ -6,7 +6,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- LLM Provider (Groq / Ollama Cloud) --------------------------------------
+# --- LLM Provider (Groq, auto-falling back to Gemini) ------------------------
+# No provider-select env var — every call tries the full Groq chain first,
+# then automatically falls through to the full Gemini chain if every Groq
+# model fails (src/groq_client.py::chat). Sole caller is the hourly
+# AI-assisted exit-params proposal step (src/learning/recommendations.py::
+# generate_ai_exit_params_recommendations) — trading itself makes zero LLM
+# calls (src/orchestrator.py), so a quota/outage here costs one skipped
+# hourly proposal, never blocked trading.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_CHAIN = [
     m.strip()
@@ -16,14 +23,9 @@ GROQ_MODEL_CHAIN = [
     for m in (os.getenv("GROQ_MODEL_CHAIN") or "openai/gpt-oss-120b,qwen/qwen3.6-27b").split(",")
     if m.strip()
 ]
-
-# "groq" (default) or "ollama" (Ollama Cloud — https://ollama.com, not a
-# local instance). Switch by setting LLM_PROVIDER, no code change needed.
-LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "groq").strip().lower()
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL") or "https://ollama.com"
-OLLAMA_MODEL_CHAIN = [
-    m.strip() for m in (os.getenv("OLLAMA_MODEL_CHAIN") or "gpt-oss:120b").split(",") if m.strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_CHAIN = [
+    m.strip() for m in (os.getenv("GEMINI_MODEL_CHAIN") or "gemini-2.5-flash").split(",") if m.strip()
 ]
 
 # --- Credentials -------------------------------------------------------------
@@ -289,17 +291,6 @@ BACKTEST_WALK_FORWARD_TEST_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TEST_DAYS
 # bug surface for little gain over the existing z-test at this sample size;
 # small-n confidence intervals are answered by the seeded bootstrap above
 # instead, which needs no distributional assumption at all.
-
-# Off by default: quant-only (feature engine + opportunity scorer + risk
-# manager) is the deterministic default that actually satisfies "everything
-# must be deterministic" — the live LLM signal agent is temperature-sampled.
-# When enabled, validate_opportunity() is reused as-is for realism, but the
-# historical-confidence/regime/symbol blend is deliberately NOT reused (it
-# queries LIVE current trades/learning_statistics, which would leak
-# present-day trade history into a historical decision) — LLM-mode
-# confidence is the raw AI verdict only, and is labeled non-reproducible in
-# reports rather than fed into PerformanceAnalyzer's trusted default metrics.
-BACKTEST_USE_LLM_SIGNAL_AGENT = (os.getenv("BACKTEST_USE_LLM_SIGNAL_AGENT") or "false").strip().lower() == "true"
 
 # CoinDCX's public candles endpoint caps at 500 rows per call regardless of
 # the requested startTime/endTime range (confirmed empirically) — named

@@ -1,12 +1,18 @@
 """One full cycle: scan -> feature engine -> opportunity score -> top
-candidates -> LLM validation -> risk -> execute -> log. Single invocation,
-runs to completion, exits — see PROJECT_SPEC.md §5.
+candidates -> risk -> execute -> log. Single invocation, runs to
+completion, exits — see PROJECT_SPEC.md §5.
 
-Quant-first: OpportunityScorer (src/features/) deterministically scores
-every scanned symbol, zero LLM calls. Only the top-scoring not-held
-candidates (TOP_N_CANDIDATES) and held positions whose score has fallen
-below EXIT_SCORE_THRESHOLD go to the LLM for accept/reject validation —
-the LLM never sees raw candles and never picks direction on its own.
+Fully quant, zero LLM calls anywhere in this module: OpportunityScorer
+(src/features/) deterministically scores every scanned symbol, and
+reaching MIN_OPPORTUNITY_SCORE/TOP_N_CANDIDATES (entry) or dropping below
+EXIT_SCORE_THRESHOLD (exit) IS the accept decision — there's no separate
+validation step asking anything for a second opinion. An LLM does get
+consulted elsewhere in this codebase, but only once an hour, offline from
+live trading, to propose stop_loss_pct/take_profit_pct candidates that
+still have to clear the same statistical gate as every other strategy
+change (src/learning/recommendations.py::generate_ai_exit_params_
+recommendations) — a bad or unavailable LLM call there costs one skipped
+hourly proposal, never a blocked trade.
 
 Spot-only: an accepted exit closes an existing held position for that
 symbol (there's no shorting on CoinDCX spot). An accepted entry opens one
@@ -15,9 +21,8 @@ buy, not just once at cycle start, since a loss realized earlier in the
 same cycle must stop later buys in that same cycle.
 
 Stop-loss/take-profit (from the active version's params_json) is swept
-every cycle too, and doesn't wait on the LLM to say "sell" — see
-run_risk_check() below, which does only that sweep with no LLM calls,
-meant for a tighter cron than the full LLM validation cycle."""
+every cycle too — see run_risk_check() below, which does only that sweep,
+meant for a tighter cron than the full cycle."""
 
 from __future__ import annotations
 
@@ -34,7 +39,6 @@ from src.agents.risk_manager import (
     target_hit,
     today_ist,
 )
-from src.agents.signal_agent import validate_opportunity
 from src.audit.trail import config_version
 from src.coindcx_client import get_ticker
 from src.config import (
@@ -43,6 +47,7 @@ from src.config import (
     EXIT_SCORE_THRESHOLD,
     LEARNING_CATCHUP_LOOKBACK_HOURS,
     MIN_FINAL_CONFIDENCE,
+    MIN_OPPORTUNITY_SCORE,
     RECENT_PERFORMANCE_LOOKBACK_TRADES,
     RECENT_STREAK_LOSS_MODIFIER_CAP,
     RECENT_STREAK_WIN_MODIFIER_CAP,
@@ -400,17 +405,23 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         if held is None and symbol in candidate_symbols:
             similar = find_similar_trades(record, market_regime=record["market_regime"], mode=mode)
             summary = _opportunity_summary(record, historical_context=similar)
-            verdict, usage_events = validate_opportunity(summary, version["prompt_text"], context="entry")
-            models.log_model_usage(usage_events)
-            llm_decision = verdict.get("decision")
-            llm_reasoning = verdict.get("reasoning")
-            llm_raw_response = verdict
+            # Reaching this branch already means the quant scorer accepted
+            # the candidate (MIN_OPPORTUNITY_SCORE/TOP_N_CANDIDATES) — no
+            # separate validation step, no LLM call.
+            llm_decision = "accept"
+            llm_reasoning = (
+                f"quant score {opportunity_score:.1f} >= {MIN_OPPORTUNITY_SCORE} "
+                f"(trend={record['trend_score']:.0f} momentum={record['momentum_score']:.0f} "
+                f"volume={record['volume_score']:.0f} volatility={record['volatility_score']:.0f} "
+                f"risk={record['risk_score']:.0f}, regime={record['market_regime']})"
+            )
+            llm_raw_response = summary
 
             historical_confidence = similar["win_rate"] * 100 if similar["win_rate"] is not None else None
             regime_modifier = _bucket_modifier(regime_stats, record["market_regime"], overall_win_rate)
             symbol_modifier = _bucket_modifier(symbol_stats, symbol, overall_win_rate)
             calibrated = calibrate_confidence(
-                verdict.get("confidence"),
+                opportunity_score,
                 historical_confidence,
                 similar["count"],
                 regime_modifier=regime_modifier,
@@ -418,7 +429,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 recent_performance_modifier=recent_performance_modifier,
             )
             calibration_to_log = {
-                "ai_confidence": verdict.get("confidence"),
+                "ai_confidence": opportunity_score,
                 "historical_confidence": historical_confidence,
                 "ai_weight": calibrated["ai_weight_used"],
                 "historical_weight": calibrated["historical_weight_used"],
@@ -432,7 +443,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 calibrated["final_confidence"] is None or calibrated["final_confidence"] >= MIN_FINAL_CONFIDENCE
             )
 
-            if llm_decision == "accept" and confidence_cleared:
+            if confidence_cleared:
                 capital_to_use = capital_config.get("capital_to_use") or 0
                 sizing_context = {
                     "avg_correlation": _avg_correlation_with_book(symbol, open_trades, price_history),
@@ -489,28 +500,22 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                     final_decision, reason, trade_id = "buy", llm_reasoning, trade["id"]
                 else:
                     reason = f"risk_manager blocked: {decision.action}"
-            elif llm_decision == "accept":
-                reason = f"confidence gated: {calibrated['final_confidence']:.1f} < {MIN_FINAL_CONFIDENCE}"
             else:
-                reason = llm_reasoning or "llm rejected entry"
+                reason = f"confidence gated: {calibrated['final_confidence']:.1f} < {MIN_FINAL_CONFIDENCE}"
 
         elif held is not None and opportunity_score is not None and opportunity_score < EXIT_SCORE_THRESHOLD:
-            summary = _opportunity_summary(record, held=held)
-            verdict, usage_events = validate_opportunity(summary, version["prompt_text"], context="exit")
-            models.log_model_usage(usage_events)
-            llm_decision = verdict.get("decision")
-            llm_reasoning = verdict.get("reasoning")
-            llm_raw_response = verdict
+            # Score dropping below EXIT_SCORE_THRESHOLD is itself the exit
+            # decision — no separate validation step, no LLM call.
+            llm_decision = "accept"
+            llm_reasoning = f"quant score {opportunity_score:.1f} < {EXIT_SCORE_THRESHOLD} exit threshold"
+            llm_raw_response = None
 
-            if llm_decision == "accept":
-                fill = execution_agent.place_order(symbol, "sell", held["qty"], market["last_price"])
-                _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl, exit_reason_value="ai_exit")
-                closed.append(held)
-                open_trades.remove(held)
-                del open_by_symbol[symbol]
-                final_decision, reason, trade_id = "sell", llm_reasoning, held["id"]
-            else:
-                reason = llm_reasoning or "llm rejected exit"
+            fill = execution_agent.place_order(symbol, "sell", held["qty"], market["last_price"])
+            _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl, exit_reason_value="ai_exit")
+            closed.append(held)
+            open_trades.remove(held)
+            del open_by_symbol[symbol]
+            final_decision, reason, trade_id = "sell", llm_reasoning, held["id"]
         else:
             reason = "not_a_candidate" if held is None else "score_above_exit_threshold_or_unavailable"
 

@@ -27,9 +27,11 @@ _PATCHES = (
     "src.learning.adaptive_strategy_engine.generate_regime_recommendations",
     "src.learning.adaptive_strategy_engine.generate_weight_recommendations",
     "src.learning.adaptive_strategy_engine.compute_learning_status",
+    "src.learning.adaptive_strategy_engine.generate_ai_exit_params_recommendations",
 )
 
 
+@patch(_PATCHES[13])
 @patch(_PATCHES[12])
 @patch(_PATCHES[0])
 @patch(_PATCHES[1])
@@ -57,6 +59,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_feature_importance,
     mock_models,
     mock_learning_status,
+    mock_ai_exit_params_recs,
 ):
     status = _status("HYPOTHESIS", 120)
     mock_learning_status.return_value = status
@@ -65,6 +68,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_symbol_recs.return_value = []
     mock_threshold_recs.return_value = [{"metric_name": "MIN_OPPORTUNITY_SCORE"}]
     mock_exit_params_recs.return_value = [{"metric_name": "stop_loss_pct"}]
+    mock_ai_exit_params_recs.return_value = []
     mock_simulate_weight.return_value = {"id": 1, "passed": True}
     mock_simulate_threshold.return_value = {"id": 2, "passed": False}
     mock_simulate_exit_params.return_value = [{"id": 3, "passed": True}]
@@ -79,6 +83,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_symbol_recs.assert_called_once_with("paper", status=status)
     mock_threshold_recs.assert_called_once_with("paper", weakness_context=mock_weaknesses.return_value, status=status)
     mock_exit_params_recs.assert_called_once_with("paper", status=status)
+    mock_ai_exit_params_recs.assert_called_once_with("paper", status=status)
     mock_simulate_weight.assert_called_once_with("paper", "abc", status=status)
     mock_simulate_threshold.assert_called_once_with("paper", status=status)
     mock_simulate_exit_params.assert_called_once_with("paper", symbol_to_pair=None, status=status)
@@ -93,6 +98,7 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_models.log_agent_event.assert_called_once()
 
 
+@patch(_PATCHES[13])
 @patch(_PATCHES[12])
 @patch(_PATCHES[0])
 @patch(_PATCHES[1])
@@ -120,6 +126,7 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_feature_importance,
     mock_models,
     mock_learning_status,
+    mock_ai_exit_params_recs,
 ):
     mock_learning_status.return_value = _status("BOOTSTRAP", 3)
     mock_weight_recs.return_value = []
@@ -127,6 +134,7 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_symbol_recs.return_value = []
     mock_threshold_recs.return_value = []
     mock_exit_params_recs.return_value = []
+    mock_ai_exit_params_recs.return_value = []
     mock_weaknesses.return_value = {}
     mock_rejections.return_value = []
     mock_feature_importance.return_value = []

@@ -147,7 +147,7 @@ def test_decision_pass_opens_position_for_qualifying_candidate():
     pos = engine.portfolio.positions["TESTINR"]
     assert pos.opportunity_score == 90.0
     assert pos.market_regime == "strong_bull"
-    assert pos.confidence is None  # quant-only default, no LLM verdict
+    assert pos.confidence == 90.0  # quant-only: confidence is the opportunity_score itself
 
 
 def test_decision_pass_blocks_oversized_candidate_via_concentration_gate():

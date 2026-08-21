@@ -4,7 +4,13 @@ Optimization Framework) now the SOLE authoritative source of strategy
 change candidates — evolution_agent.py's nightly LLM prompt/param rewrite
 was retired entirely, not replaced by anything here; strategy evolution
 runs exclusively through this statistically-rigorous, human-approved
-pipeline now.
+pipeline now. An LLM is back in the loop as of generate_ai_exit_params_
+recommendations below, but only as one more candidate-value source
+alongside the pure-stat sweep — every candidate, AI-proposed or not,
+still goes through the same walk-forward/bootstrap/fitness gate before it
+can matter. This is unrelated to (and does not reintroduce) the retired
+ungated nightly rewrite; see src/orchestrator.py's module docstring for
+why live trading itself makes zero LLM calls either way.
 
 Invariants (enforced by what this module imports, not just documented):
 never executes a trade (no execution-agent import), never modifies
@@ -39,6 +45,7 @@ from src.config import FEATURE_TIMEFRAMES
 from src.db import models
 from src.learning.feature_importance import compute_feature_importance
 from src.learning.recommendations import (
+    generate_ai_exit_params_recommendations,
     generate_exit_params_recommendations,
     generate_recommendations,
     generate_regime_recommendations,
@@ -98,6 +105,7 @@ class AdaptiveStrategyEngine:
         symbol_recs = generate_symbol_recommendations(mode, status=status)
         threshold_recs = generate_recommendations(mode, weakness_context=weaknesses, status=status)
         exit_params_recs = generate_exit_params_recommendations(mode, status=status)
+        ai_exit_params_recs = generate_ai_exit_params_recommendations(mode, status=status)
         timeframe_importance = compute_feature_importance(mode, timeframes=FEATURE_TIMEFRAMES)
 
         simulations = []
@@ -110,7 +118,7 @@ class AdaptiveStrategyEngine:
             threshold_simulation = simulate_threshold_recommendation(mode, status=status)
             if threshold_simulation is not None:
                 simulations.append(threshold_simulation)
-        if exit_params_recs:
+        if exit_params_recs or ai_exit_params_recs:
             symbol_to_pair = _build_symbol_to_pair(mode)
             simulations.extend(
                 simulate_exit_params_recommendation(mode, symbol_to_pair=symbol_to_pair, status=status)
@@ -125,7 +133,7 @@ class AdaptiveStrategyEngine:
             f"evidence_readiness={status.evidence_readiness_pct:.0f}% "
             f"weight_recs={len(weight_recs)} regime_recs={len(regime_recs)} "
             f"symbol_recs={len(symbol_recs)} threshold_recs={len(threshold_recs)} "
-            f"exit_params_recs={len(exit_params_recs)} "
+            f"exit_params_recs={len(exit_params_recs)} ai_exit_params_recs={len(ai_exit_params_recs)} "
             f"timeframe_feature_rows={len(timeframe_importance)} simulations={len(simulations)} "
             f"candidates_created={candidates_created} rejection_reasons={len(rejections)}",
         )
@@ -139,6 +147,7 @@ class AdaptiveStrategyEngine:
             "symbol_recommendations": symbol_recs,
             "threshold_recommendations": threshold_recs,
             "exit_params_recommendations": exit_params_recs,
+            "ai_exit_params_recommendations": ai_exit_params_recs,
             "timeframe_feature_importance": timeframe_importance,
             "simulations": simulations,
             "candidates_created": candidates_created,

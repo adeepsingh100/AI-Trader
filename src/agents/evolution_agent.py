@@ -1,4 +1,4 @@
-"""Nightly: score the active strategy version's paper trades and flag it
+"""Hourly: score the active strategy version's paper trades and flag it
 promotion_eligible if it clears the promotion bar — a human still reviews
 and flips promoted_to_real themselves (Scientific Strategy Optimization
 Framework, PROJECT_SPEC.md §2/§3).
@@ -12,8 +12,10 @@ evolution (including stop_loss_pct/take_profit_pct, previously only ever
 LLM-guessed) now happens exclusively through the statistically-rigorous,
 human-approved adaptive_strategy_versions candidate pipeline
 (src/learning/recommendations.py + simulation.py, orchestrated by
-src/learning/adaptive_strategy_engine.py). signal_agent's validation
-prompt is stable/human-edited only."""
+src/learning/adaptive_strategy_engine.py). No LLM call in this module —
+trading itself makes none either (src/orchestrator.py); the one place an
+LLM is still used is an hourly, code-validated exit-params proposal in
+that same recommendations.py pipeline."""
 
 from __future__ import annotations
 

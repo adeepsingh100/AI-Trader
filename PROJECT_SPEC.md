@@ -71,16 +71,15 @@ process (see §7):
 
 ```
 Data Agent → Feature Engine → Opportunity Scorer → Candidate Filter
-    → Signal Agent (LLM validation) → Risk Manager → Execution Agent → log
+    → Risk Manager → Execution Agent → log
 ```
 
-**Quant-first, not LLM-first**: the LLM never picks direction and never
-sees raw candles. A deterministic scorer (zero AI, zero randomness) ranks
-every scanned symbol; only the top candidates and deteriorating held
-positions reach the LLM at all, as a curated validate/reject gate. This
-is what actually bounds LLM call volume per cycle — not the scan
-breadth (`n_symbols`, still top-10-by-turnover), which stays cheap
-because scoring is pure math.
+**Fully quant, zero LLM calls in this cycle**: a deterministic scorer
+(zero AI, zero randomness) ranks every scanned symbol, and clearing
+`MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (or, for a held position,
+dropping below `EXIT_SCORE_THRESHOLD`) **is** the trade decision — no
+separate validation step asks anything for a second opinion (§4 on why,
+and where an LLM is still used elsewhere, offline from this cycle).
 
 ### Data Agent (`src/agents/data_agent.py`)
 - Pulls CoinDCX's public market endpoints (ticker, candles).
@@ -127,29 +126,33 @@ because scoring is pure math.
   `opportunity_score >= MIN_OPPORTUNITY_SCORE` (default 60), sorts
   descending, keeps the top `TOP_N_CANDIDATES` (default 5, **configurable**).
   A held position whose recomputed score falls below
-  `EXIT_SCORE_THRESHOLD` (default 40) becomes an LLM exit-validation
-  candidate. The gap between the two thresholds is a deliberate
-  hysteresis band — a symbol scoring in between is never simultaneously
-  too-weak-to-enter and forced-to-exit-if-held.
+  `EXIT_SCORE_THRESHOLD` (default 40) closes. The gap between the two
+  thresholds is a deliberate hysteresis band — a symbol scoring in
+  between is never simultaneously too-weak-to-enter and
+  forced-to-exit-if-held.
 
-### Signal Agent (`src/agents/signal_agent.py`) — LLM validation gate
-- `validate_opportunity(opportunity_summary, strategy_prompt, context)`
-  is the only entry point now (`context` is `"entry"` or `"exit"`).
-  Receives a curated digest (symbol, opportunity_score, the 5 sub-scores,
-  volatility label, support/resistance, ADX, volume spike, and —
-  exit-context only — the held position's entry price/qty/unrealized
-  PnL%) — **never raw candles, never the full multi-timeframe feature
-  dump**.
-- Asks the LLM to accept or reject, with reasoning/risks/expected
-  duration/invalidation point; only `decision` and `reasoning` drive
-  control flow, the full verdict is stored losslessly as jsonb
-  (`opportunity_evaluations.llm_raw_response`).
-- Fails **closed**: an unparseable response or every model in the
-  fallback chain failing both resolve to `decision: "reject"` — the LLM
-  is a gate now, not the primary decision-maker, so a broken gate must
-  not silently let a trade through.
-- `reasoning` is what gets persisted to `trades.reasoning_text` on an
-  accepted entry/exit — same column, same dashboard rendering as before.
+### Trade decisions — fully quant, zero LLM calls (`src/orchestrator.py`)
+- There is no validation gate between the Opportunity Scorer and a trade
+  anymore. Reaching `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or
+  dropping below `EXIT_SCORE_THRESHOLD` (exit) **is** the decision —
+  deterministic, no network call, no token budget, no parse failure ever
+  in the path that opens or closes a position. (The module that used to
+  sit here, `src/agents/signal_agent.py`, an LLM accept/reject gate, was
+  removed entirely — see §4 for why.)
+- The confidence that gates position sizing (`calibrate_confidence`,
+  `MIN_FINAL_CONFIDENCE`) now blends the scorer's own `opportunity_score`
+  with historical win-rate on similar past trades, instead of an LLM's
+  self-rating — same function, same weights
+  (`CONFIDENCE_AI_WEIGHT`/`CONFIDENCE_HISTORICAL_WEIGHT`), just a
+  quant-sourced input.
+- `reasoning_text` on a trade, and `opportunity_evaluations.llm_reasoning`,
+  are now a deterministic string built from the sub-scores and the
+  threshold that was cleared — same columns, same dashboard rendering as
+  before, just quant-authored instead of LLM-authored.
+- An LLM is still consulted elsewhere in the codebase — see §4 — but only
+  once an hour, offline from live trading, and only to *propose* a
+  candidate value that still has to clear the same statistical gate as
+  every other strategy change before it can matter.
 
 ### Risk Manager Agent (`src/agents/risk_manager.py`)
 - **Safety-critical — build and unit-test this first (build order step 6).**
@@ -464,14 +467,12 @@ checking 5-10x more often than the live one ever does.
   user-supplied list, never reconstructed from a live turnover ranking —
   CoinDCX has no historical ticker/turnover series to replay, so
   defaulting to "today's top-N over history" would be survivorship bias;
-  every report says this. LLM signal-agent validation is real but
-  **opt-in, off by default** (`BACKTEST_USE_LLM_SIGNAL_AGENT`) — quant-only
-  is the deterministic default that actually satisfies "everything must be
-  deterministic" (the live LLM call is temperature-sampled); when enabled,
-  the historical-confidence/regime/symbol blend is deliberately NOT
-  reused, since that queries LIVE current trades/learning_statistics and
-  would leak years of future information into a historical decision —
-  LLM-mode confidence is the raw AI verdict only, labeled non-reproducible.
+  every report says this. Entry/exit decisions are quant-only,
+  deterministic, mirroring `orchestrator.py` exactly — there was
+  previously an opt-in LLM signal-agent validation path here
+  (`BACKTEST_USE_LLM_SIGNAL_AGENT`); it was removed along with
+  `signal_agent.py` itself (§4), not just defaulted off, since live
+  trading no longer has an LLM-validated path for a backtest to mirror.
   `ingest_data.py` (CLI) backfills `historical_candles` for
   `[start_date - BACKTEST_WARMUP_BUFFER_DAYS, end_date]`, never just the
   requested window — `FEATURE_CANDLE_LIMIT`/`EMA_TREND_PERIOD_4` need up
@@ -715,8 +716,10 @@ came back as a new `strategy_versions` row every single night, no
 statistical gate — plus auto-flipped `promoted_to_real` the instant 3 raw
 thresholds cleared, the only place in this codebase real money moved with
 zero human approval. Both are deleted. `strategy_versions`/`prompt_text`
-still exist (still what `signal_agent`/`risk_manager` read every cycle) but
-the prompt is stable/human-edited now; `evolution_agent.run_evolution()`
+still exist (`params_json` is what live trading actually reads every
+cycle — `prompt_text` is now unread since the LLM validation gate that
+used it, `signal_agent.py`, was later removed entirely, see §4) but
+`evolution_agent.run_evolution()`
 shrinks to a promotion-readiness monitor (§2). Strategy evolution —
 including `stop_loss_pct`/`take_profit_pct`, previously only ever
 LLM-guessed — moved entirely into `adaptive_strategy_versions`' already-
@@ -750,6 +753,18 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   a full price-path replay, a stated limitation). `generate_recommendations`
   gained an optional `weakness_context` param so a rationale can cite a
   corroborating weakness-detection finding as evidence.
+  `generate_ai_exit_params_recommendations` (new) is an AI-assisted sibling
+  — an LLM call (Groq, auto-falling back to Gemini; see §4) proposes a
+  `stop_loss_pct`/`take_profit_pct` value from a digest of current params
+  and baseline stats, written as an ordinary `recommendations` row
+  (`category="exit_params"`) indistinguishable, downstream, from the
+  pure-stat sweep's own output — `simulate_exit_params_recommendation`
+  doesn't know or care which generator produced the row it's testing, so
+  the AI's proposal clears the exact same walk-forward/bootstrap/fitness
+  gate before it can matter. Any LLM failure here (quota, outage,
+  unparseable response) just means no AI candidate that run — logged,
+  never raised, never blocks the pure-stat sweep or the rest of
+  `AdaptiveStrategyEngine.analyze()`.
 - **`simulation.py`** (extended): every `simulate_*` function now also
   runs a bootstrap confidence-interval gate
   (`backtest.statistical_validation.bootstrap_confidence_interval`,
@@ -896,27 +911,49 @@ is derived on read from tables that already exist, same "don't store a
 derivable fact under a second name" precedent as everywhere else in this
 codebase.
 
-## 4. LLM integration (Groq default, Ollama Cloud alternative)
+## 4. LLM integration (Groq, auto-falling back to Gemini — hourly, offline from live trading)
 
-- Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
-  (Ollama Cloud — `https://ollama.com`, authenticated via `OLLAMA_API_KEY`,
-  not a local instance). Same retry/fallback/logging behavior either way;
-  `src/groq_client.py`'s `chat()` is the single entry point both agents call,
-  so switching providers is an env var change, not a code change.
-- Model chain is **configurable** per provider (env var, ordered list — Groq
-  deprecates models periodically): default
-  `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
-  `OLLAMA_MODEL_CHAIN=gpt-oss:120b` (no `-cloud` suffix — that's only for
-  routing through a local Ollama daemon, not this direct-to-`ollama.com` setup).
+**Not in the live trade path at all.** `src/agents/signal_agent.py`, the
+per-trade LLM accept/reject gate, was removed entirely — every entry/exit
+is now a deterministic function of the Opportunity Scorer's already-computed
+score (§3, "Trade decisions — fully quant, zero LLM calls"). This followed
+a real incident: at up to `TOP_N_CANDIDATES` LLM calls every ~10-minute
+cycle, Groq's free-tier per-model daily token quota was exhausted fast
+enough to cause a multi-day trading outage before anyone noticed — a
+provider issue blocking live trading is the specific failure mode this
+architecture now makes structurally impossible, not just less likely.
+
+The LLM's sole remaining role is **hourly**, inside
+`AdaptiveStrategyEngine.analyze()` (§3b/§3e):
+`generate_ai_exit_params_recommendations` asks it to propose a
+`stop_loss_pct`/`take_profit_pct` candidate from recent trade
+statistics — one call per run, ~24/day, comfortably inside Groq's free
+quota even before Gemini fallback. That proposal is never applied
+directly: it's written as an ordinary `recommendations` row and has to
+clear the same walk-forward/bootstrap-CI/fitness-floor gate as every
+other candidate (§3e) before it can become a live `adaptive_strategy_versions`
+candidate. A failed or unavailable LLM call here just means no AI
+candidate that hour, logged and skipped — never a blocked run, since this
+step is offline from live trading entirely.
+
+- No provider-select env var — every call tries the full Groq chain
+  first, then automatically falls through to the full Gemini chain if
+  every Groq model fails. `src/groq_client.py`'s `chat()` is the single
+  entry point; callers never know which provider actually answered.
+- Model chain is **configurable** per provider (env var, ordered list):
+  default `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
+  `GEMINI_MODEL_CHAIN=gemini-2.5-flash`. Gemini's default reasoning
+  ("thinking") pass is explicitly disabled (`thinkingConfig.
+  thinkingBudget: 0`) — left on, it burns the whole output-token budget
+  on its `<think>` chain before ever emitting the requested JSON, so
+  every call came back truncated and unparseable until this was found
+  and fixed.
 - On 429 or any API error: retry with exponential backoff on the current
-  model, then fall back to the next model in the chain.
-- Every call (success or failure, every model tried) logs to
-  `model_usage`: model name, fallback_reason (null on first-try
+  model, then fall back to the next model in the chain; when the entire
+  Groq chain is exhausted, fall through to the Gemini chain the same way.
+- Every call (success or failure, every model tried, either provider)
+  logs to `model_usage`: model name, fallback_reason (null on first-try
   success), latency_ms, success.
-- Verify during build (step 3) by forcing a failure (e.g. bad API key
-  swapped in temporarily, or a monkeypatched 429) to confirm the
-  fallback chain actually triggers and logs correctly — don't just trust
-  the retry logic unexercised.
 
 ## 5. Deployment (free tier only)
 
@@ -927,15 +964,15 @@ codebase.
   Risk Manager's daily bookkeeping must tolerate skipped/late cycles
   (it recomputes from `trades`/`daily_pnl`, not from cycle count).
 - Risk check: separate `risk_check.yml` workflow, `cron: '*/5 * * * *'`
-  (5 min is GitHub Actions' shortest supported schedule interval —
-  going tighter isn't possible on the free tier, and per-cycle LLM cost
-  is why the full trading cycle above stays at 10 min). Runs
-  `orchestrator.py --risk-only`: stop-loss/take-profit + circuit-breaker
-  sweep only, no LLM call and no market snapshot, so it's cheap enough
-  to run twice as often as the signal cycle. This is what actually
-  bounds how long a bad move can run unwatched — not the signal cycle's
-  interval, since exits no longer wait on the LLM to notice.
-- Evolution job: separate daily GH Actions workflow.
+  (5 min is GitHub Actions' shortest supported schedule interval — going
+  tighter isn't possible on the free tier). Runs `orchestrator.py
+  --risk-only`: stop-loss/take-profit + circuit-breaker sweep only, no
+  market snapshot, so it's cheap enough to run twice as often as the
+  signal cycle. This is what actually bounds how long a bad move can run
+  unwatched, not the signal cycle's interval.
+- Evolution job: separate hourly GH Actions workflow (§3b/§4) — cheap
+  even at this cadence, since every gate downstream is keyed off
+  accumulated trade data/elapsed calendar time, not run frequency.
 - Database: Supabase free tier (Postgres).
 - Secrets: GitHub encrypted secrets for CI; `.env` (gitignored) for
   local dev. Never committed — `.env.example` documents the required
@@ -1323,7 +1360,6 @@ funds exist, before trusting it beyond the promotion gate.
 │   ├── orchestrator.py
 │   ├── agents/
 │   │   ├── data_agent.py
-│   │   ├── signal_agent.py          # LLM validation gate, not primary decision-maker
 │   │   ├── risk_manager.py
 │   │   ├── evolution_agent.py
 │   │   ├── reporting_agent.py

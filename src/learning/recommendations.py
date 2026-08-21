@@ -28,6 +28,7 @@ feature and isn't being built here."""
 
 from __future__ import annotations
 
+import json
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -51,9 +52,11 @@ from src.config import (
 )
 from src.db import models
 from src.features.opportunity_scorer import PRIMARY_TIMEFRAME
+from src.groq_client import AllModelsFailedError, chat
 from src.learning.feature_importance import compute_subscore_correlation_weights, score_separation_p_value
 from src.learning.learning_status import LearningStatus, compute_learning_status
 from src.learning.statistics import compute_bucket_statistics, z_test_two_proportions
+from src.lenient_json import parse_llm_json
 
 _SUBSCORE_TO_WEIGHT_CONFIG = {
     "trend_score": "OPPORTUNITY_WEIGHT_TREND",
@@ -573,5 +576,95 @@ def generate_exit_params_recommendations(mode: str, status: LearningStatus | Non
             category="exit_params",
         )
         results.append({"metric_name": param_name, "recommended_value": best_value, "rationale": rationale})
+
+    return results
+
+
+_AI_PROPOSER_SYSTEM_PROMPT = (
+    "You analyze a crypto trading bot's recent closed-trade statistics and "
+    "propose a stop_loss_pct/take_profit_pct change if the data supports "
+    "one. Your proposal is NOT applied directly — it is validated against "
+    "held-out trade data via walk-forward analysis, a bootstrap confidence "
+    "interval, and a fitness floor before it can ever become live; if it "
+    "fails that check it is simply discarded. Respond as JSON only: "
+    '{"stop_loss_pct": 0.0-1.0 or null, "take_profit_pct": 0.0-1.0 or null, '
+    '"rationale": "..."}. Use null for a leg you have no data-backed change '
+    "to propose — never guess a value just to fill the field."
+)
+
+
+def generate_ai_exit_params_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+    """AI-assisted sibling to generate_exit_params_recommendations — same
+    idempotency pattern, same category="exit_params" recommendation row,
+    same downstream walk-forward/bootstrap/fitness gate
+    (simulate_exit_params_recommendation, which doesn't care which
+    generator wrote the row it's testing). The LLM only ever proposes a
+    *candidate value*; code remains the sole gate on what can actually go
+    live. Never blocks: any LLM failure (quota, outage, unparseable
+    response) just means no AI candidate this run — the pure-stat sweep
+    above is unaffected and the caller (AdaptiveStrategyEngine, run
+    hourly) keeps going."""
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
+        return []
+
+    closed = _recently_closed(mode)
+    capital_config = models.get_capital_config(mode)
+    capital_to_use = capital_config["capital_to_use"] if capital_config else 0
+    version = models.get_latest_version()
+    current_params = (version.get("params_json") or {}) if version else {}
+
+    baseline_stats = compute_bucket_statistics(closed, capital_to_use)
+    if baseline_stats["expectancy"] is None:
+        return []
+
+    digest = {
+        "current_params": current_params,
+        "baseline_stats": baseline_stats,
+        "trade_count": len(closed),
+        "valid_range_pct": [EXIT_PARAM_SWEEP_MIN_PCT, EXIT_PARAM_SWEEP_MAX_PCT],
+    }
+    messages = [
+        {"role": "system", "content": _AI_PROPOSER_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(digest)},
+    ]
+    try:
+        content, events = chat(messages)
+    except AllModelsFailedError as e:
+        models.log_agent_event("ai_strategy_proposer", "warning", f"AI exit-params proposal skipped: {e}")
+        return []
+    models.log_model_usage(events)
+
+    try:
+        proposal = parse_llm_json(content)
+    except (json.JSONDecodeError, TypeError):
+        models.log_agent_event(
+            "ai_strategy_proposer", "warning", f"unparseable AI exit-params proposal: {content!r}"
+        )
+        return []
+    if not isinstance(proposal, dict):
+        return []
+
+    results = []
+    for param_name in ("stop_loss_pct", "take_profit_pct"):
+        value = proposal.get(param_name)
+        if not isinstance(value, (int, float)) or not (EXIT_PARAM_SWEEP_MIN_PCT <= value <= EXIT_PARAM_SWEEP_MAX_PCT):
+            continue
+        if _not_materially_different(mode, param_name, value):
+            continue
+
+        current_value = current_params.get(param_name)
+        rationale = f"AI-proposed: {proposal.get('rationale', '')}"
+        models.insert_recommendation(
+            mode=mode,
+            metric_name=param_name,
+            current_value=current_value,
+            recommended_value=value,
+            rationale=rationale,
+            sample_size=len(closed),
+            category="exit_params",
+            evidence={"ai_raw_response": proposal},
+        )
+        results.append({"metric_name": param_name, "recommended_value": value, "rationale": rationale})
 
     return results
