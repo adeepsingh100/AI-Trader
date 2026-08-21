@@ -9,11 +9,11 @@ load_dotenv()
 # --- LLM Provider (Groq, auto-falling back to Gemini) ------------------------
 # No provider-select env var — every call tries the full Groq chain first,
 # then automatically falls through to the full Gemini chain if every Groq
-# model fails (src/groq_client.py::chat). Sole caller is the hourly
-# AI-assisted exit-params proposal step (src/learning/recommendations.py::
-# generate_ai_exit_params_recommendations) — trading itself makes zero LLM
-# calls (src/orchestrator.py), so a quota/outage here costs one skipped
-# hourly proposal, never blocked trading.
+# model fails (src/groq_client.py::chat). Groq's free-tier daily token
+# quota gets exhausted fast at this codebase's call volume (see
+# PROJECT_SPEC.md §4) and nobody's reliably around to flip a manual
+# switch when that happens — this keeps trading running same-cycle
+# instead of going dark until someone notices.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_CHAIN = [
     m.strip()

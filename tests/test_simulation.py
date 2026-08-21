@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from src.learning.learning_status import LearningStatus
 from src.learning.simulation import (
+    _activate_exit_params_candidate,
     _train_test_split,
     simulate_exit_params_recommendation,
     simulate_threshold_recommendation,
@@ -113,6 +114,9 @@ def test_simulate_weight_recommendation_passes_and_creates_candidate_version(
     assert version_kwargs["version_number"] == 1
     assert version_kwargs["params_json"] == {"trend_score": 1.0}
     assert version_kwargs["source_simulation_id"] == 42
+    # Scope boundary: weight candidates stay advisory, unlike exit-params
+    # ones — no strategy_versions row auto-created for this candidate type.
+    mock_models.insert_strategy_version.assert_not_called()
 
 
 @patch("src.learning.simulation.SIGNIFICANCE_THRESHOLD", 0.05)
@@ -226,9 +230,15 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
     ]
     mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
     mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
-    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_version.return_value = {
+        "id": 3, "version_number": 3, "prompt_text": "current prompt", "params_json": {"take_profit_pct": 0.05},
+    }
     mock_models.get_latest_adaptive_strategy_version.return_value = None
     mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_models.insert_adaptive_strategy_version.return_value = {
+        "id": 42, "params_json": {"stop_loss_pct": 0.02}, "fitness_score": 70.0,
+    }
+    mock_models.insert_strategy_version.return_value = {"id": 100, "version_number": 4}
     mock_bootstrap.return_value = {
         "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
     }
@@ -244,6 +254,14 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
     assert kwargs["validation_detail"]["bootstrap_ci"]["ci_low"] == 0.001
     mock_models.insert_adaptive_strategy_version.assert_called_once()
     assert mock_models.insert_adaptive_strategy_version.call_args.kwargs["fitness_score"] is not None
+
+    # Auto-activation: the candidate's one changed leg is merged onto the
+    # current version's OTHER leg, not a bare replacement of params_json.
+    mock_models.insert_strategy_version.assert_called_once()
+    activate_kwargs = mock_models.insert_strategy_version.call_args.kwargs
+    assert activate_kwargs["version_number"] == 4
+    assert activate_kwargs["prompt_text"] == "current prompt"
+    assert activate_kwargs["params_json"] == {"take_profit_pct": 0.05, "stop_loss_pct": 0.02}
 
 
 @patch("src.learning.simulation.bootstrap_confidence_interval")
@@ -300,9 +318,15 @@ def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candl
     ]
     mock_models.get_recently_closed_trades.return_value = train_trades + test_trades
     mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
-    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_version.return_value = {
+        "id": 3, "version_number": 3, "prompt_text": "current prompt", "params_json": {},
+    }
     mock_models.get_latest_adaptive_strategy_version.return_value = None
     mock_models.insert_strategy_simulation.return_value = {"id": 9}
+    mock_models.insert_adaptive_strategy_version.return_value = {
+        "id": 42, "params_json": {"stop_loss_pct": 0.02}, "fitness_score": 70.0,
+    }
+    mock_models.insert_strategy_version.return_value = {"id": 100, "version_number": 4}
     mock_bootstrap.return_value = {
         "point_estimate": 0.01, "ci_low": 0.001, "ci_high": 0.02, "confidence_pct": 95.0, "iterations": 1000,
     }
@@ -389,3 +413,35 @@ def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseli
     assert kwargs["passed"] is False
     assert kwargs["validation_detail"]["strategy_comparison"]["winner"] == "a"
     mock_models.insert_adaptive_strategy_version.assert_not_called()
+
+
+# --- _activate_exit_params_candidate ---
+
+
+@patch("src.learning.simulation.models")
+def test_activate_exit_params_candidate_merges_onto_current_params(mock_models):
+    mock_models.get_latest_version.return_value = {
+        "id": 3, "version_number": 3, "prompt_text": "current prompt", "params_json": {"take_profit_pct": 0.05},
+    }
+    mock_models.insert_strategy_version.return_value = {"id": 100, "version_number": 4}
+    candidate = {"id": 42, "params_json": {"stop_loss_pct": 0.02}, "fitness_score": 70.0}
+
+    result = _activate_exit_params_candidate(candidate)
+
+    assert result == {"id": 100, "version_number": 4}
+    mock_models.insert_strategy_version.assert_called_once_with(
+        version_number=4,
+        prompt_text="current prompt",
+        params_json={"take_profit_pct": 0.05, "stop_loss_pct": 0.02},
+        notes="Auto-activated from adaptive_strategy_versions candidate 42 (fitness=70.0).",
+    )
+    mock_models.log_agent_event.assert_called_once()
+
+
+@patch("src.learning.simulation.models")
+def test_activate_exit_params_candidate_noop_when_no_current_version(mock_models):
+    mock_models.get_latest_version.return_value = None
+    candidate = {"id": 42, "params_json": {"stop_loss_pct": 0.02}, "fitness_score": 70.0}
+
+    assert _activate_exit_params_candidate(candidate) is None
+    mock_models.insert_strategy_version.assert_not_called()

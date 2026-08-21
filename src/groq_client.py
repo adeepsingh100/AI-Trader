@@ -4,17 +4,13 @@ ModelUsageEvent for the caller to persist to `model_usage`.
 
 Auto-fallback across providers, not a provider-select switch: every call
 tries the full Groq chain first, then automatically falls through to the
-full Gemini chain if every Groq model fails.
-
-Sole caller is src/learning/recommendations.py::generate_ai_exit_params_
-recommendations — an hourly, offline-from-live-trading proposal step, not
-a per-trade gate (that per-trade LLM gate, signal_agent.py, was removed
-entirely; trading is now 100% quant/deterministic, see orchestrator.py).
-At hourly volume a failed call here just means one skipped proposal for
-this cycle's candidate pipeline, never blocked trading — the reverse of
-the failure mode this auto-fallback chain was originally built for (Groq's
-free-tier daily token quota exhausted at per-trade call volume, causing a
-multi-day trading outage)."""
+full Gemini chain if every Groq model fails. Groq's free-tier daily token
+quota gets exhausted fast at this codebase's call volume (see
+PROJECT_SPEC.md §4), and nobody's reliably around to flip a manual
+switch when that happens — this keeps trading running same-cycle instead
+of going dark until someone notices (the actual incident this replaces).
+signal_agent.py and evolution_agent.py never know which provider
+answered."""
 
 from __future__ import annotations
 
@@ -72,8 +68,8 @@ def _groq_completion(client: Groq, model: str, messages: list[dict], max_tokens:
 def _gemini_completion(model: str, messages: list[dict], max_tokens: int) -> str:
     # Gemini's REST API uses "contents"/"parts" instead of OpenAI-style
     # chat messages, and a separate systemInstruction field rather than a
-    # "system" role entry — translated here so callers (built once,
-    # OpenAI-shaped) never need to know which provider runs.
+    # "system" role entry — translated here so signal_agent.py's messages
+    # (built once, OpenAI-shaped) never need to know which provider runs.
     system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
     contents = [
         {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
@@ -83,7 +79,7 @@ def _gemini_completion(model: str, messages: list[dict], max_tokens: int) -> str
     # thinkingBudget=0 disables Gemini 2.5's default reasoning pass — left
     # on, its <think> chain eats the whole maxOutputTokens budget before
     # ever emitting the requested JSON, so every call comes back truncated
-    # and unparseable.
+    # and unparseable (see signal_agent.py's fallback-to-reject path).
     payload: dict = {
         "contents": contents,
         "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}},

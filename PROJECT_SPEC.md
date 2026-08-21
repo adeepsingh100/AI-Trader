@@ -39,14 +39,23 @@ are binding unless the user says otherwise. Everything marked
   gap and orders can fail. Once triggered, no new positions open again
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
-  `strategy_versions.promoted_to_real = true`. Since the Scientific
-  Strategy Optimization Framework (§3e), this is a **human-approved**
-  flag, not an automatic one: `evolution_agent.py`'s nightly
-  `run_evolution()` sets `strategy_versions.promotion_eligible = true`
-  when the version clears every gate below, but never flips
-  `promoted_to_real` itself — a human reviews eligible rows in Supabase
-  and flips it themselves, closing what used to be the one place in this
-  codebase real money moved with zero human click. Gates, all
+  `strategy_versions.promoted_to_real = true`. `evolution_agent.py`'s
+  nightly `run_evolution()` sets `strategy_versions.promotion_eligible =
+  true` when the version clears every gate below, and — full automation,
+  reintroduced after the Scientific Strategy Optimization Framework
+  (§3e) made the gate itself rigorous — auto-flips `promoted_to_real` in
+  the same run via `models.promote_version()`. This is deliberately
+  different from the pre-§3e auto-promote it replaces: that one flipped
+  the flag off 3 raw thresholds with no statistical check at all (§3e);
+  this one only fires after all 5 gates below pass, including a bootstrap
+  CI on trade PnLs. `promote_version()` existed as a function for a while
+  with zero callers (a human was expected to invoke it by hand in
+  Supabase; nobody ever built the UI for it) before being wired in here.
+  A structural safety property survives regardless: promotion metrics are
+  scoped to `get_closed_trades(mode, version["id"])` — that specific
+  version's own trade history — so a freshly created version always
+  starts its own `PROMOTION_MIN_PAPER_DAYS` clock at zero and cannot
+  reach real money the same night it's created. Gates, all
   **configurable** (env vars, not a DB table — these change rarely and
   don't need versioning):
   - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
@@ -324,12 +333,20 @@ this is expected to be noisy until real trade history accumulates.
 
 Closes the loop from the Learning Engine's statistics into recommended
 parameter changes — walk-forward validated and simulated before a
-candidate is even created, then requiring explicit human approval before
-being treated as adopted. Two trust levels: everything that could change
-what the bot trades (weights, thresholds, avoid-symbol/avoid-regime)
-stays advisory, human-approved in Supabase, same as `recommendations`
-already worked before this. The one automatic piece is the confidence
-modifier chain, an extension of the already-automatic (and
+candidate is even created. Two trust levels, split by whether the
+candidate's target is a DB row or a deployment env var:
+**exit-params candidates** (`stop_loss_pct`/`take_profit_pct` — target
+`strategy_versions.params_json`, a DB row) **auto-activate** into a new
+`strategy_versions` row the moment they pass every statistical gate —
+`simulation.py::_activate_exit_params_candidate`. **Everything else**
+that could change what the bot trades (opportunity-scorer weights,
+thresholds, avoid-symbol/avoid-regime — these target `OPPORTUNITY_WEIGHT_*`-
+style `os.getenv()` constants in `config.py`, not a DB row) stays
+advisory, human-approved in Supabase, same as `recommendations` already
+worked before this — auto-applying those means rewriting deployment env
+vars and forcing a redeploy, a materially bigger change than a DB write,
+deliberately out of scope for now. The one other automatic piece is the
+confidence modifier chain, an extension of the already-automatic (and
 inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
 
 - **`feature_importance.py`** (extended): `compute_feature_importance`
@@ -705,9 +722,14 @@ Replaces the old "no trades → LLM guesses new prompt/params → auto-promote"
 loop with a research pipeline: Trade Memory → Performance Analysis →
 Weakness Detection → Hypothesis Generation → Candidate Strategy →
 Statistical Validation (walk-forward, bootstrap CI, optional backtest
-replay) → Promotion, all human-approved. Never modifies a strategy because
-trade count, confidence, or win rate alone moved — every change is backed
-by statistical evidence.
+replay) → Promotion. Never modifies a strategy because trade count,
+confidence, or win rate alone moved — every change is backed by
+statistical evidence. Originally shipped with every step past Statistical
+Validation gated on a human click (see the retirement note below); full
+automation of the exit-params-candidate → strategy_versions and
+promotion_eligible → promoted_to_real steps was reintroduced afterward —
+§2 and §3b above cover exactly what's automatic now and why it's a
+different, safer shape than what the retirement below describes.
 
 **The retirement**: `evolution_agent.py::propose_next_version` sent the LLM
 a bare `{current_prompt, current_params, metrics}` blob with an open-ended
@@ -911,49 +933,49 @@ is derived on read from tables that already exist, same "don't store a
 derivable fact under a second name" precedent as everywhere else in this
 codebase.
 
-## 4. LLM integration (Groq, auto-falling back to Gemini — hourly, offline from live trading)
+## 4. LLM integration (Groq, auto-falling back to Gemini)
 
-**Not in the live trade path at all.** `src/agents/signal_agent.py`, the
-per-trade LLM accept/reject gate, was removed entirely — every entry/exit
-is now a deterministic function of the Opportunity Scorer's already-computed
-score (§3, "Trade decisions — fully quant, zero LLM calls"). This followed
-a real incident: at up to `TOP_N_CANDIDATES` LLM calls every ~10-minute
-cycle, Groq's free-tier per-model daily token quota was exhausted fast
-enough to cause a multi-day trading outage before anyone noticed — a
-provider issue blocking live trading is the specific failure mode this
-architecture now makes structurally impossible, not just less likely.
-
-The LLM's sole remaining role is **hourly**, inside
-`AdaptiveStrategyEngine.analyze()` (§3b/§3e):
-`generate_ai_exit_params_recommendations` asks it to propose a
-`stop_loss_pct`/`take_profit_pct` candidate from recent trade
-statistics — one call per run, ~24/day, comfortably inside Groq's free
-quota even before Gemini fallback. That proposal is never applied
-directly: it's written as an ordinary `recommendations` row and has to
-clear the same walk-forward/bootstrap-CI/fitness-floor gate as every
-other candidate (§3e) before it can become a live `adaptive_strategy_versions`
-candidate. A failed or unavailable LLM call here just means no AI
-candidate that hour, logged and skipped — never a blocked run, since this
-step is offline from live trading entirely.
-
-- No provider-select env var — every call tries the full Groq chain
-  first, then automatically falls through to the full Gemini chain if
-  every Groq model fails. `src/groq_client.py`'s `chat()` is the single
-  entry point; callers never know which provider actually answered.
-- Model chain is **configurable** per provider (env var, ordered list):
-  default `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
-  `GEMINI_MODEL_CHAIN=gemini-2.5-flash`. Gemini's default reasoning
-  ("thinking") pass is explicitly disabled (`thinkingConfig.
-  thinkingBudget: 0`) — left on, it burns the whole output-token budget
-  on its `<think>` chain before ever emitting the requested JSON, so
-  every call came back truncated and unparseable until this was found
-  and fixed.
+- **No provider-select env var.** `src/groq_client.py::chat()` always
+  tries the full Groq chain first, then automatically falls through to
+  the full Gemini (Google AI Studio, REST API, authenticated via
+  `GEMINI_API_KEY` as a query param) chain if every Groq model fails —
+  a genuinely different incident from a single model's 429: it means
+  Groq's whole free-tier daily quota is exhausted (happens fast at this
+  codebase's call volume — see the sizing note below), and nobody's
+  reliably around to flip a manual switch when that happens. Gemini's
+  quota is entirely separate from Groq's, so this keeps trading running
+  same-cycle instead of going dark for days (the actual incident that
+  motivated this — confirmed via `model_usage`: every call 429'd on both
+  configured Groq models for several days straight before anyone
+  noticed). `chat()` is still the single entry point both agents call,
+  so this is invisible to `signal_agent.py`/`evolution_agent.py`.
+  Gemini's request/response shape (`contents`/`parts`, a separate
+  `systemInstruction` field) differs from the OpenAI-style messages they
+  build — translated once inside `_gemini_completion`.
+- Model chain is **configurable** per provider (env var, ordered list — Groq
+  deprecates models periodically): default
+  `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
+  `GEMINI_MODEL_CHAIN=gemini-2.5-flash`.
+- **Token budget sizing** (the actual cause of the exhaustion above): each
+  validation call runs ~2,100-2,300 tokens. At `TOP_N_CANDIDATES=5`
+  candidates/cycle and a ~10min cycle, that's up to ~700 calls/day —
+  multiple times Groq's free-tier 200k-tokens/day limit on its own.
+  `TOP_N_CANDIDATES` and `MIN_OPPORTUNITY_SCORE` are the direct levers to
+  bring daily demand under budget; the Gemini fallback buys resilience
+  for the day it happens, it doesn't fix sustained overconsumption — at
+  this call volume Gemini's own quota would eventually get hit too.
 - On 429 or any API error: retry with exponential backoff on the current
-  model, then fall back to the next model in the chain; when the entire
-  Groq chain is exhausted, fall through to the Gemini chain the same way.
-- Every call (success or failure, every model tried, either provider)
-  logs to `model_usage`: model name, fallback_reason (null on first-try
-  success), latency_ms, success.
+  model, then fall back to the next model in the chain (Groq's, then
+  Gemini's).
+- Every call (success or failure, every model tried, across both
+  providers) logs to `model_usage`: model name, fallback_reason (null on
+  first-try success, otherwise the previous model/provider's failure —
+  threaded across the Groq→Gemini handoff too, not reset), latency_ms,
+  success.
+- Verify during build (step 3) by forcing a failure (e.g. bad API key
+  swapped in temporarily, or a monkeypatched 429) to confirm the
+  fallback chain actually triggers and logs correctly, including the
+  cross-provider handoff — don't just trust the retry logic unexercised.
 
 ## 5. Deployment (free tier only)
 
@@ -1199,10 +1221,13 @@ strategy_simulations (
 -- adaptive_strategy_versions: versions QUANTITATIVE PARAMETERS (a
 -- params_json snapshot of tunable adaptive constants) — orthogonal to
 -- strategy_versions above, which versions LLM PROMPT TEXT. Created
--- lazily, only for simulations that pass. No separate "currently active"
--- table — `WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
--- answers that; auto-deploy is out of scope, a human still copies
--- approved values into env vars by hand.
+-- lazily, only for simulations that pass. Exit-params candidates
+-- auto-activate into a new strategy_versions row the same run
+-- (simulation.py::_activate_exit_params_candidate) — no separate
+-- "currently active" table needed there, get_latest_version() answers
+-- it. Weight/regime/symbol candidates still target env vars, not a DB
+-- row, so those stay advisory — a human still copies approved values
+-- into env vars by hand for those.
 adaptive_strategy_versions (
   id                             bigserial primary key,
   mode                           text not null,

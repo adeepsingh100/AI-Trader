@@ -185,10 +185,11 @@ def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models,
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is True
+    assert result["promoted"] is True
     assert result["learning_status"] is status
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, True)
     mock_models.insert_strategy_version.assert_not_called()
-    mock_models.promote_version.assert_not_called()
+    mock_models.promote_version.assert_called_once_with(1)
 
 
 @patch("src.learning.learning_status.compute_learning_status")
@@ -208,7 +209,9 @@ def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models, mock_l
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is False
+    assert result["promoted"] is False
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, False)
+    mock_models.promote_version.assert_not_called()
 
 
 @patch("src.learning.learning_status.compute_learning_status")
@@ -239,3 +242,5 @@ def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_s
     result = run_evolution(mode="real")
 
     assert result["promotion_eligible"] is False
+    assert result["promoted"] is False
+    mock_models.promote_version.assert_not_called()

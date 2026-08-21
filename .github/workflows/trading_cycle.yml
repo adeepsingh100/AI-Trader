@@ -1,8 +1,9 @@
 name: Trading cycle
 
 on:
-  schedule:
-    - cron: "2-59/5 * * * *"
+  # No `schedule:` trigger — GitHub Actions' own cron is unreliable below
+  # ~15min cadence (observed 40-57min gaps on a nominal 5min schedule).
+  # Triggered externally via workflow_dispatch on a real clock instead.
   workflow_dispatch:
 
 jobs:
@@ -18,6 +19,10 @@ jobs:
       # (see src/orchestrator.py's module docstring).
       - run: python -m src.orchestrator --mode=paper
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -33,6 +38,10 @@ jobs:
       # actually promoted — see src/orchestrator.py.
       - run: python -m src.orchestrator --mode=real
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
