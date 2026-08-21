@@ -92,20 +92,44 @@ def test_cooldown_gate_clears_after_window():
 
 def test_sample_size_gates_below_floor_is_false_not_none():
     with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300):
-        gates = _sample_size_gates(50, None, None)
+        gates = _sample_size_gates(50, None, None, None)
         assert gates["paper_trades"]["passed"] is False
+        assert gates["backtest_trades"]["passed"] is None
         assert gates["walk_forward_trades"]["passed"] is None
         assert gates["champion_challenger_trades"]["passed"] is None
 
 
 def test_sample_size_gates_all_clear():
     with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300), patch(
-        "src.learning.promotion_gate.PROMOTION_MIN_WALK_FORWARD_TRADES", 300
-    ), patch("src.learning.promotion_gate.PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", 200):
-        gates = _sample_size_gates(500, 400, 250)
+        "src.learning.promotion_gate.PROMOTION_MIN_BACKTEST_TRADES", 1000
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_WALK_FORWARD_TRADES", 300), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", 200
+    ):
+        gates = _sample_size_gates(500, 1200, 400, 250)
         assert gates["paper_trades"]["passed"] is True
+        assert gates["backtest_trades"]["passed"] is True
         assert gates["walk_forward_trades"]["passed"] is True
         assert gates["champion_challenger_trades"]["passed"] is True
+
+
+# --- Issue 1: backtest sample size actually enforced ---
+
+
+def test_backtest_trades_below_minimum_extends_validation():
+    # TEST 1: backtest_trades=999, minimum=1000 -> not a pass (routes to
+    # EXTEND_VALIDATION via evaluate_promotion, never REJECT — see the
+    # end-to-end test further down).
+    with patch("src.learning.promotion_gate.PROMOTION_MIN_BACKTEST_TRADES", 1000):
+        gates = _sample_size_gates(500, 999, None, None)
+        assert gates["backtest_trades"]["passed"] is False
+        assert gates["backtest_trades"]["count"] == 999
+
+
+def test_backtest_trades_at_minimum_passes():
+    # TEST 2: backtest_trades=1000, minimum=1000 -> gate passes.
+    with patch("src.learning.promotion_gate.PROMOTION_MIN_BACKTEST_TRADES", 1000):
+        gates = _sample_size_gates(500, 1000, None, None)
+        assert gates["backtest_trades"]["passed"] is True
 
 
 def test_bootstrap_probability_of_profit_all_positive_pnls():
@@ -204,6 +228,57 @@ def test_champion_improvement_gate_significant_and_meets_minimums_passes():
     assert gate["passed"] is True
 
 
+def test_champion_improvement_gate_missing_sharpe_is_pending_not_pass():
+    # TEST 3: Sharpe improvement = null -> never a silent pass, always
+    # "insufficient evidence" (EXTEND_VALIDATION at the decision level).
+    evidence = {
+        "champion_challenger": {
+            "comparison": {"winner": "b"},
+            "candidate_metrics": {"expectancy": 20.0, "sharpe_ratio": None, "max_drawdown_pct": 5.0},
+            "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": None, "max_drawdown_pct": 5.0},
+        }
+    }
+    gate = _champion_improvement_gate(_champion(), evidence)
+    assert gate["passed"] is None
+    assert gate["detail"] == "Insufficient Sharpe evidence"
+
+
+def test_champion_improvement_gate_low_confidence_rejects():
+    # TEST 4: Sharpe improvement clears its own minimum, but the paired
+    # champion-vs-challenger confidence (82%) is below PROMOTION_MIN_
+    # CONFIDENCE_PCT (95%) -> not significant -> gate fails.
+    evidence = {
+        "champion_challenger": {
+            "comparison": {"winner": "b"},
+            "paired_comparison": {"significant": False, "statistical_confidence_pct": 82.0},
+            "candidate_metrics": {"expectancy": 20.0, "sharpe_ratio": 2.24, "max_drawdown_pct": 5.0},
+            "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": 2.0, "max_drawdown_pct": 5.0},  # sharpe +12%
+        }
+    }
+    with patch("src.learning.promotion_gate.PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT", 5), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT", 10
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_CONFIDENCE_PCT", 95):
+        gate = _champion_improvement_gate(_champion(), evidence)
+    assert gate["passed"] is False
+    assert gate["statistical_confidence_pct"] == 82.0
+
+
+def test_champion_improvement_gate_paired_comparison_not_significant_rejects():
+    # TEST 5: candidate is profitable, but the paired test says it's NOT
+    # statistically better than champion -> gate fails (never a promotion
+    # on "profitable" alone).
+    evidence = {
+        "champion_challenger": {
+            "comparison": {"winner": "b"},
+            "paired_comparison": {"significant": False, "statistical_confidence_pct": 55.0},
+            "candidate_metrics": {"expectancy": 11.0, "sharpe_ratio": 1.05, "max_drawdown_pct": 5.0},
+            "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": 1.0, "max_drawdown_pct": 5.0},
+        }
+    }
+    gate = _champion_improvement_gate(_champion(), evidence)
+    assert gate["passed"] is False
+
+
 def test_champion_improvement_gate_not_significant_fails():
     evidence = {
         "champion_challenger": {
@@ -225,9 +300,43 @@ def test_promotion_score_renormalizes_among_available_components():
         "bootstrap_ci": {"detail": None},
         "regime_robustness": {"passed": True, "degraded_regimes": [], "detail": {}},
     }
-    score, components = _promotion_score(gates, {"passed": True}, None, 0)
+    score, components = _promotion_score(gates, {"passed": True}, None, 0, [])
     assert score is not None
     assert 0 <= score <= 100
+
+
+# --- Issue 4: execution_quality is real data or None, never a neutral 50 ---
+
+
+def test_execution_quality_unavailable_returns_none_and_redistributes():
+    from src.learning.promotion_gate import _execution_quality_component
+
+    trades_no_slippage_data = [{"pnl": 10}, {"pnl": -5}]
+    assert _execution_quality_component(trades_no_slippage_data) is None
+
+    gates = {
+        "paper_trades": {"passed": True},
+        "walk_forward_trades": {"passed": None},
+        "paper_days_pnl_drawdown": {"passed": True, "detail": {"max_drawdown_pct": 5.0}},
+        "monte_carlo": {"passed": None},
+        "bootstrap_ci": {"detail": None},
+        "regime_robustness": {"passed": True, "degraded_regimes": [], "detail": {}},
+    }
+    score, components = _promotion_score(gates, {"passed": True}, None, 0, trades_no_slippage_data)
+    assert components["execution_quality"] is None
+    assert score is not None  # still computed, renormalized among what's available
+
+
+def test_execution_quality_uses_real_slippage_when_available():
+    from src.learning.promotion_gate import _execution_quality_component
+
+    with patch("src.learning.promotion_gate.SLIPPAGE_BPS", 5.0):
+        low_slippage = [{"entry_slippage_pct": 0.01}, {"entry_slippage_pct": -0.01}]
+        high_slippage = [{"entry_slippage_pct": 0.5}, {"entry_slippage_pct": -0.5}]
+        low = _execution_quality_component(low_slippage)
+        high = _execution_quality_component(high_slippage)
+        assert low is not None and high is not None
+        assert low > high
 
 
 # --- evaluate_promotion: end-to-end decision scenarios (Phase 23) ---
@@ -352,8 +461,11 @@ def test_cooldown_blocks_regardless_of_otherwise_clean_evidence(mock_models, moc
 @patch("src.learning.promotion_gate._backtest_evidence")
 @patch("src.learning.promotion_gate.models")
 def test_valid_robust_candidate_promotes(mock_models, mock_evidence):
+    # TEST 6: candidate is statistically better than champion (paired
+    # comparison significant), every mandatory gate clears -> AUTO-PROMOTE.
     _no_prior_promotions(mock_models)
     evidence = dict(_EMPTY_BACKTEST_EVIDENCE)
+    evidence["backtest_trades_count"] = 1200  # TEST 2: clears PROMOTION_MIN_BACKTEST_TRADES
     evidence["walk_forward_trades_count"] = 400
     from src.backtest.overfitting_detection import OverfittingReport
 
@@ -364,17 +476,20 @@ def test_valid_robust_candidate_promotes(mock_models, mock_evidence):
     evidence["champion_challenger_trades_count"] = 250
     evidence["champion_challenger"] = {
         "comparison": {"winner": "b"},
-        "candidate_metrics": {"expectancy": 25.0, "sharpe_ratio": 2.0, "max_drawdown_pct": 4.0},
-        "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": 1.0, "max_drawdown_pct": 5.0},
+        "paired_comparison": {"significant": True, "statistical_confidence_pct": 98.0},
+        "candidate_metrics": {"expectancy": 25.0, "sharpe_ratio": 2.0, "max_drawdown_pct": 4.0, "sortino_ratio": 2.5, "profit_factor": 2.1},
+        "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": 1.0, "max_drawdown_pct": 5.0, "sortino_ratio": 1.5, "profit_factor": 1.6},
     }
     mock_evidence.return_value = evidence
     trades = _diverse_trades(350, win_pnl=60, loss_pnl=-10)  # clean, diversified, low drawdown
 
     with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300), patch(
-        "src.learning.promotion_gate.PROMOTION_MIN_WALK_FORWARD_TRADES", 300
-    ), patch("src.learning.promotion_gate.PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", 200), patch(
-        "src.learning.promotion_gate.PROMOTION_MIN_PROFITABLE_SYMBOLS", 2
-    ), patch("src.learning.promotion_gate.PROMOTION_MIN_SCORE", 50):
+        "src.learning.promotion_gate.PROMOTION_MIN_BACKTEST_TRADES", 1000
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_WALK_FORWARD_TRADES", 300), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", 200
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_PROFITABLE_SYMBOLS", 2), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_SCORE", 50
+    ):
         decision = evaluate_promotion(
             "paper", _candidate(), trades, 10000, champion=_champion(), symbol_to_pair={"BTCINR": "I-BTCINR"}
         )
@@ -383,10 +498,59 @@ def test_valid_robust_candidate_promotes(mock_models, mock_evidence):
     assert decision.promotion_score is not None
     # audit completeness: every gate this run touched is present regardless of decision
     assert set(decision.gates) >= {
-        "cooldown", "paper_trades", "walk_forward_trades", "champion_challenger_trades",
+        "cooldown", "paper_trades", "backtest_trades", "walk_forward_trades", "champion_challenger_trades",
         "paper_days_pnl_drawdown", "bootstrap_ci", "fitness_floor", "monte_carlo",
         "regime_robustness", "symbol_robustness", "overfitting", "champion_improvement",
     }
+    # Issue 6: explicit named-field decision record, persisted into breakdown.
+    summary = decision.breakdown["summary"]
+    assert summary["decision"] == "PROMOTE"
+    assert summary["backtest_trades"] == 1200
+    assert summary["statistical_confidence_pct"] == 98.0
+    assert summary["failed_gates"] == []
+
+
+@patch("src.learning.promotion_gate._backtest_evidence")
+@patch("src.learning.promotion_gate.models")
+def test_high_promotion_score_does_not_override_failed_mandatory_gate(mock_models, mock_evidence):
+    # TEST 9: every soft signal (score-eligible components) looks great,
+    # but ONE mandatory gate — drawdown — genuinely fails -> REJECT
+    # regardless of how high the promotion score would otherwise be.
+    _no_prior_promotions(mock_models)
+    evidence = dict(_EMPTY_BACKTEST_EVIDENCE)
+    evidence["backtest_trades_count"] = 1200
+    evidence["walk_forward_trades_count"] = 400
+    from src.backtest.overfitting_detection import OverfittingReport
+
+    evidence["overfitting_report"] = OverfittingReport(
+        n_folds=5, n_passed=5, walk_forward_failure_rate=0.0,
+        in_sample_out_of_sample_gap_pct=5.0, parameter_sensitivity=None, verdict="robust",
+    )
+    evidence["champion_challenger_trades_count"] = 250
+    evidence["champion_challenger"] = {
+        "comparison": {"winner": "b"},
+        "paired_comparison": {"significant": True, "statistical_confidence_pct": 99.0},
+        "candidate_metrics": {"expectancy": 25.0, "sharpe_ratio": 2.0, "max_drawdown_pct": 4.0},
+        "champion_metrics": {"expectancy": 10.0, "sharpe_ratio": 1.0, "max_drawdown_pct": 5.0},
+    }
+    mock_evidence.return_value = evidence
+    # Excellent win rate/expectancy (drives the score up) but a single
+    # catastrophic loss blows past PROMOTION_MAX_DRAWDOWN_PCT.
+    trades = _diverse_trades(350, win_pnl=60, loss_pnl=-10) + [_trade(-50000, 15)]
+
+    with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_BACKTEST_TRADES", 1000
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_WALK_FORWARD_TRADES", 300), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", 200
+    ), patch("src.learning.promotion_gate.PROMOTION_MIN_PROFITABLE_SYMBOLS", 2), patch(
+        "src.learning.promotion_gate.PROMOTION_MIN_SCORE", 0
+    ):  # score floor disabled so only the hard gate is under test
+        decision = evaluate_promotion(
+            "paper", _candidate(), trades, 10000, champion=_champion(), symbol_to_pair={"BTCINR": "I-BTCINR"}
+        )
+
+    assert decision.decision == "REJECT"
+    assert decision.gates["paper_days_pnl_drawdown"]["passed"] is False
 
 
 @patch("src.learning.promotion_gate._backtest_evidence")
@@ -401,7 +565,8 @@ def test_first_ever_promotion_no_champion_not_blocked_by_champion_gate(mock_mode
     with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300):
         decision = evaluate_promotion("paper", _candidate(), trades, 10000, champion=None, symbol_to_pair=None)
     assert decision.gates["champion_improvement"]["passed"] is True
-    assert decision.decision == "EXTEND_VALIDATION"
+    assert decision.gates["champion_improvement"]["status"] == "NOT_APPLICABLE"  # TEST 8
+    assert decision.decision == "EXTEND_VALIDATION"  # other mandatory gates (backtest/walk-forward) still active
 
 
 @patch("src.learning.promotion_gate._backtest_evidence")

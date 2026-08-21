@@ -132,9 +132,11 @@ def promote_version(version_id: int) -> None:
 
 
 def set_strategy_version_promotion_eligible(version_id: int, eligible: bool) -> None:
-    """Code sets this flag only — never promoted_to_real itself (Scientific
-    Strategy Optimization Framework). A human reviews eligible rows in
-    Supabase and flips promoted_to_real themselves."""
+    """Mirrors src/learning/promotion_gate.py::evaluate_promotion()'s
+    PROMOTE/REJECT/EXTEND_VALIDATION verdict onto the row for visibility —
+    evolution_agent.py calls promote_version() itself immediately after on
+    PROMOTE, fully automatically, no human step. This flag is a record of
+    the decision, not a queue awaiting manual action."""
     get_client().table("strategy_versions").update({"promotion_eligible": eligible}).eq(
         "id", version_id
     ).execute()

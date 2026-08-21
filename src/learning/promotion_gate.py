@@ -20,6 +20,19 @@ params_json/config.py directly — only decides PROMOTE/REJECT/
 EXTEND_VALIDATION and returns it for the caller (evolution_agent.py) to
 act on and audit.
 
+Hardening pass (audit findings, same 3-way decision, same full automation
+— no new gate category, no manual-approval step added anywhere):
+- The backtest trade-count sample-size gate (PROMOTION_MIN_BACKTEST_TRADES)
+  is now actually enforced — it was imported/configured but never checked.
+- A missing Sharpe improvement is missing evidence (EXTEND_VALIDATION),
+  never silently treated as a pass.
+- The primary champion-vs-challenger significance test is now PAIRED —
+  candidate-minus-champion equity delta at matching backtest-replay
+  snapshots (same symbols/date range/decision-cycle grid), gated at
+  PROMOTION_MIN_CONFIDENCE_PCT — not "is the candidate profitable alone".
+- execution_quality in the Promotion Score is real per-trade slippage data
+  (or None + reweighted among the rest) — never a neutral 50 placeholder.
+
 Two gate categories, deliberately never conflated:
 - "extend-only" gates (sample sizes): a definite below-floor count is
   EXTEND_VALIDATION, never REJECT — "not enough evidence yet" is not the
@@ -61,7 +74,9 @@ from src.config import (
     PROMOTION_MC_MAX_CATASTROPHIC_DD_PROBABILITY_PCT,
     PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT,
     PROMOTION_MC_MIN_PROFITABLE_PCT,
+    PROMOTION_MIN_BACKTEST_TRADES,
     PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES,
+    PROMOTION_MIN_CONFIDENCE_PCT,
     PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT,
     PROMOTION_MIN_FITNESS_SCORE,
     PROMOTION_MIN_PAPER_TRADES,
@@ -78,6 +93,7 @@ from src.config import (
     PROMOTION_SCORE_WEIGHT_STABILITY,
     PROMOTION_SCORE_WEIGHT_STATISTICAL_SIGNIFICANCE,
     RECOMMENDATION_MIN_SAMPLE_SIZE,
+    SLIPPAGE_BPS,
 )
 from src.db import models
 from src.features.opportunity_scorer import weighted_average
@@ -86,7 +102,7 @@ from src.learning.statistics import compute_bucket_statistics
 from src.utils import clamp
 from src.utils import parse_timestamp as _parse_ts
 
-_EXTEND_ONLY_GATES = ("paper_trades", "walk_forward_trades", "champion_challenger_trades")
+_EXTEND_ONLY_GATES = ("paper_trades", "backtest_trades", "walk_forward_trades", "champion_challenger_trades")
 _REJECT_CAPABLE_GATES = (
     "paper_days_pnl_drawdown", "bootstrap_ci", "fitness_floor", "monte_carlo",
     "regime_robustness", "symbol_robustness", "overfitting", "champion_improvement",
@@ -152,6 +168,32 @@ def _bootstrap_probability_of_profit(
     return positive / iterations * 100
 
 
+def _paired_champion_comparison(champion_result: dict, candidate_result: dict) -> dict | None:
+    """Issue 3's primary significance test: candidate MINUS champion, not
+    candidate-alone profitability. Both backtest engines replay the
+    identical symbols/date-range/decision-cycle grid, so snapshot i is the
+    same wall-clock instant in both runs — period-over-period equity
+    deltas are therefore genuinely paired, not two independent samples.
+    Reuses _bootstrap_probability_of_profit's resampling (built for the
+    Monte Carlo risk gate below) against the paired diff series instead of
+    raw pnls — "is this positive" is the same question either way."""
+    champ_eq = [s["equity"] for s in champion_result["snapshots"]]
+    cand_eq = [s["equity"] for s in candidate_result["snapshots"]]
+    n = min(len(champ_eq), len(cand_eq))
+    if n < 3:
+        return None
+    diffs = [(cand_eq[i] - cand_eq[i - 1]) - (champ_eq[i] - champ_eq[i - 1]) for i in range(1, n)]
+    confidence_pct = _bootstrap_probability_of_profit(diffs)
+    if confidence_pct is None:
+        return None
+    return {
+        "mean_diff_per_period": sum(diffs) / len(diffs),
+        "statistical_confidence_pct": confidence_pct,
+        "significant": confidence_pct >= PROMOTION_MIN_CONFIDENCE_PCT,
+        "sample_size": len(diffs),
+    }
+
+
 def _cooldown_gate(mode: str) -> dict:
     latest = models.get_latest_promotion_audit(mode, event_type="promotion")
     if latest is None:
@@ -164,7 +206,12 @@ def _cooldown_gate(mode: str) -> dict:
     return {"passed": True, "detail": f"{elapsed.days}d since last promotion"}
 
 
-def _sample_size_gates(paper_count: int, walk_forward_count: int | None, champion_challenger_count: int | None) -> dict:
+def _sample_size_gates(
+    paper_count: int,
+    backtest_count: int | None,
+    walk_forward_count: int | None,
+    champion_challenger_count: int | None,
+) -> dict:
     gates = {
         "paper_trades": {
             "passed": paper_count >= PROMOTION_MIN_PAPER_TRADES,
@@ -172,6 +219,18 @@ def _sample_size_gates(paper_count: int, walk_forward_count: int | None, champio
             "minimum": PROMOTION_MIN_PAPER_TRADES,
         }
     }
+    # Issue 1: the actual backtest trade count (BacktestEngine's own
+    # closed_trades, never paper/walk-forward/champion-challenger counts
+    # substituted in) must independently clear PROMOTION_MIN_BACKTEST_TRADES
+    # — previously imported/configured but never enforced.
+    if backtest_count is None:
+        gates["backtest_trades"] = {"passed": None, "detail": "backtest not available (no historical data)"}
+    else:
+        gates["backtest_trades"] = {
+            "passed": backtest_count >= PROMOTION_MIN_BACKTEST_TRADES,
+            "count": backtest_count,
+            "minimum": PROMOTION_MIN_BACKTEST_TRADES,
+        }
     if walk_forward_count is None:
         gates["walk_forward_trades"] = {"passed": None, "detail": "walk-forward not available (no historical data)"}
     else:
@@ -347,6 +406,7 @@ def _backtest_evidence(candidate: dict, champion: dict | None, candidate_trades:
             "comparison": compare_strategies(
                 champion_result["closed_trades"], candidate_result["closed_trades"], champion_metrics, candidate_metrics
             ),
+            "paired_comparison": _paired_champion_comparison(champion_result, candidate_result),
             "candidate_metrics": candidate_metrics,
             "champion_metrics": champion_metrics,
         }
@@ -365,7 +425,14 @@ def _pct_improvement(old: float | None, new: float | None) -> float | None:
 
 def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -> dict:
     if champion is None:
-        return {"passed": True, "detail": "no current champion — vacuously passes (first-ever promotion)"}
+        # Issue 5: first-ever promotion has nothing to beat — vacuously
+        # passes this ONE gate, every other gate (sample sizes, risk,
+        # regime/symbol robustness, overfitting) still runs independently.
+        return {
+            "passed": True,
+            "status": "NOT_APPLICABLE",
+            "detail": "no current champion — vacuously passes (first-ever promotion)",
+        }
 
     cc = backtest_evidence.get("champion_challenger")
     if cc is None:
@@ -378,19 +445,53 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
         return {"passed": None, "detail": "expectancy improvement not computable yet", "comparison": comparison}
 
     sharpe_improvement_pct = _pct_improvement(champ.get("sharpe_ratio"), cand.get("sharpe_ratio"))
+    if sharpe_improvement_pct is None:
+        # Issue 2: a missing Sharpe improvement is missing EVIDENCE, never
+        # a pass and never treated as 0 — the old `is None or >=` check
+        # let a null silently clear this gate, which is exactly backwards.
+        return {
+            "passed": None,
+            "detail": "Insufficient Sharpe evidence",
+            "expectancy_improvement_pct": expectancy_improvement_pct,
+            "comparison": comparison,
+        }
+
+    sortino_improvement_pct = _pct_improvement(champ.get("sortino_ratio"), cand.get("sortino_ratio"))
+    profit_factor_change = None
+    if champ.get("profit_factor") is not None and cand.get("profit_factor") is not None:
+        profit_factor_change = cand["profit_factor"] - champ["profit_factor"]
     drawdown_increase_pct = (cand.get("max_drawdown_pct") or 0) - (champ.get("max_drawdown_pct") or 0)
-    significant = comparison.get("winner") == "b"  # "b" = candidate, the 2nd trade set passed to compare()
+
+    # Issue 3: the primary significance test is candidate MINUS champion,
+    # paired at matching backtest-replay snapshots (same symbols/date
+    # range/decision-cycle grid) — not "is the candidate profitable on its
+    # own". Falls back to the older unpaired win-rate/expectancy z-test
+    # only when the paired series couldn't be computed (e.g. fewer than 3
+    # aligned snapshots) — still real evidence, just weaker.
+    paired = cc.get("paired_comparison")
+    if paired is not None:
+        significant = paired["significant"]
+        statistical_confidence_pct = paired["statistical_confidence_pct"]
+    else:
+        significant = comparison.get("winner") == "b"  # "b" = candidate, the 2nd trade set passed to compare()
+        statistical_confidence_pct = None
+
     meets_minimums = (
         expectancy_improvement_pct >= PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT
-        and (sharpe_improvement_pct is None or sharpe_improvement_pct >= PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT)
+        and sharpe_improvement_pct >= PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT
         and drawdown_increase_pct <= PROMOTION_MAX_DRAWDOWN_INCREASE_PCT
     )
     return {
         "passed": significant and meets_minimums,
         "significant": significant,
+        "statistical_confidence_pct": statistical_confidence_pct,
         "sharpe_improvement_pct": sharpe_improvement_pct,
+        "sortino_improvement_pct": sortino_improvement_pct,
         "expectancy_improvement_pct": expectancy_improvement_pct,
+        "profit_factor_change": profit_factor_change,
         "drawdown_increase_pct": drawdown_increase_pct,
+        "candidate_metrics": cand,
+        "champion_metrics": champ,
         "comparison": comparison,
     }
 
@@ -409,16 +510,34 @@ def _complexity_delta(candidate: dict, champion: dict | None) -> int:
     return sum(1 for k in all_keys if candidate_params.get(k) != champion_params.get(k))
 
 
+def _execution_quality_component(trades: list[dict]) -> float | None:
+    """Real per-trade entry slippage — orchestrator.py already records
+    entry_slippage_pct on every opened trade — scored against the assumed
+    SLIPPAGE_BPS baseline the net-expectancy gate already prices every
+    trade against. Issue 4: None (never a neutral 50) when no trade in
+    this candidate's history has slippage recorded; weighted_average
+    excludes a None component and redistributes its weight, same
+    convention every other aggregation step in this codebase already uses."""
+    slippages = [abs(t["entry_slippage_pct"]) for t in trades if t.get("entry_slippage_pct") is not None]
+    if not slippages or not SLIPPAGE_BPS:
+        return None
+    avg_slippage_bps = (sum(slippages) / len(slippages)) * 100  # pct -> bps
+    return clamp(100 - (avg_slippage_bps / SLIPPAGE_BPS) * 50, 0, 100)
+
+
 def _promotion_score(
     gates: dict,
     champion_gate: dict,
     overfitting_report: OverfittingReport | None,
     complexity_delta: int,
+    trades: list[dict],
 ) -> tuple[float | None, dict]:
     """`gates` is the full merged gate dict evaluate_promotion built (sample-
     size + risk + regime/symbol/overfitting all live in one dict there) —
     a single parameter, not artificially split, since every component
-    below reads from that same merged evidence."""
+    below reads from that same merged evidence. `trades` is the
+    candidate's own closed trades, used only for the execution-quality
+    component."""
     out_of_sample = None
     if gates["paper_trades"]["passed"]:
         out_of_sample = 100.0 if gates.get("walk_forward_trades", {}).get("passed") else 60.0
@@ -442,7 +561,7 @@ def _promotion_score(
     if regime_gate.get("detail"):
         regime_robustness = 0.0 if regime_gate.get("degraded_regimes") else 100.0
 
-    execution_quality = 50.0  # neutral — no live execution-optimizer data wired into orchestrator yet
+    execution_quality = _execution_quality_component(trades)
 
     stability = None if overfitting_report is None else clamp(100 - overfitting_report.walk_forward_failure_rate, 0, 100)
 
@@ -496,7 +615,10 @@ def evaluate_promotion(
     backtest_evidence = _backtest_evidence(candidate, champion, closed_trades, symbol_to_pair)
 
     gates.update(_sample_size_gates(
-        len(closed_trades), backtest_evidence["walk_forward_trades_count"], backtest_evidence["champion_challenger_trades_count"]
+        len(closed_trades),
+        backtest_evidence["backtest_trades_count"],
+        backtest_evidence["walk_forward_trades_count"],
+        backtest_evidence["champion_challenger_trades_count"],
     ))
     gates.update(_risk_gates(candidate, metrics, closed_trades, fitness_score, capital_to_use))
 
@@ -516,7 +638,66 @@ def evaluate_promotion(
     gates["champion_improvement"] = champion_gate
 
     complexity_delta = _complexity_delta(candidate, champion)
-    score, score_components = _promotion_score(gates, champion_gate, overfitting_report, complexity_delta)
+    score, score_components = _promotion_score(gates, champion_gate, overfitting_report, complexity_delta, closed_trades)
+
+    # Issue 7: mandatory gates decide first, unconditionally — the score
+    # below only ever gates a candidate that has ALREADY cleared every one
+    # of them; it can never rescue a candidate that failed one.
+    reasons: list[str] = []
+    if not gates["cooldown"]["passed"]:
+        decision = "EXTEND_VALIDATION"
+        reasons.append(gates["cooldown"]["detail"])
+    else:
+        reject_failed = [n for n in _REJECT_CAPABLE_GATES if gates.get(n, {}).get("passed") is False]
+        if reject_failed:
+            decision = "REJECT"
+            reasons.extend(f"{n} failed" for n in reject_failed)
+        else:
+            extend_unmet = [n for n in _EXTEND_ONLY_GATES if gates.get(n, {}).get("passed") is not True]
+            reject_pending = [n for n in _REJECT_CAPABLE_GATES if gates.get(n, {}).get("passed") is None]
+            if extend_unmet or reject_pending:
+                decision = "EXTEND_VALIDATION"
+                reasons.extend(f"{n}: insufficient evidence — {gates[n].get('detail')}" for n in extend_unmet + reject_pending)
+            elif score is None or score < PROMOTION_MIN_SCORE:
+                decision = "EXTEND_VALIDATION"
+                reasons.append(f"promotion_score {score} below minimum {PROMOTION_MIN_SCORE}")
+            else:
+                decision = "PROMOTE"
+                reasons.append(f"all gates cleared, promotion_score={score:.1f}")
+
+    # Issue 6: one explicit, flat, named-field decision record — everything
+    # a human (or the promotion_audit row §9/Issue 10 persists it into)
+    # needs to answer "why", without re-deriving it from nested gates.
+    risk_gate_names = ("paper_days_pnl_drawdown", "bootstrap_ci", "fitness_floor", "monte_carlo")
+    risk_results = [gates[n].get("passed") for n in risk_gate_names]
+    risk_status = "fail" if any(r is False for r in risk_results) else "pending" if any(r is None for r in risk_results) else "pass"
+
+    summary = {
+        "candidate_id": candidate.get("id"),
+        "version_number": candidate.get("version_number"),
+        "champion_id": champion.get("id") if champion else None,
+        "champion_version_number": champion.get("version_number") if champion else None,
+        "backtest_trades": backtest_evidence["backtest_trades_count"],
+        "walk_forward_trades": backtest_evidence["walk_forward_trades_count"],
+        "paper_trades": len(closed_trades),
+        "champion_challenger_trades": backtest_evidence["champion_challenger_trades_count"],
+        "sharpe_improvement_pct": champion_gate.get("sharpe_improvement_pct"),
+        "sortino_improvement_pct": champion_gate.get("sortino_improvement_pct"),
+        "expectancy_improvement_pct": champion_gate.get("expectancy_improvement_pct"),
+        "drawdown_change_pct": champion_gate.get("drawdown_increase_pct"),
+        "profit_factor_change": champion_gate.get("profit_factor_change"),
+        "statistical_confidence_pct": champion_gate.get("statistical_confidence_pct"),
+        "regime_robustness_passed": gates["regime_robustness"]["passed"],
+        "symbol_robustness_passed": gates["symbol_robustness"]["passed"],
+        "execution_quality": score_components.get("execution_quality"),
+        "overfitting_status": overfitting_report.verdict if overfitting_report is not None else None,
+        "risk_status": risk_status,
+        "promotion_score": score,
+        "decision": decision,
+        "promotion_reason": "; ".join(reasons),
+        "failed_gates": [n for n, g in gates.items() if g.get("passed") is False],
+        "missing_gates": [n for n, g in gates.items() if g.get("passed") is None],
+    }
 
     breakdown = {
         "metrics": metrics,
@@ -525,30 +706,7 @@ def evaluate_promotion(
         "score_components": score_components,
         "backtest_evidence_available": backtest_evidence["backtest_trades_count"] is not None,
         "walk_forward_fold_count": len(backtest_evidence["walk_forward_folds"] or []),
+        "summary": summary,
     }
 
-    reasons: list[str] = []
-
-    if not gates["cooldown"]["passed"]:
-        reasons.append(gates["cooldown"]["detail"])
-        return PromotionDecision("EXTEND_VALIDATION", score, gates, reasons, breakdown)
-
-    reject_failed = [n for n in _REJECT_CAPABLE_GATES if gates.get(n, {}).get("passed") is False]
-    if reject_failed:
-        for n in reject_failed:
-            reasons.append(f"{n} failed")
-        return PromotionDecision("REJECT", score, gates, reasons, breakdown)
-
-    extend_unmet = [n for n in _EXTEND_ONLY_GATES if gates.get(n, {}).get("passed") is not True]
-    reject_pending = [n for n in _REJECT_CAPABLE_GATES if gates.get(n, {}).get("passed") is None]
-    if extend_unmet or reject_pending:
-        for n in extend_unmet + reject_pending:
-            reasons.append(f"{n}: insufficient evidence — {gates[n].get('detail')}")
-        return PromotionDecision("EXTEND_VALIDATION", score, gates, reasons, breakdown)
-
-    if score is None or score < PROMOTION_MIN_SCORE:
-        reasons.append(f"promotion_score {score} below minimum {PROMOTION_MIN_SCORE}")
-        return PromotionDecision("EXTEND_VALIDATION", score, gates, reasons, breakdown)
-
-    reasons.append(f"all gates cleared, promotion_score={score:.1f}")
-    return PromotionDecision("PROMOTE", score, gates, reasons, breakdown)
+    return PromotionDecision(decision, score, gates, reasons, breakdown)

@@ -78,11 +78,16 @@ PROMOTION_MAX_SYMBOL_PROFIT_CONCENTRATION_PCT = float(
 PROMOTION_MIN_PROFITABLE_SYMBOLS = int(os.getenv("PROMOTION_MIN_PROFITABLE_SYMBOLS", "2"))
 
 # Champion-vs-challenger minimum improvement (Phase 5) — required ON TOP OF
-# statistical significance (SIGNIFICANCE_THRESHOLD, reused), never either
-# alone.
+# statistical significance, never either alone. Significance itself is a
+# PAIRED test (candidate-minus-champion equity delta at each matching
+# backtest-replay snapshot, same symbols/date range/decision-cycle grid —
+# "is the challenger better", not "is the challenger profitable") gated at
+# PROMOTION_MIN_CONFIDENCE_PCT confidence, not the unpaired candidate-alone
+# significance check this replaced.
 PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT", "10"))
 PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT", "5"))
 PROMOTION_MAX_DRAWDOWN_INCREASE_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_INCREASE_PCT", "0"))
+PROMOTION_MIN_CONFIDENCE_PCT = float(os.getenv("PROMOTION_MIN_CONFIDENCE_PCT", "95"))
 
 # Promotion cooldown (Phase 22) — blocks rapid-fire promotions regardless
 # of how many candidates happen to clear every other gate in one run.

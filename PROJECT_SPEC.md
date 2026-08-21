@@ -47,11 +47,16 @@ are binding unless the user says otherwise. Everything marked
   true` and auto-flips `promoted_to_real` in the same run via
   `models.promote_version()`. Auto-promotion itself isn't new (it
   survived the original 3-raw-threshold version this replaced, §3e); what
-  changed is the bar: sample-size floors (paper/walk-forward/champion-
-  challenger trade counts, not just elapsed days), risk/statistical/
-  Monte-Carlo gates, regime/symbol robustness, an overfitting verdict, and
-  a statistically significant, same-market-data improvement over the
-  current real-mode champion — not 3-5 simple thresholds. Missing
+  changed is the bar: sample-size floors (backtest/paper/walk-forward/
+  champion-challenger trade counts, not just elapsed days), risk/
+  statistical/Monte-Carlo gates, regime/symbol robustness, an overfitting
+  verdict, and a statistically significant, same-market-data improvement
+  over the current real-mode champion — not 3-5 simple thresholds. The
+  champion-vs-challenger significance test itself is PAIRED (candidate-
+  minus-champion equity delta at matching backtest-replay snapshots, same
+  symbols/date range/decision-cycle grid, gated at
+  `PROMOTION_MIN_CONFIDENCE_PCT`) — "is the challenger better than the
+  champion", not "is the challenger profitable on its own". Missing
   required evidence (e.g. no historical candles ingested yet for the
   walk-forward/champion-challenger backtest-replay gates) always yields
   `EXTEND_VALIDATION`, never a silent skip and never a promotion on
@@ -944,7 +949,16 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   conditional write of the same kind — a `promotion_audit` `'rollback'`
   row when the version it just suspended was the live real-mode champion
   (Automatic Rollback, §2) — fails open, same as the module's other
-  advisory writes.
+  advisory writes. Hardening pass on top of the above (same 3-way decision,
+  same full automation): the backtest trade-count sample-size gate
+  (`PROMOTION_MIN_BACKTEST_TRADES`) is now actually enforced (previously
+  configured but never checked); a missing Sharpe improvement is missing
+  evidence (`EXTEND_VALIDATION`), never silently a pass; the champion-vs-
+  challenger significance test is the paired comparison described in §2,
+  not candidate-alone profitability; `execution_quality` in the Promotion
+  Score is real per-trade `entry_slippage_pct` data scored against
+  `SLIPPAGE_BPS` (or `None` + reweighted among the rest), never a neutral
+  50 placeholder.
 - **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
   confidence/opportunity-score/risk/stop-loss/target accuracy percentages
   over `trade_evaluations`, which `_evaluate_trade` already tagged
@@ -1048,9 +1062,10 @@ methods — `can_generate_hypotheses()`, `can_simulate()`, `can_validate()`,
 `can_create_candidate()` (delegates to `can_validate()` — candidate rows
 are validation's output, not a separately-thresholded gate, one number
 behind both names), and `can_promote()` (reads the `promotion_eligible`
-flag `evolution_agent.promotion_eligible()` already computes with its own
-full rigor — paper-days + PnL + drawdown + bootstrap CI + fitness — never
-recomputes promotion logic here). `recommendations.py`'s 5 generators and
+flag `src.learning.promotion_gate.evaluate_promotion()` already computes
+with its own full rigor — sample sizes, risk/statistical/Monte-Carlo
+gates, regime/symbol robustness, champion improvement, promotion score —
+never recomputes promotion logic here). `recommendations.py`'s 5 generators and
 `simulation.py`'s 3 simulators each gained an optional
 `status: LearningStatus | None = None` param (same threading pattern
 `generate_recommendations`'s existing `weakness_context` param already

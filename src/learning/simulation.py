@@ -370,9 +370,10 @@ def _activate_exit_params_candidate(candidate: dict) -> dict | None:
     vars, not a DB row, so there's no equivalent safe automated path for
     those without a redeploy). Real money is unaffected by this step
     alone: the new version only reaches real trading after independently
-    clearing evolution_agent.promotion_eligible() on ITS OWN paper trade
-    history — get_closed_trades(mode, version["id"]) scopes to the new
-    version's id, so its PROMOTION_MIN_PAPER_DAYS clock starts at zero."""
+    clearing src.learning.promotion_gate.evaluate_promotion() on ITS OWN
+    paper trade history — get_closed_trades(mode, version["id"]) scopes to
+    the new version's id, so its sample-size/paper-days clocks start at
+    zero."""
     current = models.get_latest_version()
     if current is None:
         return None

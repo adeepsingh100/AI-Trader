@@ -49,7 +49,7 @@ _ACTIVITY = {
     "OBSERVATION": "Analyzing rejection reasons, feature distributions, and weakness patterns. No strategy changes yet.",
     "HYPOTHESIS": "Generating hypotheses (weight/threshold/exit-parameter recommendations) from observed weaknesses. No candidate strategies yet.",
     "SIMULATION": "Testing hypotheses via backtest and walk-forward simulation. Candidates are validated but not yet created.",
-    "VALIDATION": "Full validation active — passing simulations create candidate strategies, pending human approval for promotion.",
+    "VALIDATION": "Full validation active — passing simulations create candidate strategies; promotion itself is automatic once promotion_gate.py's full evidence bar clears, no human approval step.",
 }
 
 
@@ -88,9 +88,10 @@ class LearningStatus:
         return self.can_validate()
 
     def can_promote(self) -> bool:
-        # Reads the fact evolution_agent.promotion_eligible() already
-        # computed (paper-days + PnL + drawdown + bootstrap CI + fitness)
-        # — never recomputes promotion logic here.
+        # Reads the fact src.learning.promotion_gate.evaluate_promotion()
+        # already computed (sample sizes, risk/statistical/Monte-Carlo
+        # gates, regime/symbol robustness, champion improvement, promotion
+        # score) — never recomputes promotion logic here.
         return self.promotion_eligible
 
 
