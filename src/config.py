@@ -292,17 +292,6 @@ BACKTEST_WALK_FORWARD_TEST_DAYS = int(os.getenv("BACKTEST_WALK_FORWARD_TEST_DAYS
 # small-n confidence intervals are answered by the seeded bootstrap above
 # instead, which needs no distributional assumption at all.
 
-# Off by default: quant-only (feature engine + opportunity scorer + risk
-# manager) is the deterministic default that actually satisfies "everything
-# must be deterministic" — the live LLM signal agent is temperature-sampled.
-# When enabled, validate_opportunity() is reused as-is for realism, but the
-# historical-confidence/regime/symbol blend is deliberately NOT reused (it
-# queries LIVE current trades/learning_statistics, which would leak
-# present-day trade history into a historical decision) — LLM-mode
-# confidence is the raw AI verdict only, and is labeled non-reproducible in
-# reports rather than fed into PerformanceAnalyzer's trusted default metrics.
-BACKTEST_USE_LLM_SIGNAL_AGENT = (os.getenv("BACKTEST_USE_LLM_SIGNAL_AGENT") or "false").strip().lower() == "true"
-
 # CoinDCX's public candles endpoint caps at 500 rows per call regardless of
 # the requested startTime/endTime range (confirmed empirically) — named
 # here so pagination logic has no magic number.

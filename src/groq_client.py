@@ -34,9 +34,9 @@ from src.resilience import backoff_delay
 MAX_RETRIES_PER_MODEL = LLM_MAX_RETRIES_PER_MODEL
 BACKOFF_BASE_SECONDS = LLM_BACKOFF_BASE_SECONDS
 # openai/gpt-oss-120b on Groq caps context at 8K tokens, input+output
-# combined. Our prompts are small (a strategy prompt + a market snapshot,
-# or a metrics summary), so the real risk is unbounded *output* eating
-# the budget — this keeps every call well inside it regardless of chain.
+# combined. Our prompts are small (a metrics summary), so the real risk
+# is unbounded *output* eating the budget — this keeps every call well
+# inside it regardless of chain.
 DEFAULT_MAX_TOKENS = 1024
 GEMINI_TIMEOUT_SECONDS = 60
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"

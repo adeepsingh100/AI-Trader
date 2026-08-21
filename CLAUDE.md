@@ -20,7 +20,7 @@ Vercel) that reads the same Supabase DB read-only.
 
 ```bash
 pip install -r requirements.txt          # deps
-pytest                                   # full suite (272 tests, ~1s, all mocked — no network/DB)
+pytest                                   # full suite (589 tests, ~1s, all mocked — no network/DB)
 pytest tests/test_orchestrator.py        # one file
 pytest tests/test_orchestrator.py::test_name  # one test
 python3 -m py_compile $(find src -name "*.py")  # syntax-check whole src tree
@@ -46,7 +46,7 @@ npm run lint    # eslint
 
 ### Pipeline (`src/orchestrator.py::run_cycle`)
 
-Quant-first, LLM-gated, two-pass per cycle:
+Fully quant, zero LLM calls anywhere in this cycle:
 
 1. **Data Agent** (`src/agents/data_agent.py`) — pulls candles from CoinDCX for `FEATURE_TIMEFRAMES`.
 2. **Feature Engine** (`src/features/feature_engine.py`) — pure indicator math (RSI, MACD, StochRSI, ATR, Bollinger, OBV, ADX, EMAs, support/resistance), no LLM.
@@ -59,9 +59,9 @@ Pass 1 of `run_cycle` handles open-position exits (stop-loss/take-profit/exit-sc
 
 ### Learning system (`src/learning/`) — two trust tiers
 
-**Trade Memory + Learning Engine** (§3a in PROJECT_SPEC.md): `trade_memory.py` (nearest-neighbor similar-trade lookup for confidence blending), `feature_importance.py` (per-timeframe + blended sub-score correlation), `statistics.py` (Sharpe/Sortino/Calmar/expectancy/streaks/z-tests, all stdlib — no numpy/scipy anywhere in this repo), `confidence_calibration.py`, `recommendations.py`, `reports.py`. Runs nightly via `evolution_agent.py`.
+**Trade Memory + Learning Engine** (§3a in PROJECT_SPEC.md): `trade_memory.py` (nearest-neighbor similar-trade lookup for confidence blending), `feature_importance.py` (per-timeframe + blended sub-score correlation), `statistics.py` (Sharpe/Sortino/Calmar/expectancy/streaks/z-tests, all stdlib — no numpy/scipy anywhere in this repo), `confidence_calibration.py`, `recommendations.py`, `reports.py`. Runs hourly via `evolution_agent.py`.
 
-**Adaptive Strategy Intelligence Engine** (§3b, `adaptive_strategy_engine.py` + `simulation.py`) — layered on top, runs as its **own** independent nightly step (`python -m src.learning.adaptive_strategy_engine` in `evolution.yml`, after but not inside `evolution_agent.run_evolution()` — never merge these two call sites, it was deliberately kept as a separate step to avoid coupling). Generates weight/regime/symbol/threshold recommendations, walk-forward validates them (train/test time-split, no look-ahead), simulates against trades actually taken (never fabricates counterfactual trades — no backtester exists), and versions passing candidates into `adaptive_strategy_versions`.
+**Adaptive Strategy Intelligence Engine** (§3b, `adaptive_strategy_engine.py` + `simulation.py`) — layered on top, runs as its **own** independent hourly step (`python -m src.learning.adaptive_strategy_engine` in `evolution.yml`, after but not inside `evolution_agent.run_evolution()` — never merge these two call sites, it was deliberately kept as a separate step to avoid coupling). Generates weight/regime/symbol/threshold/exit-params recommendations — the exit-params one has an AI-assisted sibling, `generate_ai_exit_params_recommendations`, that proposes a candidate value via an LLM call instead of a pure-stat sweep, written as an ordinary `recommendations` row indistinguishable downstream from the pure-stat one — walk-forward validates them all (train/test time-split, no look-ahead), simulates against trades actually taken (never fabricates counterfactual trades — no backtester exists), and versions passing candidates into `adaptive_strategy_versions`.
 
 **Invariant, narrowed**: nothing in `src/learning/` ever auto-writes to `config.py` or live scoring weights (`OPPORTUNITY_WEIGHT_*` and similar `os.getenv()` constants) — weight/regime/symbol-threshold recommendations stay advisory, a human still reviews `recommendations`/`adaptive_strategy_versions` rows in Supabase's table editor and manually copies values into env vars, exactly as before. What's no longer true as a blanket statement: **exit-params candidates** (`stop_loss_pct`/`take_profit_pct`, which target a DB row — `strategy_versions.params_json` — not an env var) **auto-activate** into a new `strategy_versions` row the moment they clear every statistical gate (`simulation.py::_activate_exit_params_candidate`), and `evolution_agent.py::run_evolution()` auto-flips `promoted_to_real` the same way once `promotion_eligible()`'s five gates (§2) all pass — see PROJECT_SPEC.md §2/§3b for the full reasoning (unchanged gates, only the human click removed; a fresh version's own `PROMOTION_MIN_PAPER_DAYS` clock still starts at zero). The confidence-modifier chain in `confidence_calibration.py` (regime/symbol/recent-performance modifiers) remains the third automatic piece, extending the already-automatic, already-inert-by-default gate (`MIN_FINAL_CONFIDENCE=0`). Don't treat any of these three as precedent for auto-applying weight/regime/symbol-threshold recommendations too — that still needs env-var rewrites + a redeploy, a deliberately separate, bigger change.
 
@@ -79,7 +79,7 @@ Next.js App Router, client components fetch Supabase directly (anon key, RLS-gat
 
 ### Testing conventions
 
-All 272 tests mock `src.db.models` / external clients — no real network or DB calls in the suite (a slow/hanging test run is a signal something is leaking a real client, not just flakiness). New statistical or DB-touching code gets its own `tests/test_<module>.py`; don't rely on indirect coverage through a caller's mocked test.
+All 589 tests mock `src.db.models` / external clients — no real network or DB calls in the suite (a slow/hanging test run is a signal something is leaking a real client, not just flakiness). New statistical or DB-touching code gets its own `tests/test_<module>.py`; don't rely on indirect coverage through a caller's mocked test.
 
 ## Workflow Orchestration
 

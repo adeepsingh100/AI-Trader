@@ -79,13 +79,12 @@ def _permissive_calibration():
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_opens_trade_on_accepted_entry_candidate(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -96,7 +95,6 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
     mock_select.return_value = [{"symbol": "BTCINR"}]
     mock_models.open_trade.return_value = {"id": 99}
     mock_models.log_opportunity_evaluation.return_value = {"id": 501}
-    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = _permissive_calibration()
 
@@ -108,11 +106,9 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
     assert result["opened"] == [{"id": 99}]
     assert result["closed"] == []
     assert result["circuit_breaker"] is False
-    mock_validate.assert_called_once()
-    assert mock_validate.call_args.kwargs["context"] == "entry"
     execution_agent.place_order.assert_called_once_with("BTCINR", "buy", pytest.approx(0.001), 1_000_000)
     mock_models.open_trade.assert_called_once()
-    assert mock_models.open_trade.call_args.kwargs["reasoning_text"] == "go"
+    assert "quant score 85.0" in mock_models.open_trade.call_args.kwargs["reasoning_text"]
     assert mock_models.open_trade.call_args.kwargs["market_regime"] == "strong_bull"
     mock_models.log_opportunity_evaluation.assert_called_once()
     eval_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
@@ -124,13 +120,12 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
 
 
 @patch("src.orchestrator.process_closed_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_skips_symbol_not_in_candidate_set(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -144,7 +139,6 @@ def test_run_cycle_skips_symbol_not_in_candidate_set(
     result = run_cycle(execution_agent=execution_agent)
 
     assert result["opened"] == []
-    mock_validate.assert_not_called()
     execution_agent.place_order.assert_not_called()
     log_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
     assert log_kwargs["final_decision"] == "hold"
@@ -156,45 +150,12 @@ def test_run_cycle_skips_symbol_not_in_candidate_set(
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
-@patch("src.orchestrator.select_top_candidates")
-@patch("src.orchestrator.score_opportunity")
-@patch("src.orchestrator.models")
-@patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_does_not_buy_when_llm_rejects_entry(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
-):
-    mock_models.get_capital_config.return_value = _capital_config()
-    mock_models.get_latest_version.return_value = _version()
-    mock_models.get_daily_pnl.return_value = None
-    mock_models.get_open_trades.return_value = []
-    mock_snapshot.return_value = [_market()]
-    mock_score.return_value = _scores(85)
-    mock_select.return_value = [{"symbol": "BTCINR"}]
-    mock_validate.return_value = ({"decision": "reject", "reasoning": "too extended"}, [])
-    mock_similar.return_value = _empty_similar()
-    mock_calibrate.return_value = _permissive_calibration()
-
-    execution_agent = Mock()
-    result = run_cycle(execution_agent=execution_agent)
-
-    assert result["opened"] == []
-    execution_agent.place_order.assert_not_called()
-    log_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
-    assert log_kwargs["llm_decision"] == "reject"
-    assert log_kwargs["reason"] == "too extended"
-
-
-@patch("src.orchestrator.process_closed_trades")
-@patch("src.orchestrator.calibrate_confidence")
-@patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_llm_accepts_but_risk_manager_blocks_max_positions(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config(max_concurrent_positions=2)
     mock_models.get_latest_version.return_value = _version()
@@ -206,7 +167,6 @@ def test_run_cycle_llm_accepts_but_risk_manager_blocks_max_positions(
     mock_snapshot.return_value = [_market()]
     mock_score.return_value = _scores(85)
     mock_select.return_value = [{"symbol": "BTCINR"}]
-    mock_validate.return_value = ({"decision": "accept", "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = _permissive_calibration()
 
@@ -223,13 +183,12 @@ def test_run_cycle_llm_accepts_but_risk_manager_blocks_max_positions(
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_confidence_gate_blocks_despite_llm_accept(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -238,7 +197,6 @@ def test_run_cycle_confidence_gate_blocks_despite_llm_accept(
     mock_snapshot.return_value = [_market()]
     mock_score.return_value = _scores(85)
     mock_select.return_value = [{"symbol": "BTCINR"}]
-    mock_validate.return_value = ({"decision": "accept", "confidence": 30, "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = {
         "final_confidence": 30.0,
@@ -266,13 +224,12 @@ def test_run_cycle_confidence_gate_blocks_despite_llm_accept(
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_closes_held_position_when_llm_accepts_exit(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+def test_run_cycle_closes_held_position_when_score_drops_below_exit_threshold(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
@@ -284,14 +241,12 @@ def test_run_cycle_closes_held_position_when_llm_accepts_exit(
     mock_snapshot.return_value = [_market(price=1_000_000)]
     mock_score.return_value = _scores(20)  # below EXIT_SCORE_THRESHOLD (40)
     mock_select.return_value = []
-    mock_validate.return_value = ({"decision": "accept", "reasoning": "deteriorated"}, [])
 
     execution_agent = Mock()
     execution_agent.place_order.return_value = {"fill_price": 999_500, "fees": 1.0}
 
     result = run_cycle(execution_agent=execution_agent)
 
-    assert mock_validate.call_args.kwargs["context"] == "exit"
     execution_agent.place_order.assert_called_once_with("BTCINR", "sell", 0.001, 1_000_000)
     mock_models.close_trade.assert_called_once()
     assert mock_models.close_trade.call_args.kwargs["exit_reason"] == "ai_exit"
@@ -303,41 +258,12 @@ def test_run_cycle_closes_held_position_when_llm_accepts_exit(
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_keeps_held_position_when_llm_rejects_exit(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
-):
-    mock_ticker.return_value = []
-    held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
-    mock_models.get_capital_config.return_value = _capital_config()
-    mock_models.get_latest_version.return_value = _version()
-    mock_models.get_daily_pnl.return_value = None
-    mock_models.get_open_trades.return_value = [held]
-    mock_snapshot.return_value = [_market(price=1_000_000)]
-    mock_score.return_value = _scores(20)
-    mock_select.return_value = []
-    mock_validate.return_value = ({"decision": "reject", "reasoning": "still worth holding"}, [])
-
-    execution_agent = Mock()
-    result = run_cycle(execution_agent=execution_agent)
-
-    execution_agent.place_order.assert_not_called()
-    assert result["closed"] == []
-
-
-@patch("src.orchestrator.process_closed_trades")
-@patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
-@patch("src.orchestrator.select_top_candidates")
-@patch("src.orchestrator.score_opportunity")
-@patch("src.orchestrator.models")
-@patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_no_exit_validation_when_score_above_threshold(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+def test_run_cycle_no_exit_when_score_above_threshold(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
@@ -352,7 +278,6 @@ def test_run_cycle_no_exit_validation_when_score_above_threshold(
     execution_agent = Mock()
     result = run_cycle(execution_agent=execution_agent)
 
-    mock_validate.assert_not_called()
     assert result["closed"] == []
     log_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
     assert log_kwargs["reason"] == "score_above_exit_threshold_or_unavailable"
@@ -360,13 +285,12 @@ def test_run_cycle_no_exit_validation_when_score_above_threshold(
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_no_exit_validation_when_score_unavailable(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+def test_run_cycle_no_exit_when_score_unavailable(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     # opportunity_score None (insufficient candle history) must not crash
     # a `None < EXIT_SCORE_THRESHOLD` comparison
@@ -383,7 +307,6 @@ def test_run_cycle_no_exit_validation_when_score_unavailable(
     execution_agent = Mock()
     result = run_cycle(execution_agent=execution_agent)
 
-    mock_validate.assert_not_called()
     assert result["closed"] == []
 
 
@@ -392,13 +315,12 @@ def test_run_cycle_no_exit_validation_when_score_unavailable(
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_stop_loss_sweep_closes_before_scoring_pass_considers_it(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 1_000_000, "fees": 0}
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 970_000}]
@@ -421,19 +343,18 @@ def test_run_cycle_stop_loss_sweep_closes_before_scoring_pass_considers_it(
     mock_models.close_trade.assert_called_once()
     assert mock_models.close_trade.call_args.kwargs["exit_reason"] == "stop_loss"
     assert result["closed"] == [held]
-    # the sweep already closed it — the scoring pass must not also validate an exit for it
-    mock_validate.assert_not_called()
+    # the sweep already closed it — the scoring pass must not also try to exit it again
+    execution_agent.place_order.assert_called_once()
 
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_sweep_leaves_position_alone_when_no_leg_hit(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 1_000_000, "fees": 0}
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 995_000}]  # -0.5%, under 2% SL
@@ -457,13 +378,12 @@ def test_run_cycle_sweep_leaves_position_alone_when_no_leg_hit(
 # --- circuit breaker ---
 
 
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_flattens_and_skips_when_breaker_already_triggered(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate
+    mock_snapshot, mock_models, mock_score, mock_select
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -478,19 +398,17 @@ def test_run_cycle_flattens_and_skips_when_breaker_already_triggered(
 
     execution_agent.flatten_all.assert_called_once_with("paper")
     mock_snapshot.assert_not_called()
-    mock_validate.assert_not_called()
     assert result == {"opened": [], "closed": [], "circuit_breaker": True}
 
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.get_ticker")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_ticker, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_ticker, mock_process
 ):
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "ETHINR", "qty": 1, "entry_price": 200_000, "fees": 0}
@@ -506,7 +424,6 @@ def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
 
     mock_score.return_value = _scores(20)  # below exit threshold for the held ETHINR
     mock_select.return_value = [{"symbol": "BTCINR"}]
-    mock_validate.return_value = ({"decision": "accept", "reasoning": "cut loss"}, [])
 
     execution_agent = Mock()
     execution_agent.place_order.return_value = {"fill_price": 199_000, "fees": 0}
@@ -518,8 +435,8 @@ def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
     assert result["closed"] == [held]
     assert result["opened"] == []
     execution_agent.flatten_all.assert_called_once_with("paper")
-    # BTCINR's entry validation must never have been attempted
-    assert mock_validate.call_count == 1
+    # BTCINR's entry must never have been attempted — only ETHINR got processed
+    assert mock_models.log_opportunity_evaluation.call_count == 1
     buy_calls = [c for c in execution_agent.place_order.call_args_list if c.args[1] == "buy"]
     assert buy_calls == []
 
@@ -528,13 +445,12 @@ def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
 
 
 @patch("src.orchestrator.process_closed_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
-def test_run_cycle_logs_every_scanned_symbol_even_without_an_llm_call(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_process
+def test_run_cycle_logs_every_scanned_symbol(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -548,7 +464,6 @@ def test_run_cycle_logs_every_scanned_symbol_even_without_an_llm_call(
     run_cycle(execution_agent=execution_agent)
 
     assert mock_models.log_opportunity_evaluation.call_count == 2
-    mock_validate.assert_not_called()
     mock_process.assert_called_once_with("paper")
 
 
@@ -558,13 +473,12 @@ def test_run_cycle_logs_every_scanned_symbol_even_without_an_llm_call(
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     """A confirmed real gap before this fix: one symbol's exception used
     to crash the whole cycle, so every remaining symbol never got
@@ -579,7 +493,6 @@ def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
     mock_select.return_value = [{"symbol": "BTCINR"}, {"symbol": "ETHINR"}]
     mock_models.open_trade.return_value = {"id": 99}
     mock_models.log_opportunity_evaluation.return_value = {"id": 501}
-    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
     mock_calibrate.return_value = _permissive_calibration()
     # First symbol's similarity lookup blows up; second symbol must still
     # be processed normally.
@@ -657,11 +570,10 @@ def test_run_cycle_real_mode_noop_when_no_capital_config(mock_models):
     mock_models.get_latest_promoted_version.assert_not_called()
 
 
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.get_market_snapshot")
 @patch("src.orchestrator.models")
 def test_run_cycle_paper_paused_skips_without_touching_scoring(
-    mock_models, mock_snapshot, mock_validate
+    mock_models, mock_snapshot
 ):
     mock_models.get_capital_config.return_value = _capital_config(paused=True)
 
@@ -670,14 +582,12 @@ def test_run_cycle_paper_paused_skips_without_touching_scoring(
     assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
     mock_models.get_latest_version.assert_not_called()
     mock_snapshot.assert_not_called()
-    mock_validate.assert_not_called()
 
 
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.get_market_snapshot")
 @patch("src.orchestrator.models")
 def test_run_cycle_real_paused_skips_without_touching_scoring(
-    mock_models, mock_snapshot, mock_validate
+    mock_models, mock_snapshot
 ):
     mock_models.get_capital_config.return_value = _capital_config(paused=True)
 
@@ -686,22 +596,20 @@ def test_run_cycle_real_paused_skips_without_touching_scoring(
     assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
     mock_models.get_latest_promoted_version.assert_not_called()
     mock_snapshot.assert_not_called()
-    mock_validate.assert_not_called()
 
 
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_real_mode_uses_promoted_version_not_latest(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     # latest overall version is #7 (unvetted paper draft), but only #3 is
-    # promoted — real mode must validate against #3's prompt, not #7's
+    # promoted — real mode must open trades against #3, not #7
     promoted_version = {"id": 3, "version_number": 3, "prompt_text": "promoted prompt"}
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_promoted_version.return_value = promoted_version
@@ -710,7 +618,6 @@ def test_run_cycle_real_mode_uses_promoted_version_not_latest(
     mock_snapshot.return_value = [_market()]
     mock_score.return_value = _scores(85)
     mock_select.return_value = [{"symbol": "BTCINR"}]
-    mock_validate.return_value = ({"decision": "accept", "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = _permissive_calibration()
     mock_models.open_trade.return_value = {"id": 1}
@@ -720,7 +627,6 @@ def test_run_cycle_real_mode_uses_promoted_version_not_latest(
 
     run_cycle(mode="real", execution_agent=execution_agent)
 
-    assert mock_validate.call_args.args[1] == "promoted prompt"
     assert mock_models.open_trade.call_args.kwargs["version_id"] == 3
     mock_models.get_latest_version.assert_not_called()
     mock_process.assert_called_once_with("real")
@@ -867,13 +773,12 @@ def test_recent_performance_modifier_none_when_no_recent_trades(mock_models):
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
-@patch("src.orchestrator.validate_opportunity")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
 def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_validate, mock_similar, mock_calibrate, mock_process
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_version.return_value = _version()
@@ -884,7 +789,6 @@ def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
     mock_select.return_value = [{"symbol": "BTCINR"}]
     mock_models.open_trade.return_value = {"id": 99}
     mock_models.log_opportunity_evaluation.return_value = {"id": 501}
-    mock_validate.return_value = ({"decision": "accept", "confidence": 80, "reasoning": "go"}, [])
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = _permissive_calibration()
 

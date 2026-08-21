@@ -2,10 +2,12 @@ from unittest.mock import patch
 
 import pytest
 
+from src.groq_client import AllModelsFailedError
 from src.learning.learning_status import LearningStatus
 from src.learning.recommendations import (
     _simulate_exit_pnl,
     current_weights,
+    generate_ai_exit_params_recommendations,
     generate_exit_params_recommendations,
     generate_recommendations,
     generate_regime_recommendations,
@@ -350,3 +352,108 @@ def test_generate_exit_params_recommendations_proposes_tighter_stop_on_clear_imp
 def test_generate_exit_params_recommendations_empty_when_baseline_expectancy_none(mock_models):
     mock_models.get_recently_closed_trades.return_value = []
     assert generate_exit_params_recommendations("paper", status=_READY) == []
+
+
+# --- generate_ai_exit_params_recommendations ---
+#
+# AI-assisted sibling: same idempotency/staging gates, but the candidate
+# value comes from a mocked chat() call instead of a sweep. Never lets an
+# LLM failure raise — the hourly job it feeds must keep going regardless.
+
+
+def _ai_trades():
+    return [_trade(i, pnl=-30.0, entry_price=100.0, qty=1.0, mae_pct=5.0, mfe_pct=0.2) for i in range(1, 5)]
+
+
+@patch("src.learning.recommendations.chat")
+@patch("src.learning.recommendations.models")
+def test_generate_ai_exit_params_recommendations_below_stage_gate_returns_empty_without_calling_chat(
+    mock_models, mock_chat
+):
+    assert generate_ai_exit_params_recommendations("paper", status=_NOT_READY) == []
+    mock_chat.assert_not_called()
+
+
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MIN_PCT", 0.005)
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MAX_PCT", 0.10)
+@patch("src.learning.recommendations.chat")
+@patch("src.learning.recommendations.models")
+def test_generate_ai_exit_params_recommendations_writes_recommendation_from_valid_proposal(
+    mock_models, mock_chat
+):
+    mock_models.get_recently_closed_trades.return_value = _ai_trades()
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {"stop_loss_pct": 0.02}}
+    mock_models.get_latest_recommendation.return_value = None
+    mock_chat.return_value = (
+        '{"stop_loss_pct": 0.03, "take_profit_pct": null, "rationale": "widen stop, MAE consistently exceeds 2%"}',
+        ["usage-event"],
+    )
+
+    result = generate_ai_exit_params_recommendations("paper", status=_READY)
+
+    assert result == [
+        {
+            "metric_name": "stop_loss_pct",
+            "recommended_value": 0.03,
+            "rationale": "AI-proposed: widen stop, MAE consistently exceeds 2%",
+        }
+    ]
+    mock_models.insert_recommendation.assert_called_once()
+    call_kwargs = mock_models.insert_recommendation.call_args.kwargs
+    assert call_kwargs["metric_name"] == "stop_loss_pct"
+    assert call_kwargs["recommended_value"] == 0.03
+    assert call_kwargs["category"] == "exit_params"
+    assert call_kwargs["evidence"]["ai_raw_response"]["stop_loss_pct"] == 0.03
+    mock_models.log_model_usage.assert_called_once_with(["usage-event"])
+
+
+@patch("src.learning.recommendations.chat")
+@patch("src.learning.recommendations.models")
+def test_generate_ai_exit_params_recommendations_all_models_failed_returns_empty_without_raising(
+    mock_models, mock_chat
+):
+    mock_models.get_recently_closed_trades.return_value = _ai_trades()
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_chat.side_effect = AllModelsFailedError("all models failed", events=[])
+
+    result = generate_ai_exit_params_recommendations("paper", status=_READY)
+
+    assert result == []
+    mock_models.insert_recommendation.assert_not_called()
+    mock_models.log_agent_event.assert_called_once()
+    assert mock_models.log_agent_event.call_args.args[0] == "ai_strategy_proposer"
+
+
+@patch("src.learning.recommendations.chat")
+@patch("src.learning.recommendations.models")
+def test_generate_ai_exit_params_recommendations_unparseable_response_returns_empty(mock_models, mock_chat):
+    mock_models.get_recently_closed_trades.return_value = _ai_trades()
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_chat.return_value = ("not json at all {{{", [])
+
+    result = generate_ai_exit_params_recommendations("paper", status=_READY)
+
+    assert result == []
+    mock_models.insert_recommendation.assert_not_called()
+    mock_models.log_agent_event.assert_called_once()
+
+
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MIN_PCT", 0.005)
+@patch("src.learning.recommendations.EXIT_PARAM_SWEEP_MAX_PCT", 0.10)
+@patch("src.learning.recommendations.chat")
+@patch("src.learning.recommendations.models")
+def test_generate_ai_exit_params_recommendations_out_of_range_value_ignored(mock_models, mock_chat):
+    mock_models.get_recently_closed_trades.return_value = _ai_trades()
+    mock_models.get_capital_config.return_value = {"capital_to_use": 1000}
+    mock_models.get_latest_version.return_value = {"params_json": {}}
+    mock_models.get_latest_recommendation.return_value = None
+    # way outside the valid sweep range — must be rejected, not blindly trusted
+    mock_chat.return_value = ('{"stop_loss_pct": 5.0, "take_profit_pct": null, "rationale": "x"}', [])
+
+    result = generate_ai_exit_params_recommendations("paper", status=_READY)
+
+    assert result == []
+    mock_models.insert_recommendation.assert_not_called()

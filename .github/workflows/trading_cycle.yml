@@ -15,6 +15,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # Pure quant/deterministic — zero LLM calls, no LLM secrets needed
+      # (see src/orchestrator.py's module docstring).
       - run: python -m src.orchestrator --mode=paper
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

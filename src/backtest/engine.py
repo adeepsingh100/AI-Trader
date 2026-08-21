@@ -41,7 +41,6 @@ from src.config import (
     BACKTEST_RISK_CHECK_MINUTES,
     BACKTEST_STARTING_CAPITAL,
     BACKTEST_TICK_TIMEFRAME,
-    BACKTEST_USE_LLM_SIGNAL_AGENT,
     BACKTEST_WARMUP_BUFFER_DAYS,
     EXIT_SCORE_THRESHOLD,
     FEATURE_CANDLE_LIMIT,
@@ -50,7 +49,7 @@ from src.config import (
 )
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
-from src.features.opportunity_scorer import PRIMARY_TIMEFRAME, score_opportunity, select_top_candidates
+from src.features.opportunity_scorer import score_opportunity, select_top_candidates
 from src.portfolio.intelligence import Position as IntelligencePosition
 
 from src.backtest.simulation_clock import SimulationClock
@@ -66,42 +65,6 @@ SURVIVORSHIP_BIAS_NOTE = (
 def _date_to_ms(d: date, end_of_day: bool = False) -> int:
     t = datetime.combine(d, time.max if end_of_day else time.min, tzinfo=timezone.utc)
     return int(t.timestamp() * 1000)
-
-
-def _opportunity_summary(record: dict, held: dict | None = None) -> dict:
-    """Curated digest for the optional LLM mode — deliberately narrower
-    than orchestrator._opportunity_summary: no historical_context. Blending
-    in live find_similar_trades()/learning_statistics here would leak
-    present-day trade history into a historical decision (this run's
-    simulated `now` is usually years before the live data queried)."""
-    primary = record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}
-    summary = {
-        "symbol": record["symbol"],
-        "last_price": record["last_price"],
-        "opportunity_score": record["opportunity_score"],
-        "sub_scores": {
-            "trend": record["trend_score"],
-            "momentum": record["momentum_score"],
-            "volume": record["volume_score"],
-            "volatility": record["volatility_score"],
-            "risk": record["risk_score"],
-        },
-        "volatility_label": primary.get("volatility_regime"),
-        "support": primary.get("support"),
-        "resistance": primary.get("resistance"),
-        "distance_from_resistance_pct": primary.get("distance_from_resistance_pct"),
-        "volume_spike": primary.get("volume_spike"),
-        "adx": primary.get("adx"),
-    }
-    if held is not None:
-        entry_price = held.entry_price
-        last_price = record["last_price"]
-        summary["held_position"] = {
-            "entry_price": entry_price,
-            "qty": held.qty,
-            "unrealized_pnl_pct": (last_price - entry_price) / entry_price * 100 if entry_price else None,
-        }
-    return summary
 
 
 class BacktestEngine:
@@ -121,8 +84,6 @@ class BacktestEngine:
         tick_timeframe: str = BACKTEST_TICK_TIMEFRAME,
         decision_cycle_minutes: int = BACKTEST_DECISION_CYCLE_MINUTES,
         risk_check_minutes: int = BACKTEST_RISK_CHECK_MINUTES,
-        use_llm_signal_agent: bool = BACKTEST_USE_LLM_SIGNAL_AGENT,
-        strategy_prompt: str = "You are a disciplined crypto trading strategy validator.",
     ):
         self.symbols = symbols
         self.start_date = start_date
@@ -138,8 +99,6 @@ class BacktestEngine:
         self.tick_timeframe = tick_timeframe
         self.decision_cycle_ms = decision_cycle_minutes * 60_000
         self.risk_check_ms = risk_check_minutes * 60_000
-        self.use_llm_signal_agent = use_llm_signal_agent
-        self.strategy_prompt = strategy_prompt
 
         run_start_ms = _date_to_ms(start_date)
         run_end_ms = _date_to_ms(end_date, end_of_day=True)
@@ -312,9 +271,10 @@ class BacktestEngine:
             opportunity_score = record["opportunity_score"]
 
             if held is None and symbol in candidate_symbols:
-                accept, confidence = self._entry_verdict(record)
-                if not accept:
-                    continue
+                # MIN_OPPORTUNITY_SCORE/TOP_N_CANDIDATES clearance (already
+                # true — select_top_candidates filtered on it) is the entry
+                # decision, deterministic — mirrors orchestrator.py.
+                confidence = opportunity_score
                 decision: RiskDecision = evaluate(
                     self.capital_config,
                     self.daily_pnl,
@@ -348,9 +308,8 @@ class BacktestEngine:
                 )
 
             elif held is not None and opportunity_score is not None and opportunity_score < EXIT_SCORE_THRESHOLD:
-                accept, _ = self._exit_verdict(record, held)
-                if not accept:
-                    continue
+                # Score dropping below EXIT_SCORE_THRESHOLD is itself the
+                # exit decision — mirrors orchestrator.py.
                 fill = execute_market_order(
                     symbol, "sell", held.qty, record["last_price"], self._bar_volume(symbol, time_ms)
                 )
@@ -362,31 +321,6 @@ class BacktestEngine:
                 )
                 self.daily_pnl["realized_pnl"] += trade.pnl
                 self.daily_pnl["trades_count"] += 1
-
-    def _entry_verdict(self, record: dict) -> tuple[bool, float | None]:
-        """Quant-only default: MIN_OPPORTUNITY_SCORE clearance (already
-        true — select_top_candidates filtered on it) is acceptance,
-        deterministic, no confidence value. LLM opt-in: real
-        validate_opportunity() call, raw AI confidence only (see module
-        docstring on why no historical blend)."""
-        if not self.use_llm_signal_agent:
-            return True, None
-        from src.agents.signal_agent import validate_opportunity
-
-        summary = _opportunity_summary(record)
-        verdict, usage_events = validate_opportunity(summary, self.strategy_prompt, context="entry")
-        models.log_model_usage(usage_events)
-        return verdict.get("decision") == "accept", verdict.get("confidence")
-
-    def _exit_verdict(self, record: dict, held) -> tuple[bool, float | None]:
-        if not self.use_llm_signal_agent:
-            return True, None
-        from src.agents.signal_agent import validate_opportunity
-
-        summary = _opportunity_summary(record, held=held)
-        verdict, usage_events = validate_opportunity(summary, self.strategy_prompt, context="exit")
-        models.log_model_usage(usage_events)
-        return verdict.get("decision") == "accept", verdict.get("confidence")
 
     # --- entry point ---
 
@@ -441,7 +375,6 @@ def run_and_persist(
         warmup_buffer_days=engine_kwargs.get("warmup_buffer_days", BACKTEST_WARMUP_BUFFER_DAYS),
         starting_capital=engine.capital_config["capital_to_use"],
         params_json=params_json or {},
-        use_llm_signal_agent=engine.use_llm_signal_agent,
         name=name,
     )
     run_id = run_row["id"]
@@ -480,7 +413,6 @@ if __name__ == "__main__":
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--params-file", help="JSON file with stop_loss_pct/take_profit_pct/etc")
     parser.add_argument("--name")
-    parser.add_argument("--use-llm", action="store_true")
     cli_args = parser.parse_args()
 
     cli_symbols = [s.strip() for s in cli_args.symbols.split(",") if s.strip()]
@@ -495,7 +427,6 @@ if __name__ == "__main__":
         date.fromisoformat(cli_args.end),
         params_json=cli_params,
         name=cli_args.name,
-        use_llm_signal_agent=cli_args.use_llm,
     )
     print(f"backtest_runs.id={new_run_id}")
     print(SURVIVORSHIP_BIAS_NOTE)
