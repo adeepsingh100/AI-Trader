@@ -918,44 +918,49 @@ is derived on read from tables that already exist, same "don't store a
 derivable fact under a second name" precedent as everywhere else in this
 codebase.
 
-## 4. LLM integration (Groq default, Ollama Cloud / Gemini alternatives)
+## 4. LLM integration (Groq, auto-falling back to Gemini)
 
-- Provider is **configurable**: `LLM_PROVIDER=groq` (default), `ollama`
-  (Ollama Cloud — `https://ollama.com`, authenticated via `OLLAMA_API_KEY`,
-  not a local instance), or `gemini` (Google AI Studio, REST API,
-  authenticated via `GEMINI_API_KEY` as a query param — a separate
-  free-tier daily quota from Groq's, so it's a same-day out when Groq's
-  own daily token limit gets hit, which happens fast at this codebase's
-  call volume — see the sizing note below). Same retry/fallback/logging
-  behavior across all three; `src/groq_client.py`'s `chat()` is the
-  single entry point both agents call, so switching providers is an env
-  var change, not a code change. Gemini's request/response shape
-  (`contents`/`parts`, a separate `systemInstruction` field) differs from
-  the OpenAI-style messages `signal_agent.py`/`evolution_agent.py` build —
-  translated once inside `_gemini_completion`, invisible to callers.
+- **No provider-select env var.** `src/groq_client.py::chat()` always
+  tries the full Groq chain first, then automatically falls through to
+  the full Gemini (Google AI Studio, REST API, authenticated via
+  `GEMINI_API_KEY` as a query param) chain if every Groq model fails —
+  a genuinely different incident from a single model's 429: it means
+  Groq's whole free-tier daily quota is exhausted (happens fast at this
+  codebase's call volume — see the sizing note below), and nobody's
+  reliably around to flip a manual switch when that happens. Gemini's
+  quota is entirely separate from Groq's, so this keeps trading running
+  same-cycle instead of going dark for days (the actual incident that
+  motivated this — confirmed via `model_usage`: every call 429'd on both
+  configured Groq models for several days straight before anyone
+  noticed). `chat()` is still the single entry point both agents call,
+  so this is invisible to `signal_agent.py`/`evolution_agent.py`.
+  Gemini's request/response shape (`contents`/`parts`, a separate
+  `systemInstruction` field) differs from the OpenAI-style messages they
+  build — translated once inside `_gemini_completion`.
 - Model chain is **configurable** per provider (env var, ordered list — Groq
   deprecates models periodically): default
   `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
-  `OLLAMA_MODEL_CHAIN=gpt-oss:120b` (no `-cloud` suffix — that's only for
-  routing through a local Ollama daemon, not this direct-to-`ollama.com`
-  setup), `GEMINI_MODEL_CHAIN=gemini-2.5-flash`.
-- **Token budget sizing** (the actual cause of an early real-world Groq
-  exhaustion): each validation call runs ~2,100-2,300 tokens. At
-  `TOP_N_CANDIDATES=5` candidates/cycle and a ~10min cycle, that's up to
-  ~700 calls/day — multiple times Groq's free-tier 200k-tokens/day limit
-  on its own. `TOP_N_CANDIDATES` and `MIN_OPPORTUNITY_SCORE` are the
-  direct levers to bring daily demand under whichever provider's quota;
-  switching providers alone doesn't fix sustained overconsumption, it
-  just buys a fresh quota pool that the same pattern re-exhausts.
+  `GEMINI_MODEL_CHAIN=gemini-2.5-flash`.
+- **Token budget sizing** (the actual cause of the exhaustion above): each
+  validation call runs ~2,100-2,300 tokens. At `TOP_N_CANDIDATES=5`
+  candidates/cycle and a ~10min cycle, that's up to ~700 calls/day —
+  multiple times Groq's free-tier 200k-tokens/day limit on its own.
+  `TOP_N_CANDIDATES` and `MIN_OPPORTUNITY_SCORE` are the direct levers to
+  bring daily demand under budget; the Gemini fallback buys resilience
+  for the day it happens, it doesn't fix sustained overconsumption — at
+  this call volume Gemini's own quota would eventually get hit too.
 - On 429 or any API error: retry with exponential backoff on the current
-  model, then fall back to the next model in the chain.
-- Every call (success or failure, every model tried) logs to
-  `model_usage`: model name, fallback_reason (null on first-try
-  success), latency_ms, success.
+  model, then fall back to the next model in the chain (Groq's, then
+  Gemini's).
+- Every call (success or failure, every model tried, across both
+  providers) logs to `model_usage`: model name, fallback_reason (null on
+  first-try success, otherwise the previous model/provider's failure —
+  threaded across the Groq→Gemini handoff too, not reset), latency_ms,
+  success.
 - Verify during build (step 3) by forcing a failure (e.g. bad API key
   swapped in temporarily, or a monkeypatched 429) to confirm the
-  fallback chain actually triggers and logs correctly — don't just trust
-  the retry logic unexercised.
+  fallback chain actually triggers and logs correctly, including the
+  cross-provider handoff — don't just trust the retry logic unexercised.
 
 ## 5. Deployment (free tier only)
 

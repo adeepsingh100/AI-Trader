@@ -17,12 +17,8 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m src.orchestrator --mode=paper
         env:
-          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-          OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -40,12 +36,8 @@ jobs:
       # actually promoted — see src/orchestrator.py.
       - run: python -m src.orchestrator --mode=real
         env:
-          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-          OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}

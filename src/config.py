@@ -6,7 +6,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- LLM Provider (Groq / Ollama Cloud / Gemini) ------------------------------
+# --- LLM Provider (Groq, auto-falling back to Gemini) ------------------------
+# No provider-select env var — every call tries the full Groq chain first,
+# then automatically falls through to the full Gemini chain if every Groq
+# model fails (src/groq_client.py::chat). Groq's free-tier daily token
+# quota gets exhausted fast at this codebase's call volume (see
+# PROJECT_SPEC.md §4) and nobody's reliably around to flip a manual
+# switch when that happens — this keeps trading running same-cycle
+# instead of going dark until someone notices.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_CHAIN = [
     m.strip()
@@ -15,17 +22,6 @@ GROQ_MODEL_CHAIN = [
     # key, so getenv's own default never kicks in.
     for m in (os.getenv("GROQ_MODEL_CHAIN") or "openai/gpt-oss-120b,qwen/qwen3.6-27b").split(",")
     if m.strip()
-]
-
-# "groq" (default), "ollama" (Ollama Cloud — https://ollama.com, not a
-# local instance), or "gemini" (Google AI Studio — separate free-tier quota
-# from Groq, a same-day fallback when Groq's daily token limit is hit).
-# Switch by setting LLM_PROVIDER, no code change needed.
-LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "groq").strip().lower()
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL") or "https://ollama.com"
-OLLAMA_MODEL_CHAIN = [
-    m.strip() for m in (os.getenv("OLLAMA_MODEL_CHAIN") or "gpt-oss:120b").split(",") if m.strip()
 ]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_CHAIN = [
