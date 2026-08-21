@@ -156,3 +156,95 @@ def test_ollama_all_models_failed_raises(monkeypatch):
 
     assert "down" in str(exc_info.value)
     assert len(exc_info.value.events) == 3
+
+
+# --- Gemini provider ---
+
+
+def _gemini_resp(text):
+    resp = Mock()
+    resp.raise_for_status = Mock()
+    resp.json.return_value = {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+    return resp
+
+
+def test_gemini_provider_posts_expected_shape(monkeypatch):
+    monkeypatch.setattr("src.groq_client.LLM_PROVIDER", "gemini")
+    monkeypatch.setattr("src.groq_client.GEMINI_API_KEY", "test-key")
+
+    with patch("src.groq_client.requests.post") as mock_post:
+        mock_post.return_value = _gemini_resp("hi from gemini")
+
+        content, events = chat(
+            [{"role": "system", "content": "be terse"}, {"role": "user", "content": "hi"}],
+            model_chain=["gemini-2.5-flash"],
+            max_tokens=512,
+        )
+
+    assert content == "hi from gemini"
+    assert events == [ModelUsageEvent("gemini-2.5-flash", None, events[0].latency_ms, True)]
+
+    args, kwargs = mock_post.call_args
+    assert args[0] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    assert kwargs["params"] == {"key": "test-key"}
+    assert kwargs["json"] == {
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {"maxOutputTokens": 512},
+        "systemInstruction": {"parts": [{"text": "be terse"}]},
+    }
+
+
+def test_gemini_omits_system_instruction_without_system_message(monkeypatch):
+    monkeypatch.setattr("src.groq_client.LLM_PROVIDER", "gemini")
+
+    with patch("src.groq_client.requests.post") as mock_post:
+        mock_post.return_value = _gemini_resp("hi")
+        chat([{"role": "user", "content": "hi"}], model_chain=["gemini-2.5-flash"])
+
+    assert "systemInstruction" not in mock_post.call_args.kwargs["json"]
+
+
+def test_gemini_uses_its_own_default_model_chain(monkeypatch):
+    monkeypatch.setattr("src.groq_client.LLM_PROVIDER", "gemini")
+    monkeypatch.setattr("src.groq_client.GEMINI_MODEL_CHAIN", ["gemini-2.5-flash"])
+
+    with patch("src.groq_client.requests.post") as mock_post:
+        mock_post.return_value = _gemini_resp("hi")
+        chat([{"role": "user", "content": "hi"}])  # no explicit model_chain
+
+    assert "gemini-2.5-flash:generateContent" in mock_post.call_args.args[0]
+
+
+def test_gemini_falls_back_to_next_model_on_failure(monkeypatch):
+    monkeypatch.setattr("src.groq_client.LLM_PROVIDER", "gemini")
+    monkeypatch.setattr("src.groq_client.BACKOFF_BASE_SECONDS", 0)
+
+    with patch("src.groq_client.requests.post") as mock_post:
+        mock_post.side_effect = [
+            requests.HTTPError("429 rate limited"),
+            requests.HTTPError("429 rate limited"),
+            requests.HTTPError("429 rate limited"),
+            _gemini_resp("hello from model-b"),
+        ]
+
+        content, events = chat(
+            [{"role": "user", "content": "hi"}], model_chain=["model-a", "model-b"]
+        )
+
+    assert content == "hello from model-b"
+    assert [e.model_used for e in events] == ["model-a", "model-a", "model-a", "model-b"]
+    assert [e.success for e in events] == [False, False, False, True]
+
+
+def test_gemini_all_models_failed_raises(monkeypatch):
+    monkeypatch.setattr("src.groq_client.LLM_PROVIDER", "gemini")
+    monkeypatch.setattr("src.groq_client.BACKOFF_BASE_SECONDS", 0)
+
+    with patch("src.groq_client.requests.post") as mock_post:
+        mock_post.side_effect = requests.HTTPError("quota exceeded")
+
+        with pytest.raises(AllModelsFailedError) as exc_info:
+            chat([{"role": "user", "content": "hi"}], model_chain=["model-a"])
+
+    assert "quota exceeded" in str(exc_info.value)
+    assert len(exc_info.value.events) == 3

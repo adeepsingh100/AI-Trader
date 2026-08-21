@@ -51,7 +51,7 @@ Quant-first, LLM-gated, two-pass per cycle:
 1. **Data Agent** (`src/agents/data_agent.py`) — pulls candles from CoinDCX for `FEATURE_TIMEFRAMES`.
 2. **Feature Engine** (`src/features/feature_engine.py`) — pure indicator math (RSI, MACD, StochRSI, ATR, Bollinger, OBV, ADX, EMAs, support/resistance), no LLM.
 3. **Opportunity Scorer** (`src/features/opportunity_scorer.py`) — deterministic weighted blend of 5 sub-scores (trend/momentum/volume/volatility/risk, `OPPORTUNITY_WEIGHT_*` in config) into one 0-100 score per symbol; also classifies market regime. `weighted_average()` is the public entry point other modules reuse. Only the `TOP_N_CANDIDATES` above `MIN_OPPORTUNITY_SCORE` go to the LLM at all — this is the cost/rate-limit control.
-4. **Signal Agent** (`src/agents/signal_agent.py`) — LLM (Groq default, Ollama Cloud alternative, model-chain fallback) validates/rejects the quant candidates and returns structured reasoning; never invents candidates itself.
+4. **Signal Agent** (`src/agents/signal_agent.py`) — LLM (Groq default, Ollama Cloud / Gemini alternatives via `LLM_PROVIDER`, model-chain fallback) validates/rejects the quant candidates and returns structured reasoning; never invents candidates itself.
 5. **Risk Manager** (`src/agents/risk_manager.py`) — position sizing, stop-loss/take-profit, circuit breaker, daily loss limits. Pure Python, no LLM.
 6. **Execution Agent** (`src/agents/execution/`) — `ExecutionAgent` ABC, `PaperExecutionAgent` (simulated fills) and `RealExecutionAgent` (live CoinDCX orders — wired in but its order-placement path is unverified against a live fill; stays inert until a strategy version clears the promotion bar in PROJECT_SPEC.md §2).
 

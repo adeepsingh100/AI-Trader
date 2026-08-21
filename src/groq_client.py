@@ -2,10 +2,12 @@
 falls back to the next model. Every attempt is returned as a
 ModelUsageEvent for the caller to persist to `model_usage`.
 
-Provider is picked by LLM_PROVIDER — "groq" (default) or "ollama" (Ollama
-Cloud). Same retry/fallback loop either way; only how a single model gets
-called differs. Switching providers is an env var change, not a code
-change — signal_agent.py and evolution_agent.py never know which one ran."""
+Provider is picked by LLM_PROVIDER — "groq" (default), "ollama" (Ollama
+Cloud), or "gemini" (Google AI Studio, a separate free-tier quota from
+Groq — useful as a same-day out when Groq's daily token limit is hit).
+Same retry/fallback loop either way; only how a single model gets called
+differs. Switching providers is an env var change, not a code change —
+signal_agent.py and evolution_agent.py never know which one ran."""
 
 from __future__ import annotations
 
@@ -16,6 +18,8 @@ import requests
 from groq import Groq
 
 from src.config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL_CHAIN,
     GROQ_API_KEY,
     GROQ_MODEL_CHAIN,
     LLM_BACKOFF_BASE_SECONDS,
@@ -35,6 +39,8 @@ BACKOFF_BASE_SECONDS = LLM_BACKOFF_BASE_SECONDS
 # the budget — this keeps every call well inside it regardless of chain.
 DEFAULT_MAX_TOKENS = 1024
 OLLAMA_TIMEOUT_SECONDS = 120  # generous — cloud inference is slower than Groq
+GEMINI_TIMEOUT_SECONDS = 60
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 @dataclass
@@ -76,6 +82,31 @@ def _ollama_completion(model: str, messages: list[dict], max_tokens: int) -> str
     return resp.json()["message"]["content"]
 
 
+def _gemini_completion(model: str, messages: list[dict], max_tokens: int) -> str:
+    # Gemini's REST API uses "contents"/"parts" instead of OpenAI-style
+    # chat messages, and a separate systemInstruction field rather than a
+    # "system" role entry — translated here so signal_agent.py's messages
+    # (built once, OpenAI-shaped) never need to know which provider runs.
+    system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    contents = [
+        {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+        for m in messages
+        if m["role"] != "system"
+    ]
+    payload: dict = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    resp = requests.post(
+        f"{GEMINI_API_BASE}/{model}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json=payload,
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def chat(
     messages: list[dict],
     model_chain: list[str] | None = None,
@@ -87,6 +118,11 @@ def chat(
 
         def call(model: str) -> str:
             return _ollama_completion(model, messages, max_tokens)
+    elif LLM_PROVIDER == "gemini":
+        chain = model_chain if model_chain is not None else GEMINI_MODEL_CHAIN
+
+        def call(model: str) -> str:
+            return _gemini_completion(model, messages, max_tokens)
     else:
         chain = model_chain if model_chain is not None else GROQ_MODEL_CHAIN
         groq_client = client if client is not None else Groq(api_key=GROQ_API_KEY)

@@ -918,18 +918,35 @@ is derived on read from tables that already exist, same "don't store a
 derivable fact under a second name" precedent as everywhere else in this
 codebase.
 
-## 4. LLM integration (Groq default, Ollama Cloud alternative)
+## 4. LLM integration (Groq default, Ollama Cloud / Gemini alternatives)
 
-- Provider is **configurable**: `LLM_PROVIDER=groq` (default) or `ollama`
+- Provider is **configurable**: `LLM_PROVIDER=groq` (default), `ollama`
   (Ollama Cloud — `https://ollama.com`, authenticated via `OLLAMA_API_KEY`,
-  not a local instance). Same retry/fallback/logging behavior either way;
-  `src/groq_client.py`'s `chat()` is the single entry point both agents call,
-  so switching providers is an env var change, not a code change.
+  not a local instance), or `gemini` (Google AI Studio, REST API,
+  authenticated via `GEMINI_API_KEY` as a query param — a separate
+  free-tier daily quota from Groq's, so it's a same-day out when Groq's
+  own daily token limit gets hit, which happens fast at this codebase's
+  call volume — see the sizing note below). Same retry/fallback/logging
+  behavior across all three; `src/groq_client.py`'s `chat()` is the
+  single entry point both agents call, so switching providers is an env
+  var change, not a code change. Gemini's request/response shape
+  (`contents`/`parts`, a separate `systemInstruction` field) differs from
+  the OpenAI-style messages `signal_agent.py`/`evolution_agent.py` build —
+  translated once inside `_gemini_completion`, invisible to callers.
 - Model chain is **configurable** per provider (env var, ordered list — Groq
   deprecates models periodically): default
   `GROQ_MODEL_CHAIN=openai/gpt-oss-120b,qwen/qwen3.6-27b`,
   `OLLAMA_MODEL_CHAIN=gpt-oss:120b` (no `-cloud` suffix — that's only for
-  routing through a local Ollama daemon, not this direct-to-`ollama.com` setup).
+  routing through a local Ollama daemon, not this direct-to-`ollama.com`
+  setup), `GEMINI_MODEL_CHAIN=gemini-2.5-flash`.
+- **Token budget sizing** (the actual cause of an early real-world Groq
+  exhaustion): each validation call runs ~2,100-2,300 tokens. At
+  `TOP_N_CANDIDATES=5` candidates/cycle and a ~10min cycle, that's up to
+  ~700 calls/day — multiple times Groq's free-tier 200k-tokens/day limit
+  on its own. `TOP_N_CANDIDATES` and `MIN_OPPORTUNITY_SCORE` are the
+  direct levers to bring daily demand under whichever provider's quota;
+  switching providers alone doesn't fix sustained overconsumption, it
+  just buys a fresh quota pool that the same pattern re-exhausts.
 - On 429 or any API error: retry with exponential backoff on the current
   model, then fall back to the next model in the chain.
 - Every call (success or failure, every model tried) logs to

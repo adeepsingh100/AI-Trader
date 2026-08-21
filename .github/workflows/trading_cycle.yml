@@ -23,6 +23,8 @@ jobs:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
           OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -44,6 +46,8 @@ jobs:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
           OLLAMA_MODEL_CHAIN: ${{ secrets.OLLAMA_MODEL_CHAIN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL_CHAIN: ${{ secrets.GEMINI_MODEL_CHAIN }}
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

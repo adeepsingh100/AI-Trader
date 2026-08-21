@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- LLM Provider (Groq / Ollama Cloud) --------------------------------------
+# --- LLM Provider (Groq / Ollama Cloud / Gemini) ------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_CHAIN = [
     m.strip()
@@ -17,13 +17,19 @@ GROQ_MODEL_CHAIN = [
     if m.strip()
 ]
 
-# "groq" (default) or "ollama" (Ollama Cloud — https://ollama.com, not a
-# local instance). Switch by setting LLM_PROVIDER, no code change needed.
+# "groq" (default), "ollama" (Ollama Cloud — https://ollama.com, not a
+# local instance), or "gemini" (Google AI Studio — separate free-tier quota
+# from Groq, a same-day fallback when Groq's daily token limit is hit).
+# Switch by setting LLM_PROVIDER, no code change needed.
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "groq").strip().lower()
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL") or "https://ollama.com"
 OLLAMA_MODEL_CHAIN = [
     m.strip() for m in (os.getenv("OLLAMA_MODEL_CHAIN") or "gpt-oss:120b").split(",") if m.strip()
+]
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_CHAIN = [
+    m.strip() for m in (os.getenv("GEMINI_MODEL_CHAIN") or "gemini-2.5-flash").split(",") if m.strip()
 ]
 
 # --- Credentials -------------------------------------------------------------
