@@ -1,17 +1,25 @@
-"""Hourly: score the active strategy version's paper trades and flag it
-promotion_eligible if it clears the promotion bar — a human still reviews
-and flips promoted_to_real themselves (Scientific Strategy Optimization
-Framework, PROJECT_SPEC.md §2/§3).
+"""Hourly: evaluate the active strategy version against
+src/learning/promotion_gate.py's multi-dimensional PROMOTE/REJECT/
+EXTEND_VALIDATION decision, and auto-promote on PROMOTE — no human-
+approval step (Scientific Strategy Optimization Framework, extended;
+PROJECT_SPEC.md §2/§3e). Auto-promotion itself isn't new; what changed is
+the bar: a candidate now has to clear sample-size floors, risk/
+statistical/Monte-Carlo gates, regime/symbol robustness, and a
+significant same-market-data improvement over the current real-mode
+champion, not just 5 simple thresholds. See promotion_gate.py's module
+docstring for the full gate list and PROJECT_SPEC.md §3e for the audit
+trail (promotion_audit) and automatic-rollback (strategy_health.py) that
+go with it.
 
 Previously also asked an LLM to freely rewrite the strategy's prompt_text/
 params_json every night and auto-promoted to real trading the instant 3
 simple thresholds cleared — retired entirely. That was unconstrained
 "parameter tuning by LLM guesswork," not learning, and the only place in
-this codebase real money moved with zero human approval. Strategy
+this codebase real money moved with zero rigorous validation. Strategy
 evolution (including stop_loss_pct/take_profit_pct, previously only ever
-LLM-guessed) now happens exclusively through the statistically-rigorous,
-human-approved adaptive_strategy_versions candidate pipeline
-(src/learning/recommendations.py + simulation.py, orchestrated by
+LLM-guessed) now happens exclusively through the statistically-rigorous
+adaptive_strategy_versions candidate pipeline (src/learning/
+recommendations.py + simulation.py, orchestrated by
 src/learning/adaptive_strategy_engine.py). No LLM call in this module —
 trading itself makes none either (src/orchestrator.py); the one place an
 LLM is still used is an hourly, code-validated exit-params proposal in
@@ -27,7 +35,6 @@ from src.config import (
     OPERATIONAL_LOG_RETENTION_DAYS,
     PROMOTION_MAX_DRAWDOWN_PCT,
     PROMOTION_MIN_CUMULATIVE_PNL,
-    PROMOTION_MIN_FITNESS_SCORE,
     PROMOTION_MIN_PAPER_DAYS,
 )
 from src.db import models
@@ -78,36 +85,19 @@ def promotion_ready(version: dict, metrics: dict) -> bool:
     return True
 
 
-def promotion_eligible(version: dict, metrics: dict, trades: list[dict], fitness_score: float | None) -> bool:
-    """Extends promotion_ready with statistical significance and a fitness
-    floor (Scientific Strategy Optimization Framework) — paper
-    profitability clearing 3 raw thresholds isn't enough on its own,
-    it must also not plausibly be noise (bootstrap CI on trade pnls,
-    lower bound still positive) and must clear a minimum blended fitness
-    score. Code only sets strategy_versions.promotion_eligible from this —
-    a human still reviews and flips promoted_to_real themselves."""
-    if not promotion_ready(version, metrics):
-        return False
-    from src.backtest.statistical_validation import bootstrap_confidence_interval
-
-    pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
-    ci = bootstrap_confidence_interval(pnls)
-    if ci is None or ci["ci_low"] <= 0:
-        return False
-    if fitness_score is None or fitness_score < PROMOTION_MIN_FITNESS_SCORE:
-        return False
-    return True
-
-
 def run_evolution(mode: str = "paper") -> dict:
     """Promotion monitor for the one live strategy_versions row — no LLM
     call, no new version creation (that's adaptive_strategy_engine.py's
-    candidate pipeline). Newly clearing promotion_eligible()'s five gates
-    auto-flips promoted_to_real — no human click. Safe to automate
-    because the gates themselves (paper-days, cumulative PnL, drawdown,
-    bootstrap CI, fitness floor) are unchanged; trades are scoped to this
-    specific version's own history, so a freshly created version always
-    starts its own PROMOTION_MIN_PAPER_DAYS clock at zero regardless."""
+    candidate pipeline). Delegates the actual decision to
+    src/learning/promotion_gate.py::evaluate_promotion — PROMOTE auto-
+    flips promoted_to_real, no human click, but only once every gate
+    there (sample sizes, risk/statistical/Monte-Carlo, regime/symbol
+    robustness, champion improvement) clears; REJECT/EXTEND_VALIDATION
+    leave the version exactly as it was. Every evaluation (not just a
+    promotion) is written to promotion_audit — see that function's
+    docstring for the full gate list. trades are scoped to this specific
+    version's own history, so a freshly created version always starts its
+    own PROMOTION_MIN_PAPER_DAYS clock at zero regardless."""
     capital_config = models.get_capital_config(mode)
     if capital_config is None:
         raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
@@ -119,25 +109,45 @@ def run_evolution(mode: str = "paper") -> dict:
     trades = models.get_closed_trades(mode, version["id"])
     metrics = compute_metrics(trades, capital_config["capital_to_use"])
 
-    # Local imports — src.learning.statistics/fitness/learning_status
-    # ultimately import compute_metrics from this file, so importing them
-    # at module level here would be circular.
+    # Local imports — src.learning.statistics/fitness/learning_status/
+    # promotion_gate ultimately import compute_metrics/promotion_ready
+    # from this file, so importing them at module level here would be
+    # circular.
     from src.learning.fitness import compute_fitness_score
     from src.learning.learning_status import compute_learning_status
+    from src.learning.promotion_gate import build_symbol_to_pair, evaluate_promotion
     from src.learning.statistics import compute_bucket_statistics
 
     bucket_stats = compute_bucket_statistics(trades, capital_config["capital_to_use"])
     fitness = compute_fitness_score(bucket_stats, capital_config["capital_to_use"])
 
-    eligible = mode == "paper" and not version["promoted_to_real"] and promotion_eligible(
-        version, metrics, trades, fitness["fitness_score"]
-    )
+    eligible = False
     promoted = False
-    if eligible != version.get("promotion_eligible"):
-        models.set_strategy_version_promotion_eligible(version["id"], eligible)
+    decision = None
+    if mode == "paper" and not version["promoted_to_real"]:
+        champion = models.get_latest_promoted_version()
+        symbol_to_pair = build_symbol_to_pair(mode)
+        decision = evaluate_promotion(
+            mode, version, trades, capital_config["capital_to_use"], champion=champion, symbol_to_pair=symbol_to_pair
+        )
+        eligible = decision.decision == "PROMOTE"
+        if eligible != version.get("promotion_eligible"):
+            models.set_strategy_version_promotion_eligible(version["id"], eligible)
         if eligible:
             models.promote_version(version["id"])
             promoted = True
+        models.insert_promotion_audit(
+            mode=mode,
+            event_type="promotion" if eligible else "evaluation",
+            decision=decision.decision,
+            candidate_version_id=version["id"],
+            previous_champion_id=champion["id"] if champion else None,
+            new_champion_id=version["id"] if eligible else (champion["id"] if champion else None),
+            promotion_score=decision.promotion_score,
+            gates=decision.gates,
+            breakdown=decision.breakdown,
+            reasons=decision.reasons,
+        )
 
     learning_status = compute_learning_status(mode)
 
@@ -169,13 +179,15 @@ def run_evolution(mode: str = "paper") -> dict:
         "info",
         f"stage={learning_status.stage} trades_collected={learning_status.trades_collected} "
         f"evidence_readiness={learning_status.evidence_readiness_pct:.0f}% "
-        f"metrics={metrics} fitness_score={fitness['fitness_score']} promotion_eligible={eligible}"
+        f"metrics={metrics} fitness_score={fitness['fitness_score']} "
+        f"promotion_decision={decision.decision if decision else 'n/a'} promotion_eligible={eligible}"
         + (f" AUTO-PROMOTED version_id={version['id']} to real trading" if promoted else ""),
     )
 
     return {
         "metrics": metrics,
         "fitness": fitness,
+        "promotion_decision": decision.decision if decision else None,
         "promotion_eligible": eligible,
         "promoted": promoted,
         "learning_status": learning_status,

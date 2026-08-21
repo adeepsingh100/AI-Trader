@@ -1213,6 +1213,51 @@ _RETENTION_TABLES = (
 )
 
 
+# --- promotion_audit (src/learning/promotion_gate.py) ---
+
+
+def insert_promotion_audit(
+    mode: str,
+    event_type: str,
+    decision: str,
+    candidate_version_id: int | None = None,
+    previous_champion_id: int | None = None,
+    new_champion_id: int | None = None,
+    promotion_score: float | None = None,
+    gates: dict | None = None,
+    breakdown: dict | None = None,
+    reasons: list | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("promotion_audit")
+        .insert(
+            {
+                "mode": mode,
+                "event_type": event_type,
+                "decision": decision,
+                "candidate_version_id": candidate_version_id,
+                "previous_champion_id": previous_champion_id,
+                "new_champion_id": new_champion_id,
+                "promotion_score": promotion_score,
+                "gates": gates or {},
+                "breakdown": breakdown or {},
+                "reasons": reasons or [],
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_latest_promotion_audit(mode: str, event_type: str | None = None) -> dict | None:
+    query = get_client().table("promotion_audit").select("*").eq("mode", mode)
+    if event_type is not None:
+        query = query.eq("event_type", event_type)
+    res = query.order("created_at", desc=True).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
 def purge_old_data(cutoffs: dict[str, datetime]) -> dict[str, int]:
     """Deletes rows older than `cutoffs[table]` for every table in
     _RETENTION_TABLES a cutoff was supplied for (a table with no entry in

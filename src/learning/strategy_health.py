@@ -5,9 +5,21 @@ strategy_version from rolling Sharpe/drawdown/win-rate/profit-factor
 that version — that factor is simply omitted (never fabricated) when none
 does. Maps to Excellent/Good/Warning/Critical; Critical auto-suspends the
 version (status-only, never a delete — reversible in Supabase any time).
+When the suspended version is ALSO the current real-mode champion
+(models.get_latest_promoted_version()), this is Automatic Rollback (Phase
+20 of the strategy-refinement audit): get_latest_promoted_version()
+already excludes suspended versions, so re-resolving it right after the
+suspend write IS the rollback — the natural fallback to the next-most-
+recent still-active promoted version. The only new behavior here is
+making that explicit and audited: a promotion_audit row with
+event_type='rollback' records which version was reinstated (or that none
+was, if nothing else was ever promoted). No new monitoring machinery —
+run_strategy_health(mode="real") reuses the identical health computation
+already used for paper, just scoped to real trades.
 
-Runs in the same new independent nightly step as drift_detection.py (never
-inside evolution_agent.run_evolution() or adaptive_strategy_engine.py)."""
+Runs hourly (evolution.yml, `python -m src.learning.strategy_health`, its
+own independent step — never inside evolution_agent.run_evolution() or
+adaptive_strategy_engine.py) for both "paper" and "real" modes."""
 
 from __future__ import annotations
 
@@ -28,6 +40,7 @@ from src.learning.fitness import (
     win_rate_component as _win_rate_component,
 )
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
+from src.resilience import log_fail_open
 from src.utils import clamp
 
 # Each component contributes 0-100, weighted equally — a simple, explicit
@@ -128,7 +141,19 @@ def run_strategy_health(mode: str = "paper") -> dict:
     capital_config = models.get_capital_config(mode)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
-    scored, suspended = [], []
+    # Captured once, before any suspension this call might trigger below —
+    # the rollback check compares each suspended version's id against
+    # WHO WAS CHAMPION at the start of this run, not a moving target.
+    # Fails open: a transient failure to read this must never block the
+    # health-scoring loop below, only skip the rollback-audit piece.
+    try:
+        champion_before = models.get_latest_promoted_version()
+        champion_before_id = champion_before["id"] if champion_before else None
+    except Exception as e:
+        log_fail_open("strategy_health.get_latest_promoted_version", e)
+        champion_before_id = None
+
+    scored, suspended, rolled_back = [], [], []
     for version in versions:
         result = compute_health_score(mode, version, capital_to_use)
         models.insert_strategy_health_score(
@@ -143,8 +168,42 @@ def run_strategy_health(mode: str = "paper") -> dict:
             models.update_strategy_version_status(version["id"], "suspended")
             suspended.append(version["id"])
 
-    return {"scored": len(scored), "suspended": suspended}
+            if champion_before_id is not None and version["id"] == champion_before_id:
+                try:
+                    new_champion = models.get_latest_promoted_version()
+                    new_champion_id = new_champion["id"] if new_champion else None
+                    models.insert_promotion_audit(
+                        mode=mode,
+                        event_type="rollback",
+                        decision="REJECT",
+                        candidate_version_id=version["id"],
+                        previous_champion_id=champion_before_id,
+                        new_champion_id=new_champion_id,
+                        breakdown=result["breakdown"],
+                        reasons=[
+                            f"real-mode champion (version {champion_before_id}) auto-suspended: "
+                            f"health tier=critical, score={result['health_score']}"
+                        ],
+                    )
+                    models.log_agent_event(
+                        "strategy_health",
+                        "warning",
+                        f"AUTOMATIC ROLLBACK: champion version_id={champion_before_id} suspended "
+                        f"(critical health), reinstated version_id={new_champion_id}",
+                    )
+                    rolled_back.append(version["id"])
+                except Exception as e:
+                    log_fail_open("strategy_health.rollback_audit", e)
+
+    return {"scored": len(scored), "suspended": suspended, "rolled_back": rolled_back}
 
 
 if __name__ == "__main__":
-    print(run_strategy_health())
+    # Both modes: paper suspension protects paper-only candidates from
+    # continuing to run; real suspension is what actually triggers
+    # Automatic Rollback above, scoped to the live real-mode champion's
+    # own real trades (a promoted version's paper trades often stop
+    # growing once evolution moves on to a newer paper candidate, so real
+    # trades are the only reliable ongoing signal for it).
+    print(run_strategy_health("paper"))
+    print(run_strategy_health("real"))

@@ -40,36 +40,48 @@ are binding unless the user says otherwise. Everything marked
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
   `strategy_versions.promoted_to_real = true`. `evolution_agent.py`'s
-  hourly `run_evolution()` sets `strategy_versions.promotion_eligible =
-  true` when the version clears every gate below, and — full automation,
-  reintroduced after the Scientific Strategy Optimization Framework
-  (§3e) made the gate itself rigorous — auto-flips `promoted_to_real` in
-  the same run via `models.promote_version()`. This is deliberately
-  different from the pre-§3e auto-promote it replaces: that one flipped
-  the flag off 3 raw thresholds with no statistical check at all (§3e);
-  this one only fires after all 5 gates below pass, including a bootstrap
-  CI on trade PnLs. `promote_version()` existed as a function for a while
-  with zero callers (a human was expected to invoke it by hand in
-  Supabase; nobody ever built the UI for it) before being wired in here.
-  A structural safety property survives regardless: promotion metrics are
-  scoped to `get_closed_trades(mode, version["id"])` — that specific
-  version's own trade history — so a freshly created version always
-  starts its own `PROMOTION_MIN_PAPER_DAYS` clock at zero regardless of
-  how often `run_evolution()` re-checks it. Gates, all
-  **configurable** (env vars, not a DB table — these change rarely and
-  don't need versioning):
-  - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
-    trading history for the version.
-  - `PROMOTION_MIN_CUMULATIVE_PNL` (default 0) — cumulative paper PnL
-    over that window must exceed this.
-  - `PROMOTION_MAX_DRAWDOWN_PCT` (default 15) — max peak-to-trough
-    drawdown over the window must stay under this.
-  - Statistical significance: a bootstrap confidence interval (§3e) over
-    the version's trade PnLs, requiring the lower bound to still be
-    positive — paper profitability clearing the 3 thresholds above isn't
-    enough on its own if it's plausibly noise.
-  - `PROMOTION_MIN_FITNESS_SCORE` (default 60) — the version's blended
-    fitness score (§3e) must clear this floor.
+  hourly `run_evolution()` delegates the actual decision to
+  `src/learning/promotion_gate.py::evaluate_promotion()` — a
+  multi-dimensional `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision, not a
+  boolean — and on `PROMOTE` sets `strategy_versions.promotion_eligible =
+  true` and auto-flips `promoted_to_real` in the same run via
+  `models.promote_version()`. Auto-promotion itself isn't new (it
+  survived the original 3-raw-threshold version this replaced, §3e); what
+  changed is the bar: sample-size floors (paper/walk-forward/champion-
+  challenger trade counts, not just elapsed days), risk/statistical/
+  Monte-Carlo gates, regime/symbol robustness, an overfitting verdict, and
+  a statistically significant, same-market-data improvement over the
+  current real-mode champion — not 3-5 simple thresholds. Missing
+  required evidence (e.g. no historical candles ingested yet for the
+  walk-forward/champion-challenger backtest-replay gates) always yields
+  `EXTEND_VALIDATION`, never a silent skip and never a promotion on
+  partial evidence — see `promotion_gate.py`'s own module docstring for
+  the full gate-by-gate breakdown and §3e for how it composes almost
+  entirely from primitives §3e/§3c already built. Every evaluation
+  (`PROMOTE`/`REJECT`/`EXTEND_VALIDATION` alike, not just a promotion) is
+  written to `promotion_audit` (§6) — "no promotion may occur without a
+  complete audit record" is satisfied trivially if only promotions were
+  logged, so rejections/pending evaluations are too. A structural safety
+  property survives regardless: promotion metrics are scoped to
+  `get_closed_trades(mode, version["id"])` — that specific version's own
+  trade history — so a freshly created version always starts its own
+  `PROMOTION_MIN_PAPER_DAYS`/sample-size clock at zero regardless of how
+  often `run_evolution()` re-checks it. A `PROMOTION_COOLDOWN_DAYS`
+  (default 7) floor also blocks rapid-fire re-promotion regardless of how
+  many candidates happen to clear every other gate in one run.
+- **Automatic Rollback**: if a promoted real-mode champion's live
+  performance later degrades, `strategy_health.py`'s existing nightly-now-
+  hourly auto-suspend (§3d) already causes `get_latest_promoted_version()`
+  to naturally fall back to the next-most-recent still-active promoted
+  version (it excludes suspended rows) — this was always structurally
+  true. What's new: when the suspended version IS the current real-mode
+  champion, that fallback is now explicitly audited as a `promotion_audit`
+  row (`event_type='rollback'`, recording which version was reinstated).
+  No new monitoring machinery — `run_strategy_health(mode="real")` reuses
+  the identical health computation already used for paper, just scoped to
+  the champion's own real trades (its paper trades often stop growing once
+  evolution moves on to a newer paper candidate, so real trades are the
+  only reliable ongoing signal for it specifically).
 
 ## 3. Multi-agent architecture
 
@@ -276,10 +288,13 @@ and where an LLM is still used elsewhere, offline from this cycle).
 - **Promotion monitor only** since the Scientific Strategy Optimization
   Framework (§3e) — no LLM call, no new `strategy_versions` row.
   Computes win rate, avg win/loss, drawdown, and a blended fitness score
-  (§3e) from the current version's trades, checks every promotion gate
-  (§2), sets `strategy_versions.promotion_eligible`, and — full
-  automation (§2) — auto-flips `promoted_to_real` in the same run the
-  instant all five gates pass, no human click.
+  (§3e) from the current version's trades, then delegates the actual
+  `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision to
+  `src/learning/promotion_gate.py::evaluate_promotion()` (§2/§3e) — sets
+  `strategy_versions.promotion_eligible` and, on `PROMOTE`, auto-flips
+  `promoted_to_real` in the same run, no human click. Also runs
+  `src/db/models.py::purge_old_data()` (Data Retention, §3d) each pass,
+  piggybacked on this already-hourly step rather than a new cron job.
 - Previously also asked an LLM to freely rewrite the strategy's
   prompt_text/params_json every night and auto-promoted the instant 3
   simple thresholds cleared with no statistical check at all — retired
@@ -790,8 +805,9 @@ the new `OPERATIONAL_LOG_RETENTION_DAYS`, default 30 — pure debug/ops
 logs, never read past recent history). `trades`/`strategy_versions`/
 `recommendations`/`adaptive_strategy_versions`/`strategy_simulations`/
 `learning_statistics`/`feature_importance`/`drift_alerts`/
-`strategy_health_scores`/`historical_candles` are never purged — the
-actual ledger, small-row-count decision history, compact rollups, or
+`strategy_health_scores`/`promotion_audit`/`historical_candles` are never
+purged — the actual ledger, small-row-count decision history, compact
+rollups, or
 low-volume/valuable backtest data respectively. Runs every hour,
 piggybacked on `evolution_agent.run_evolution()` (already scheduled, no
 new cron) — fails open, a purge error never blocks the promotion-monitor
@@ -895,6 +911,40 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   Walk Forward/Decision prose, not a changelog line) and a
   `validation_detail` jsonb bundle with the raw numbers, and a passing
   candidate's `adaptive_strategy_versions` row carries its `fitness_score`.
+- **`promotion_gate.py`** (new): `evaluate_promotion()` — the multi-
+  dimensional `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision §2 describes,
+  called from `evolution_agent.run_evolution()` in place of the old 5-gate
+  boolean. Almost entirely composition over what this section already
+  built: `fitness.py` (multi-objective score, unchanged), `bootstrap_
+  confidence_interval` + a new `monte_carlo_drawdown_distribution`
+  Monte-Carlo gate (probability-of-profit via a dedicated bootstrap-
+  resample pass, catastrophic-drawdown probability from that function's
+  now-exposed raw shuffled-distribution list — additive, existing callers
+  destructure by key), `walk_forward_validator.run_walk_forward` +
+  `overfitting_detection.detect` for the walk-forward/overfitting gate,
+  `strategy_comparison.compare` for champion-vs-challenger (candidate's
+  and champion's `params_json` replayed via `BacktestEngine` over the
+  IDENTICAL symbols/date range — "same market data" is only honest via
+  backtest replay, since paper trades happen sequentially, never
+  simultaneously). New pieces genuinely added: sample-size floors
+  (`PROMOTION_MIN_BACKTEST_TRADES`/`_WALK_FORWARD_TRADES`/`_PAPER_TRADES`/
+  `_CHAMPION_CHALLENGER_TRADES`) that route to `EXTEND_VALIDATION` (never
+  `REJECT` — "not enough evidence" isn't the same claim as "the evidence
+  says no"); regime/symbol robustness (candidate's own bucketed
+  `learning_statistics`-shaped stats compared against the champion's same
+  bucket, plus a Herfindahl-style symbol-profit-concentration check); a
+  complexity-delta (`params_json` keys changed vs champion) feeding the
+  score's simplicity component; a weighted Promotion Score (§2's weight
+  list) that's necessary but never sufficient — every hard gate above
+  must independently pass regardless of score; a `PROMOTION_COOLDOWN_DAYS`
+  floor. Every evaluation writes a `promotion_audit` row (§6) via
+  `evolution_agent.py`, not this module directly (kept a pure decision
+  engine, no DB writes of its own beyond the read-only lookups its gates
+  need). `strategy_health.py`'s existing auto-suspend gained one
+  conditional write of the same kind — a `promotion_audit` `'rollback'`
+  row when the version it just suspended was the live real-mode champion
+  (Automatic Rollback, §2) — fails open, same as the module's other
+  advisory writes.
 - **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
   confidence/opportunity-score/risk/stop-loss/target accuracy percentages
   over `trade_evaluations`, which `_evaluate_trade` already tagged
@@ -917,7 +967,10 @@ Migration `0010_scientific_optimization.sql`: `strategy_versions.
 promotion_eligible` (§2), `strategy_simulations.research_note`/
 `.validation_detail`, `adaptive_strategy_versions.fitness_score` — all
 nullable/safe-defaulted, zero behavior change until the corresponding code
-ships. No new dependency — stdlib plus this repo's own modules throughout.
+ships. Migration `0011_promotion_audit.sql` (Promotion Gate, above): new
+`promotion_audit` table (§6) — additive only, no column changes to any
+existing table. No new dependency in either — stdlib plus this repo's own
+modules throughout.
 
 ### Evidence-Driven Learning Progression (bootstrap-learning)
 
@@ -1385,6 +1438,18 @@ behavior change.
 `strategy_simulations.research_note`/`.validation_detail`,
 `adaptive_strategy_versions.fitness_score` — all nullable/safe-defaulted,
 same non-urgent deployment order as every migration except `0008`.
+
+**Promotion Gate (§2/§3e), migration `0011`** — one new table,
+`promotion_audit`: `id`, `mode`, `event_type` (`'evaluation'`|
+`'promotion'`|`'rollback'`), `candidate_version_id`/`previous_champion_id`/
+`new_champion_id` (all `strategy_versions` references), `decision`
+(`'PROMOTE'`|`'REJECT'`|`'EXTEND_VALIDATION'`), `promotion_score`,
+`gates`/`breakdown`/`reasons` (jsonb — the full evidence bundle
+`evaluate_promotion()` built), `created_at`. One row per evaluation, not
+just per promotion, so `REJECT`/`EXTEND_VALIDATION` are equally auditable
+— same shape/RLS pattern as `drift_alerts`/`strategy_health_scores`
+(`0008`). Additive only, no existing-table changes, same non-urgent
+deployment order as every migration except `0008`.
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.

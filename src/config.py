@@ -40,6 +40,72 @@ PROMOTION_MIN_PAPER_DAYS = int(os.getenv("PROMOTION_MIN_PAPER_DAYS", "14"))
 PROMOTION_MIN_CUMULATIVE_PNL = float(os.getenv("PROMOTION_MIN_CUMULATIVE_PNL", "0"))
 PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15"))
 
+# --- Promotion Gate (src/learning/promotion_gate.py) -------------------------
+# Multi-dimensional, evidence-gated auto-promotion — stays fully automatic
+# (no human-approval step), but a candidate must clear sample-size floors,
+# risk/statistical/Monte-Carlo gates, regime/symbol robustness, and a
+# significant, same-market-data improvement over the current real-mode
+# champion before PROMOTE; missing required evidence (e.g. no historical
+# candles ingested yet for walk-forward/champion-challenger) always yields
+# EXTEND_VALIDATION, never a silent skip or a promotion on partial evidence.
+
+# Minimum sample sizes (Phase 3) — trade-COUNT floors, additional to the
+# existing PROMOTION_MIN_PAPER_DAYS time floor above.
+PROMOTION_MIN_BACKTEST_TRADES = int(os.getenv("PROMOTION_MIN_BACKTEST_TRADES", "1000"))
+PROMOTION_MIN_WALK_FORWARD_TRADES = int(os.getenv("PROMOTION_MIN_WALK_FORWARD_TRADES", "300"))
+PROMOTION_MIN_PAPER_TRADES = int(os.getenv("PROMOTION_MIN_PAPER_TRADES", "300"))
+PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES = int(os.getenv("PROMOTION_MIN_CHAMPION_CHALLENGER_TRADES", "200"))
+
+# Monte Carlo promotion gate (Phase 14) — reuses
+# statistical_validation.monte_carlo_drawdown_distribution (drawdown-path
+# shuffle) and a bootstrap resample of trade pnls for probability-of-profit.
+PROMOTION_MC_MIN_PROFITABLE_PCT = float(os.getenv("PROMOTION_MC_MIN_PROFITABLE_PCT", "70"))
+PROMOTION_MC_MAX_CATASTROPHIC_DD_PROBABILITY_PCT = float(
+    os.getenv("PROMOTION_MC_MAX_CATASTROPHIC_DD_PROBABILITY_PCT", "5")
+)
+PROMOTION_MC_CATASTROPHIC_DD_THRESHOLD_PCT = float(
+    os.getenv("PROMOTION_MC_CATASTROPHIC_DD_THRESHOLD_PCT", "25")
+)
+PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT", "25"))
+
+# Regime/symbol robustness (Phases 7, 8) — a candidate must not be
+# catastrophically worse than champion in any regime/symbol bucket with
+# enough samples to trust (RECOMMENDATION_MIN_SAMPLE_SIZE, reused).
+PROMOTION_MAX_REGIME_DEGRADATION_PCT = float(os.getenv("PROMOTION_MAX_REGIME_DEGRADATION_PCT", "30"))
+PROMOTION_MAX_SYMBOL_PROFIT_CONCENTRATION_PCT = float(
+    os.getenv("PROMOTION_MAX_SYMBOL_PROFIT_CONCENTRATION_PCT", "60")
+)
+PROMOTION_MIN_PROFITABLE_SYMBOLS = int(os.getenv("PROMOTION_MIN_PROFITABLE_SYMBOLS", "2"))
+
+# Champion-vs-challenger minimum improvement (Phase 5) — required ON TOP OF
+# statistical significance (SIGNIFICANCE_THRESHOLD, reused), never either
+# alone.
+PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT", "10"))
+PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT", "5"))
+PROMOTION_MAX_DRAWDOWN_INCREASE_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_INCREASE_PCT", "0"))
+
+# Promotion cooldown (Phase 22) — blocks rapid-fire promotions regardless
+# of how many candidates happen to clear every other gate in one run.
+PROMOTION_COOLDOWN_DAYS = int(os.getenv("PROMOTION_COOLDOWN_DAYS", "7"))
+
+# Promotion Score (Phase 17) — renormalized among available components via
+# weighted_average (opportunity_scorer.py's existing convention), same
+# "necessary but never sufficient" rule as everywhere else in this repo:
+# every hard gate above must ALSO independently pass regardless of score.
+PROMOTION_SCORE_WEIGHT_OUT_OF_SAMPLE = float(os.getenv("PROMOTION_SCORE_WEIGHT_OUT_OF_SAMPLE", "0.20"))
+PROMOTION_SCORE_WEIGHT_CHAMPION_IMPROVEMENT = float(
+    os.getenv("PROMOTION_SCORE_WEIGHT_CHAMPION_IMPROVEMENT", "0.20")
+)
+PROMOTION_SCORE_WEIGHT_RISK = float(os.getenv("PROMOTION_SCORE_WEIGHT_RISK", "0.20"))
+PROMOTION_SCORE_WEIGHT_STATISTICAL_SIGNIFICANCE = float(
+    os.getenv("PROMOTION_SCORE_WEIGHT_STATISTICAL_SIGNIFICANCE", "0.15")
+)
+PROMOTION_SCORE_WEIGHT_REGIME_ROBUSTNESS = float(os.getenv("PROMOTION_SCORE_WEIGHT_REGIME_ROBUSTNESS", "0.10"))
+PROMOTION_SCORE_WEIGHT_EXECUTION_QUALITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_EXECUTION_QUALITY", "0.05"))
+PROMOTION_SCORE_WEIGHT_STABILITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_STABILITY", "0.05"))
+PROMOTION_SCORE_WEIGHT_SIMPLICITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_SIMPLICITY", "0.05"))
+PROMOTION_MIN_SCORE = float(os.getenv("PROMOTION_MIN_SCORE", "70"))
+
 # --- Feature Engine / Opportunity Scorer -----------------------------------
 # Quant-first pipeline: Feature Engine computes indicators per timeframe,
 # Opportunity Scorer turns them into a deterministic 0-100 score, only the
