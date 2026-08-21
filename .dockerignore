@@ -1,0 +1,13 @@
+.git/
+.github/
+dashboard/
+tests/
+tasks/
+*.md
+.env
+.env.example
+.claude/
+.cursor/
+.windsurf/
+.clinerules/
+.opencode/

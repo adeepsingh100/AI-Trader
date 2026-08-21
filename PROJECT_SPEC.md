@@ -178,16 +178,15 @@ and where an LLM is still used elsewhere, offline from this cycle).
   trading day, flips `circuit_breaker_triggered` and instructs Execution
   Agent to flatten when `max_daily_loss` is breached.
 - Only sizes a position once the Opportunity Scorer has ranked the
-  symbol a top candidate AND the Signal Agent's LLM validation has
-  accepted it (§3) — ranking/ties are the Opportunity Scorer's job
-  (`opportunity_score`, descending), not this module's.
+  symbol a top candidate (§3) — ranking/ties are the Opportunity Scorer's
+  job (`opportunity_score`, descending), not this module's.
 - Per-trade stop-loss/take-profit (`exit_reason()`): the active strategy
   version's `params_json.stop_loss_pct`/`take_profit_pct` (decimal
   fraction of entry price, e.g. `0.02` = 2%) are enforced against every
-  open trade's live ticker price, independent of the LLM signal for that
-  cycle — a hit closes the position immediately rather than waiting for
-  the LLM to say "sell". Either key can be omitted to leave that side
-  unenforced. See `orchestrator.run_risk_check()` and §5.
+  open trade's live ticker price every cycle — a hit closes the position
+  immediately, not deferred to any other check. Either key can be
+  omitted to leave that side unenforced. See `orchestrator.run_risk_check()`
+  and §5.
   **Not a guarantee, same caveat as the circuit breaker above**: CoinDCX's
   spot API has no exchange-side stop order (confirmed against their docs —
   `market_order`/`limit_order` only; stop-limit/take-profit exist solely
@@ -223,22 +222,25 @@ and where an LLM is still used elsewhere, offline from this cycle).
   strategy.
 
 ### Evolution/Learning Agent (`src/agents/evolution_agent.py`)
-- Runs nightly (separate GH Actions workflow, §7).
-- **Promotion-readiness monitor only** since the Scientific Strategy
-  Optimization Framework (§3e) — no LLM call, no new `strategy_versions`
-  row. Computes win rate, avg win/loss, drawdown, and a blended fitness
-  score (§3e) from the current version's trades, checks every promotion
-  gate (§2), and sets `strategy_versions.promotion_eligible` (never
-  `promoted_to_real` itself — a human flips that).
+- Runs hourly (separate GH Actions workflow, §7).
+- **Promotion monitor only** since the Scientific Strategy Optimization
+  Framework (§3e) — no LLM call, no new `strategy_versions` row.
+  Computes win rate, avg win/loss, drawdown, and a blended fitness score
+  (§3e) from the current version's trades, checks every promotion gate
+  (§2), sets `strategy_versions.promotion_eligible`, and — full
+  automation (§2) — auto-flips `promoted_to_real` in the same run the
+  instant all five gates pass, no human click.
 - Previously also asked an LLM to freely rewrite the strategy's
   prompt_text/params_json every night and auto-promoted the instant 3
-  simple thresholds cleared — retired entirely (§3e explains why).
-  `strategy_versions`/`prompt_text` still exist and are still what
-  `signal_agent`/`risk_manager` read every cycle; the prompt is just
-  stable/human-edited now instead of nightly-LLM-mutated. Strategy
-  evolution (including `stop_loss_pct`/`take_profit_pct`, previously only
-  ever LLM-guessed) happens exclusively through the Adaptive Strategy
-  Intelligence Engine's candidate pipeline (§3b/§3e) now.
+  simple thresholds cleared with no statistical check at all — retired
+  entirely (§3e explains why). `strategy_versions` still exists;
+  `params_json` is what live trading actually reads every cycle
+  (`risk_manager.py`'s stop-loss/take-profit) — `prompt_text` is unread
+  since the LLM validation gate that used it, `signal_agent.py`, was
+  later removed entirely too (§4). Strategy evolution (including
+  `stop_loss_pct`/`take_profit_pct`, previously only ever LLM-guessed)
+  happens exclusively through the Adaptive Strategy Intelligence
+  Engine's candidate pipeline (§3b/§3e) now.
 
 ### Reporting Agent (`src/agents/reporting_agent.py`)
 - Generates an HTML report covering both modes side by side: PnL vs
@@ -397,7 +399,7 @@ inert-by-default, `MIN_FINAL_CONFIDENCE=0`) `calibrate_confidence` gate.
 - **`adaptive_strategy_engine.py`**: `AdaptiveStrategyEngine.analyze(mode)`
   — the single composed entry point, calling every generator above plus
   the simulations, then logging a summary. Never executes a trade, never
-  writes to `config.py` or any trading table. Runs as its own nightly
+  writes to `config.py` or any trading table. Runs as its own hourly
   step in `evolution.yml` (after `evolution_agent`, no new workflow). As
   of the Scientific Strategy Optimization Framework (§3e) this is the
   **sole** source of strategy-change candidates —
@@ -918,7 +920,7 @@ recomputes promotion logic here). `recommendations.py`'s 5 generators and
 used) — `None` means "compute it myself" (every function stays
 independently callable), but `adaptive_strategy_engine.analyze()` computes
 one `LearningStatus` and threads the same instance into all 8 calls,
-avoiding 8x redundant `EvidenceEngine` passes per nightly run. Every
+avoiding 8x redundant `EvidenceEngine` passes per run. Every
 `if len(closed) < CONSTANT: return []` this replaced is gone — each
 generator/simulator now asks `status.can_generate_hypotheses()` /
 `status.can_simulate()` instead.
@@ -1222,10 +1224,13 @@ strategy_simulations (
 -- adaptive_strategy_versions: versions QUANTITATIVE PARAMETERS (a
 -- params_json snapshot of tunable adaptive constants) — orthogonal to
 -- strategy_versions above, which versions LLM PROMPT TEXT. Created
--- lazily, only for simulations that pass. No separate "currently active"
--- table — `WHERE status='approved' ORDER BY created_at DESC LIMIT 1`
--- answers that; auto-deploy is out of scope, a human still copies
--- approved values into env vars by hand.
+-- lazily, only for simulations that pass. Exit-params candidates
+-- auto-activate into a new strategy_versions row the same run
+-- (simulation.py::_activate_exit_params_candidate) — no separate
+-- "currently active" table needed there, get_latest_version() answers
+-- it. Weight/regime/symbol candidates still target env vars, not a DB
+-- row, so those stay advisory — a human still copies approved values
+-- into env vars by hand for those.
 adaptive_strategy_versions (
   id                             bigserial primary key,
   mode                           text not null,
@@ -1355,7 +1360,7 @@ jobs, not new nodes: `src.monitoring.diagnostics` joins `risk_check.yml`
 6. Risk Manager rules with unit tests (capital limit, daily target, circuit breaker, position sizing) — do not skip
 7. Evolution agent + versioning, run against a few days of paper data
 8. Reporting agent (HTML report for both modes)
-9. GitHub Actions workflows for the cron cycle and nightly evolution job
+9. GitHub Actions workflows for the cron cycle and evolution job
 10. Next.js dashboard on Vercel wired to Supabase
 11. Real trading Execution Agent, gated behind `promoted_to_real`, only after user review of paper history
 
