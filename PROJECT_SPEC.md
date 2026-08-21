@@ -40,36 +40,64 @@ are binding unless the user says otherwise. Everything marked
   until the next trading day (00:00 IST rollover).
 - Real trading only runs a strategy version where
   `strategy_versions.promoted_to_real = true`. `evolution_agent.py`'s
-  hourly `run_evolution()` sets `strategy_versions.promotion_eligible =
-  true` when the version clears every gate below, and — full automation,
-  reintroduced after the Scientific Strategy Optimization Framework
-  (§3e) made the gate itself rigorous — auto-flips `promoted_to_real` in
-  the same run via `models.promote_version()`. This is deliberately
-  different from the pre-§3e auto-promote it replaces: that one flipped
-  the flag off 3 raw thresholds with no statistical check at all (§3e);
-  this one only fires after all 5 gates below pass, including a bootstrap
-  CI on trade PnLs. `promote_version()` existed as a function for a while
-  with zero callers (a human was expected to invoke it by hand in
-  Supabase; nobody ever built the UI for it) before being wired in here.
-  A structural safety property survives regardless: promotion metrics are
-  scoped to `get_closed_trades(mode, version["id"])` — that specific
-  version's own trade history — so a freshly created version always
-  starts its own `PROMOTION_MIN_PAPER_DAYS` clock at zero regardless of
-  how often `run_evolution()` re-checks it. Gates, all
-  **configurable** (env vars, not a DB table — these change rarely and
-  don't need versioning):
-  - `PROMOTION_MIN_PAPER_DAYS` (default 14) — minimum days of paper
-    trading history for the version.
-  - `PROMOTION_MIN_CUMULATIVE_PNL` (default 0) — cumulative paper PnL
-    over that window must exceed this.
-  - `PROMOTION_MAX_DRAWDOWN_PCT` (default 15) — max peak-to-trough
-    drawdown over the window must stay under this.
-  - Statistical significance: a bootstrap confidence interval (§3e) over
-    the version's trade PnLs, requiring the lower bound to still be
-    positive — paper profitability clearing the 3 thresholds above isn't
-    enough on its own if it's plausibly noise.
-  - `PROMOTION_MIN_FITNESS_SCORE` (default 60) — the version's blended
-    fitness score (§3e) must clear this floor.
+  hourly `run_evolution()` delegates the actual decision to
+  `src/learning/promotion_gate.py::evaluate_promotion()` — a
+  multi-dimensional `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision, not a
+  boolean — and on `PROMOTE` sets `strategy_versions.promotion_eligible =
+  true` and auto-flips `promoted_to_real` in the same run via
+  `models.promote_version()`. Auto-promotion itself isn't new (it
+  survived the original 3-raw-threshold version this replaced, §3e); what
+  changed is the bar: sample-size floors (backtest/paper/walk-forward/
+  TRUE paired-observation counts, not just elapsed days), risk/
+  statistical/Monte-Carlo gates, regime/symbol robustness, an overfitting
+  verdict, and a statistically significant, same-market-data improvement
+  over the current real-mode champion — not 3-5 simple thresholds. The
+  champion-vs-challenger significance test itself is PAIRED and is the
+  ONLY test — no fallback to a weaker unpaired test ever exists: candidate-
+  minus-champion equity delta at matching backtest-replay snapshots,
+  matched by their shared decision-cycle identifier (`snapshot_time`, via
+  explicit intersection, never by list index/position), gated at
+  `PROMOTION_MIN_CONFIDENCE_PCT` against an explicitly-named
+  `bootstrap_probability_candidate_better_pct` statistic — "is the
+  challenger better than the champion", not "is the challenger profitable
+  on its own". `PROMOTION_MIN_PAIRED_OBSERVATIONS` gates the TRUE matched-
+  observation count (never `min(champion_trades, challenger_trades)` —
+  independent trade counts don't imply matched market observations). A
+  bot's first-ever promotion (no champion) marks the champion-comparison
+  gate AND the paired-observations sample gate both `NOT_APPLICABLE`
+  rather than leaving the sample gate permanently unresolved — otherwise
+  every first promotion would deadlock at `EXTEND_VALIDATION` forever
+  regardless of how clean every other gate looked. Missing required
+  evidence (e.g. no historical candles ingested yet for the walk-forward/
+  paired-observation backtest-replay gates) always yields
+  `EXTEND_VALIDATION`, never a silent skip and never a promotion on
+  partial evidence — see `promotion_gate.py`'s own module docstring for
+  the full gate-by-gate breakdown and §3e for how it composes almost
+  entirely from primitives §3e/§3c already built. Every evaluation
+  (`PROMOTE`/`REJECT`/`EXTEND_VALIDATION` alike, not just a promotion) is
+  written to `promotion_audit` (§6) — "no promotion may occur without a
+  complete audit record" is satisfied trivially if only promotions were
+  logged, so rejections/pending evaluations are too. A structural safety
+  property survives regardless: promotion metrics are scoped to
+  `get_closed_trades(mode, version["id"])` — that specific version's own
+  trade history — so a freshly created version always starts its own
+  `PROMOTION_MIN_PAPER_DAYS`/sample-size clock at zero regardless of how
+  often `run_evolution()` re-checks it. A `PROMOTION_COOLDOWN_DAYS`
+  (default 7) floor also blocks rapid-fire re-promotion regardless of how
+  many candidates happen to clear every other gate in one run.
+- **Automatic Rollback**: if a promoted real-mode champion's live
+  performance later degrades, `strategy_health.py`'s existing nightly-now-
+  hourly auto-suspend (§3d) already causes `get_latest_promoted_version()`
+  to naturally fall back to the next-most-recent still-active promoted
+  version (it excludes suspended rows) — this was always structurally
+  true. What's new: when the suspended version IS the current real-mode
+  champion, that fallback is now explicitly audited as a `promotion_audit`
+  row (`event_type='rollback'`, recording which version was reinstated).
+  No new monitoring machinery — `run_strategy_health(mode="real")` reuses
+  the identical health computation already used for paper, just scoped to
+  the champion's own real trades (its paper trades often stop growing once
+  evolution moves on to a newer paper candidate, so real trades are the
+  only reliable ongoing signal for it specifically).
 
 ## 3. Multi-agent architecture
 
@@ -123,7 +151,16 @@ and where an LLM is still used elsewhere, offline from this cycle).
   via fixed formulas over named config weights/thresholds
   (`OPPORTUNITY_WEIGHT_*`, `RSI_SCORE_FLOOR/CEIL`, `TIMEFRAME_WEIGHTS`,
   etc. — see `.env.example` for the full list), then a weighted
-  `opportunity_score` (0–100) from the 5 sub-scores.
+  `opportunity_score` (0–100) from the 5 sub-scores. The "risk" sub-score
+  is, despite the name, resistance headroom only (distance from the next
+  resistance level) — kept as-is (DB column/`OPPORTUNITY_WEIGHT_RISK`/
+  dashboard would need a migration to rename) but never treated as a
+  stand-in for actual trade risk. Real risk (execution cost/liquidity,
+  stop-distance, portfolio exposure, drawdown) is measured and gated
+  independently — Net Expectancy Gate, risk-based position sizing,
+  Portfolio Intelligence concentration caps, circuit breaker/promotion
+  drawdown gate respectively (see Trade decisions and Risk Manager Agent
+  below) — not blended into this one number.
 - Every aggregation step (timeframe components → a timeframe's
   sub-score, per-timeframe scores → the blended sub-score, sub-scores →
   the final score) goes through one shared weighted-average helper that
@@ -141,13 +178,44 @@ and where an LLM is still used elsewhere, offline from this cycle).
   forced-to-exit-if-held.
 
 ### Trade decisions — fully quant, zero LLM calls (`src/orchestrator.py`)
-- There is no validation gate between the Opportunity Scorer and a trade
-  anymore. Reaching `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or
-  dropping below `EXIT_SCORE_THRESHOLD` (exit) **is** the decision —
-  deterministic, no network call, no token budget, no parse failure ever
-  in the path that opens or closes a position. (The module that used to
-  sit here, `src/agents/signal_agent.py`, an LLM accept/reject gate, was
-  removed entirely — see §4 for why.)
+- There is no LLM validation gate between the Opportunity Scorer and a
+  trade. Reaching `MIN_OPPORTUNITY_SCORE`/`TOP_N_CANDIDATES` (entry) or
+  dropping below `EXIT_SCORE_THRESHOLD` (exit) is necessary but not
+  sufficient — an entry candidate must also clear the **Net Expectancy
+  Gate** (`risk_manager.compute_net_expectancy_pct`) before an order is
+  placed. Both gates are deterministic, no network call, no token budget,
+  no parse failure ever in the path that opens or closes a position. (The
+  module that used to sit here, `src/agents/signal_agent.py`, an LLM
+  accept/reject gate, was removed entirely — see §4 for why.)
+- **Net Expectancy Gate**: fees (`TRADING_FEE_PCT`+`GST_PCT_ON_FEE`, both
+  legs, via `src/agents/execution/paper.py::fees()` reused directly so
+  this is the exact fee the trade would actually pay) + TDS
+  (`SELL_TDS_PCT`, sell leg) + spread (`EXPECTANCY_SPREAD_BPS`) +
+  slippage (`SLIPPAGE_BPS`) netted against the resolved stop/target
+  (below) and the system's own calibrated win-probability estimate
+  (`calibrate_confidence`'s `final_confidence`, falling back to
+  `opportunity_score` when there's no historical blend yet — never a new
+  probability estimator). `net_expectancy_pct <= 0` is itself the "no
+  trade" decision — code is allowed to do nothing. Pure percentage-of-
+  notional math, no qty/entry_price needed, since every cost scales
+  linearly with notional.
+- **Stop-loss/take-profit resolution** (`risk_manager.resolve_exit_params`):
+  the active strategy version's evidence-validated `params_json.
+  stop_loss_pct`/`take_profit_pct` (already cleared the walk-forward/
+  bootstrap/fitness gate, §3b/§3e) wins when configured. A leg
+  `params_json` doesn't configure falls back to an ATR-derived value
+  (`atr_pct * STOP_LOSS_ATR_MULTIPLIER`/`TAKE_PROFIT_ATR_MULTIPLIER`,
+  clamped to `EXIT_PARAM_SWEEP_MIN_PCT`/`MAX_PCT`) — never both at once
+  for the same leg, and never overriding a configured value. Closes the
+  "no stop configured = unbounded downside" gap `statistics.py::
+  _assess_risk` already self-flags as `"too_aggressive"`.
+- **Risk-based position sizing**: `risk_manager.evaluate`'s existing flat/
+  dynamic capital-fraction qty gets one additional cap —
+  `(capital_to_use * RISK_PER_TRADE_PCT / 100) / (stop_loss_pct *
+  last_price)` — so no single trade risks more than `RISK_PER_TRADE_PCT`
+  of capital if its stop is hit. Strictly additive: `min()` with the
+  existing formula, so it can only shrink qty, never grow it past what
+  flat/dynamic sizing already allows.
 - The confidence that gates position sizing (`calibrate_confidence`,
   `MIN_FINAL_CONFIDENCE`) now blends the scorer's own `opportunity_score`
   with historical win-rate on similar past trades, instead of an LLM's
@@ -168,12 +236,17 @@ and where an LLM is still used elsewhere, offline from this cycle).
 - Enforces, in order: circuit-breaker state check → capital limit check
   → position sizing → daily target/loss bookkeeping.
 - Position sizing (resolved decision, §9): **fixed % of `capital_to_use`
-  per trade**, capped at `max_concurrent_positions` open positions
-  simultaneously. Both are new **configurable** columns on
+  per trade** (or the Capital Allocation Engine's dynamic multiplier,
+  §3d — `capital_config.sizing_mode`), capped at `max_concurrent_positions`
+  open positions simultaneously. Both are new **configurable** columns on
   `capital_config` (see §6): `position_size_pct` (default 10%),
   `max_concurrent_positions` (default 5). At the default settings, at
   most 50% of allocated capital is deployed at once — deliberate buffer,
-  not a hard requirement.
+  not a hard requirement. On top of that, whichever formula ran gets one
+  additional **risk-based cap** derived from stop distance
+  (`RISK_PER_TRADE_PCT` of capital per trade, evaluate()'s optional
+  `stop_loss_pct` kwarg) — `min()` with the existing qty, never a
+  replacement, so it can only shrink size, never grow it.
 - Owns the circuit-breaker: tracks realized PnL for the current IST
   trading day, flips `circuit_breaker_triggered` and instructs Execution
   Agent to flatten when `max_daily_loss` is breached.
@@ -184,9 +257,14 @@ and where an LLM is still used elsewhere, offline from this cycle).
   version's `params_json.stop_loss_pct`/`take_profit_pct` (decimal
   fraction of entry price, e.g. `0.02` = 2%) are enforced against every
   open trade's live ticker price every cycle — a hit closes the position
-  immediately, not deferred to any other check. Either key can be
-  omitted to leave that side unenforced. See `orchestrator.run_risk_check()`
-  and §5.
+  immediately, not deferred to any other check, and this live-recomputed
+  check retroactively protects already-open positions when `params_json`
+  changes. When a leg isn't configured in `params_json`, `exit_reason()`
+  falls back to that specific trade's own frozen-at-entry stored
+  `stop_loss_price`/`take_profit_price` (set at open time via
+  `resolve_exit_params`'s ATR fallback — see Trade decisions above) rather
+  than leaving that side unenforced — every position always has a defined
+  risk boundary. See `orchestrator.run_risk_check()` and §5.
   **Not a guarantee, same caveat as the circuit breaker above**: CoinDCX's
   spot API has no exchange-side stop order (confirmed against their docs —
   `market_order`/`limit_order` only; stop-limit/take-profit exist solely
@@ -226,10 +304,13 @@ and where an LLM is still used elsewhere, offline from this cycle).
 - **Promotion monitor only** since the Scientific Strategy Optimization
   Framework (§3e) — no LLM call, no new `strategy_versions` row.
   Computes win rate, avg win/loss, drawdown, and a blended fitness score
-  (§3e) from the current version's trades, checks every promotion gate
-  (§2), sets `strategy_versions.promotion_eligible`, and — full
-  automation (§2) — auto-flips `promoted_to_real` in the same run the
-  instant all five gates pass, no human click.
+  (§3e) from the current version's trades, then delegates the actual
+  `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision to
+  `src/learning/promotion_gate.py::evaluate_promotion()` (§2/§3e) — sets
+  `strategy_versions.promotion_eligible` and, on `PROMOTE`, auto-flips
+  `promoted_to_real` in the same run, no human click. Also runs
+  `src/db/models.py::purge_old_data()` (Data Retention, §3d) each pass,
+  piggybacked on this already-hourly step rather than a new cron job.
 - Previously also asked an LLM to freely rewrite the strategy's
   prompt_text/params_json every night and auto-promoted the instant 3
   simple thresholds cleared with no statistical check at all — retired
@@ -260,20 +341,24 @@ and where an LLM is still used elsewhere, offline from this cycle).
   split into not-held/held, `select_top_candidates` picks the entry
   candidate set → **Pass 2**: for each scanned symbol, circuit-breaker
   check (same position as before every buy, preserved from the original
-  design) → entry candidates: `find_similar_trades` (§3a) first, its
-  result feeds both the Signal Agent's prompt and, after the LLM
-  responds, `calibrate_confidence` blends the LLM's own confidence with
-  the historical figure — a `MIN_FINAL_CONFIDENCE` gate (default 0,
-  permissive) sits alongside the existing Risk Manager check before
-  `place_order` → score-deteriorated held positions go straight to Signal
-  Agent exit validation (no similarity search on exits — the SL/TP sweep
-  and `EXIT_SCORE_THRESHOLD` already cover that path) → every symbol
-  reaching Pass 2 gets exactly one `opportunity_evaluations` row logged
-  regardless of outcome (most with `llm_decision = null` — the checkable
-  proof LLM call volume actually dropped), plus `trades` / `daily_pnl` /
-  `agent_logs` / `model_usage` as before → `process_closed_trades` (§3a)
-  runs once at the end, catching up self-evaluation/statistics for any
-  trade closed since the last pass, regardless of which path closed it.
+  design) → entry candidates: reaching this branch already means the
+  quant scorer accepted the candidate — `find_similar_trades` (§3a) feeds
+  `calibrate_confidence`, which blends `opportunity_score` with the
+  historical win-rate figure (no LLM confidence, no LLM call anywhere in
+  this path) behind the `MIN_FINAL_CONFIDENCE` gate (default 0,
+  permissive) → `resolve_exit_params` resolves the effective stop/target
+  → the **Net Expectancy Gate** (`compute_net_expectancy_pct`) must clear
+  before the Risk Manager's `evaluate()` (capital + risk-based-sizing +
+  concentration checks) and `place_order` → score-deteriorated held
+  positions close unconditionally on `EXIT_SCORE_THRESHOLD`, no
+  similarity search or extra validation (the SL/TP sweep already covers
+  that path) → every symbol reaching Pass 2 gets exactly one
+  `opportunity_evaluations` row logged regardless of outcome (`reason`
+  distinguishes `not_a_candidate`/`confidence gated`/`net_expectancy
+  gated`/a Risk Manager block/an actual fill), plus `trades` / `daily_pnl`
+  / `agent_logs` as before → `process_closed_trades` (§3a) runs once at
+  the end, catching up self-evaluation/statistics for any trade closed
+  since the last pass, regardless of which path closed it.
 
 ## 3a. Trade Memory + Learning Engine (`src/learning/`)
 
@@ -300,8 +385,19 @@ this is expected to be noisy until real trade history accumulates.
   circuit-breaker flatten, self-evaluates each, and upserts every
   `learning_statistics` bucket (symbol / market_regime /
   opportunity_score_bucket / confidence_bucket / strategy_version /
-  weekday / hour — IST-converted) it belongs to, bounded by
-  `LEARNING_HISTORY_WINDOW_DAYS`.
+  weekday / hour — IST-converted / exit_reason / rsi_bucket /
+  stoch_rsi_bucket / atr_volatility_bucket) it belongs to, bounded by
+  `LEARNING_HISTORY_WINDOW_DAYS`. The RSI/StochRSI/volatility buckets
+  (Phases 7-9 of the strategy-refinement audit) read the entry-time
+  indicator snapshot already stored on every `opportunity_evaluations`
+  row (`features` jsonb) — no new data collection. RSI/StochRSI share the
+  same fixed 0-100-scale edges (`<30, 30-40, ..., >80`); the volatility
+  bucket is a 5-way evidence-only split (very_low/low/medium/high/extreme)
+  distinct from the Feature Engine's 3-way live-scoring split, which is
+  untouched. `recommendations.py::generate_indicator_bucket_recommendations`
+  flags "avoid bucket X" via the same generic two-proportion z-test as the
+  existing regime/symbol "avoid" recommendations — advisory only, never
+  auto-applied, same `RECOMMENDATION_MIN_SAMPLE_SIZE` gate.
 - **`trade_memory.py`**: `find_similar_trades` — Euclidean distance over
   the 5 already-computed sub-scores (not raw candles) against a bounded,
   time-windowed pool of past entries with known outcomes, filtered by
@@ -715,6 +811,26 @@ retry from a clean DB-read state; this is the actual root-cause fix for
 "crash recovery" in a stateless cron architecture, not new checkpointing
 infrastructure (there's no persistent daemon to checkpoint).
 
+**Data Retention** (`db/models.py::purge_old_data`): plain `DELETE ...
+WHERE <column> < cutoff` on the highest-write-volume, non-permanent
+tables — `opportunity_evaluations`/`confidence_calibration` (cutoff =
+`LEARNING_HISTORY_WINDOW_DAYS`, reused rather than a second constant,
+since nothing ever queries either table beyond that window anyway) and
+`agent_logs`/`model_usage`/`system_metrics`/`data_quality_log` (cutoff =
+the new `OPERATIONAL_LOG_RETENTION_DAYS`, default 30 — pure debug/ops
+logs, never read past recent history). `trades`/`strategy_versions`/
+`recommendations`/`adaptive_strategy_versions`/`strategy_simulations`/
+`learning_statistics`/`feature_importance`/`drift_alerts`/
+`strategy_health_scores`/`promotion_audit`/`historical_candles` are never
+purged — the actual ledger, small-row-count decision history, compact
+rollups, or
+low-volume/valuable backtest data respectively. Runs every hour,
+piggybacked on `evolution_agent.run_evolution()` (already scheduled, no
+new cron) — fails open, a purge error never blocks the promotion-monitor
+logic it shares a step with. Exists because `opportunity_evaluations` is
+written every scanned symbol every cycle — the table that actually filled
+the free-tier Supabase disk once already.
+
 No new dependency of any kind — everything above is stdlib plus this
 repo's own existing modules, matching the zero-numpy/scipy discipline the
 codebase already prides itself on.
@@ -811,6 +927,62 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   Walk Forward/Decision prose, not a changelog line) and a
   `validation_detail` jsonb bundle with the raw numbers, and a passing
   candidate's `adaptive_strategy_versions` row carries its `fitness_score`.
+- **`promotion_gate.py`** (new): `evaluate_promotion()` — the multi-
+  dimensional `PROMOTE`/`REJECT`/`EXTEND_VALIDATION` decision §2 describes,
+  called from `evolution_agent.run_evolution()` in place of the old 5-gate
+  boolean. Almost entirely composition over what this section already
+  built: `fitness.py` (multi-objective score, unchanged), `bootstrap_
+  confidence_interval` + a new `monte_carlo_drawdown_distribution`
+  Monte-Carlo gate (probability-of-profit via a dedicated bootstrap-
+  resample pass, catastrophic-drawdown probability from that function's
+  now-exposed raw shuffled-distribution list — additive, existing callers
+  destructure by key), `walk_forward_validator.run_walk_forward` +
+  `overfitting_detection.detect` for the walk-forward/overfitting gate,
+  `strategy_comparison.compare` for champion-vs-challenger (candidate's
+  and champion's `params_json` replayed via `BacktestEngine` over the
+  IDENTICAL symbols/date range — "same market data" is only honest via
+  backtest replay, since paper trades happen sequentially, never
+  simultaneously). New pieces genuinely added: sample-size floors
+  (`PROMOTION_MIN_BACKTEST_TRADES`/`_WALK_FORWARD_TRADES`/`_PAPER_TRADES`/
+  `_CHAMPION_CHALLENGER_TRADES`) that route to `EXTEND_VALIDATION` (never
+  `REJECT` — "not enough evidence" isn't the same claim as "the evidence
+  says no"); regime/symbol robustness (candidate's own bucketed
+  `learning_statistics`-shaped stats compared against the champion's same
+  bucket, plus a Herfindahl-style symbol-profit-concentration check); a
+  complexity-delta (`params_json` keys changed vs champion) feeding the
+  score's simplicity component; a weighted Promotion Score (§2's weight
+  list) that's necessary but never sufficient — every hard gate above
+  must independently pass regardless of score; a `PROMOTION_COOLDOWN_DAYS`
+  floor. Every evaluation writes a `promotion_audit` row (§6) via
+  `evolution_agent.py`, not this module directly (kept a pure decision
+  engine, no DB writes of its own beyond the read-only lookups its gates
+  need). `strategy_health.py`'s existing auto-suspend gained one
+  conditional write of the same kind — a `promotion_audit` `'rollback'`
+  row when the version it just suspended was the live real-mode champion
+  (Automatic Rollback, §2) — fails open, same as the module's other
+  advisory writes. Hardening pass on top of the above (same 3-way decision,
+  same full automation): the backtest trade-count sample-size gate
+  (`PROMOTION_MIN_BACKTEST_TRADES`) is now actually enforced (previously
+  configured but never checked); a missing Sharpe improvement is missing
+  evidence (`EXTEND_VALIDATION`), never silently a pass; the champion-vs-
+  challenger significance test is the paired comparison described in §2,
+  not candidate-alone profitability; `execution_quality` in the Promotion
+  Score is real per-trade `entry_slippage_pct` data scored against
+  `SLIPPAGE_BPS` (or `None` + reweighted among the rest), never a neutral
+  50 placeholder. Second hardening pass, closing the remaining loopholes:
+  the paired comparison is now the ONLY significance test (the unpaired
+  fallback for when it couldn't be computed is gone — missing paired
+  evidence is `EXTEND_VALIDATION`, never a substitute pass); observations
+  are matched by their shared `snapshot_time` identifier via explicit
+  intersection, never by list index; `PROMOTION_MIN_PAIRED_OBSERVATIONS`
+  gates the TRUE matched count (retires `PROMOTION_MIN_CHAMPION_
+  CHALLENGER_TRADES`'s `min(champion_trades, challenger_trades)` proxy);
+  the statistic is explicitly named `bootstrap_probability_candidate_
+  better_pct`; and a bot's first-ever promotion marks both the champion-
+  improvement gate and the paired-observations sample gate
+  `NOT_APPLICABLE` so it can still reach `PROMOTE` (previously the sample
+  gate stayed permanently unresolved with no champion to pair against,
+  deadlocking every first promotion at `EXTEND_VALIDATION`).
 - **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
   confidence/opportunity-score/risk/stop-loss/target accuracy percentages
   over `trade_evaluations`, which `_evaluate_trade` already tagged
@@ -833,7 +1005,10 @@ Migration `0010_scientific_optimization.sql`: `strategy_versions.
 promotion_eligible` (§2), `strategy_simulations.research_note`/
 `.validation_detail`, `adaptive_strategy_versions.fitness_score` — all
 nullable/safe-defaulted, zero behavior change until the corresponding code
-ships. No new dependency — stdlib plus this repo's own modules throughout.
+ships. Migration `0011_promotion_audit.sql` (Promotion Gate, above): new
+`promotion_audit` table (§6) — additive only, no column changes to any
+existing table. No new dependency in either — stdlib plus this repo's own
+modules throughout.
 
 ### Evidence-Driven Learning Progression (bootstrap-learning)
 
@@ -911,9 +1086,10 @@ methods — `can_generate_hypotheses()`, `can_simulate()`, `can_validate()`,
 `can_create_candidate()` (delegates to `can_validate()` — candidate rows
 are validation's output, not a separately-thresholded gate, one number
 behind both names), and `can_promote()` (reads the `promotion_eligible`
-flag `evolution_agent.promotion_eligible()` already computes with its own
-full rigor — paper-days + PnL + drawdown + bootstrap CI + fitness — never
-recomputes promotion logic here). `recommendations.py`'s 5 generators and
+flag `src.learning.promotion_gate.evaluate_promotion()` already computes
+with its own full rigor — sample sizes, risk/statistical/Monte-Carlo
+gates, regime/symbol robustness, champion improvement, promotion score —
+never recomputes promotion logic here). `recommendations.py`'s 5 generators and
 `simulation.py`'s 3 simulators each gained an optional
 `status: LearningStatus | None = None` param (same threading pattern
 `generate_recommendations`'s existing `weakness_context` param already
@@ -1301,6 +1477,18 @@ behavior change.
 `strategy_simulations.research_note`/`.validation_detail`,
 `adaptive_strategy_versions.fitness_score` — all nullable/safe-defaulted,
 same non-urgent deployment order as every migration except `0008`.
+
+**Promotion Gate (§2/§3e), migration `0011`** — one new table,
+`promotion_audit`: `id`, `mode`, `event_type` (`'evaluation'`|
+`'promotion'`|`'rollback'`), `candidate_version_id`/`previous_champion_id`/
+`new_champion_id` (all `strategy_versions` references), `decision`
+(`'PROMOTE'`|`'REJECT'`|`'EXTEND_VALIDATION'`), `promotion_score`,
+`gates`/`breakdown`/`reasons` (jsonb — the full evidence bundle
+`evaluate_promotion()` built), `created_at`. One row per evaluation, not
+just per promotion, so `REJECT`/`EXTEND_VALIDATION` are equally auditable
+— same shape/RLS pattern as `drift_alerts`/`strategy_health_scores`
+(`0008`). Additive only, no existing-table changes, same non-urgent
+deployment order as every migration except `0008`.
 
 - Daily rollover boundary for `daily_pnl` and circuit-breaker state is
   **midnight IST** (Asia/Kolkata) — resolved decision, §9.

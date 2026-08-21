@@ -3,8 +3,12 @@ from unittest.mock import patch
 
 import pytest
 
+from src.features.opportunity_scorer import PRIMARY_TIMEFRAME
 from src.learning.statistics import (
+    _DIMENSION_TYPES,
     _bucket_memberships,
+    _rsi_style_bucket,
+    _volatility_evidence_bucket,
     accuracy_rates,
     compute_bucket_statistics,
     streaks,
@@ -219,6 +223,59 @@ def test_bucket_memberships_omits_exit_reason_when_absent():
     trade = {"symbol": "BTCINR", "version_id": 1, "closed_at": "2026-01-01T12:00:00Z"}
     memberships = _bucket_memberships(trade, opportunity_score=None, confidence=None)
     assert "exit_reason" not in memberships
+
+
+# --- RSI/StochRSI/volatility evidence buckets (Phases 7-9) ---
+
+
+def test_rsi_style_bucket_edges():
+    assert _rsi_style_bucket(29.9) == "<30"
+    assert _rsi_style_bucket(30) == "30-40"
+    assert _rsi_style_bucket(65) == "60-70"
+    assert _rsi_style_bucket(80) == ">80"
+    assert _rsi_style_bucket(99) == ">80"
+
+
+def test_rsi_style_bucket_none_passthrough():
+    assert _rsi_style_bucket(None) is None
+
+
+def test_volatility_evidence_bucket_5_way():
+    assert _volatility_evidence_bucket(0.1) == "very_low"
+    assert _volatility_evidence_bucket(0.4) == "low"
+    assert _volatility_evidence_bucket(2.0) == "medium"
+    assert _volatility_evidence_bucket(7.0) == "high"
+    assert _volatility_evidence_bucket(15.0) == "extreme"
+    assert _volatility_evidence_bucket(None) is None
+
+
+def test_dimension_types_include_new_evidence_buckets():
+    for dim in ("rsi_bucket", "stoch_rsi_bucket", "atr_volatility_bucket"):
+        assert dim in _DIMENSION_TYPES
+
+
+def _trade_with_entry_features(rsi=None, stoch_rsi_k=None, atr_pct=None):
+    return {
+        "symbol": "BTCINR",
+        "version_id": 1,
+        "closed_at": "2026-01-01T12:00:00Z",
+    }, {"features": {PRIMARY_TIMEFRAME: {"rsi": rsi, "stoch_rsi_k": stoch_rsi_k, "atr_pct": atr_pct}}}
+
+
+def test_bucket_memberships_derives_indicator_buckets_from_entry_eval():
+    trade, entry_eval = _trade_with_entry_features(rsi=75, stoch_rsi_k=25, atr_pct=0.3)
+    memberships = _bucket_memberships(trade, opportunity_score=None, confidence=None, entry_eval=entry_eval)
+    assert memberships["rsi_bucket"] == "70-80"
+    assert memberships["stoch_rsi_bucket"] == "<30"  # RSI/StochRSI share the same fixed edges
+    assert memberships["atr_volatility_bucket"] == "low"
+
+
+def test_bucket_memberships_omits_indicator_buckets_without_entry_eval():
+    trade = {"symbol": "BTCINR", "version_id": 1, "closed_at": "2026-01-01T12:00:00Z"}
+    memberships = _bucket_memberships(trade, opportunity_score=None, confidence=None)
+    assert "rsi_bucket" not in memberships
+    assert "stoch_rsi_bucket" not in memberships
+    assert "atr_volatility_bucket" not in memberships
 
 
 # --- accuracy_rates (Performance Analyzer) ---

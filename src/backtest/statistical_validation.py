@@ -70,6 +70,11 @@ def monte_carlo_drawdown_distribution(
         "simulated_worst_drawdown_pct": drawdowns[-1],
         "percentile_of_actual": sum(1 for d in drawdowns if d <= actual_dd_pct) / len(drawdowns) * 100,
         "iterations": iterations,
+        # Full sorted distribution — additive (existing callers destructure
+        # by key, none assert an exact key set); promotion_gate.py uses
+        # this to answer "probability of a catastrophic drawdown", a
+        # different question than the percentile-of-actual summary above.
+        "drawdowns": drawdowns,
     }
 
 

@@ -9,6 +9,7 @@ from src.learning.recommendations import (
     current_weights,
     generate_ai_exit_params_recommendations,
     generate_exit_params_recommendations,
+    generate_indicator_bucket_recommendations,
     generate_recommendations,
     generate_regime_recommendations,
     generate_symbol_recommendations,
@@ -240,6 +241,45 @@ def test_generate_regime_recommendations_never_flags_a_regime_better_than_baseli
     result = generate_regime_recommendations("paper", status=_READY)
 
     assert not any(r["metric_name"].startswith("avoid_regime:") for r in result)
+
+
+# --- generate_indicator_bucket_recommendations: RSI/StochRSI/volatility
+# evidence (Phases 7-9), reusing _avoid_bucket_recommendations verbatim ---
+
+
+@patch("src.learning.recommendations.SIGNIFICANCE_THRESHOLD", 0.05)
+@patch("src.learning.recommendations.RECOMMENDATION_MIN_SAMPLE_SIZE", 4)
+@patch("src.learning.recommendations.z_test_two_proportions")
+@patch("src.learning.recommendations.models")
+def test_generate_indicator_bucket_recommendations_flags_worse_than_baseline(mock_models, mock_z_test):
+    all_trades = [_trade(i, 100) for i in range(1, 5)] + [_trade(i, -100) for i in range(5, 9)]
+    mock_models.get_recently_closed_trades.return_value = all_trades
+    # returned for all 3 dimension_type calls (rsi_bucket/stoch_rsi_bucket/
+    # atr_volatility_bucket) — the mock doesn't discriminate by call args,
+    # which is fine: it exercises the same generic logic 3 times.
+    mock_models.get_learning_statistics.return_value = [
+        {"dimension_value": "70-80", "trades_count": 4, "win_rate": 0.0},
+    ]
+    mock_models.get_latest_recommendation.return_value = None
+    mock_z_test.return_value = 0.01  # significant
+
+    result = generate_indicator_bucket_recommendations("paper", status=_READY)
+
+    prefixes = {r["metric_name"].split(":")[0] for r in result}
+    assert prefixes == {"avoid_rsi_bucket", "avoid_stoch_rsi_bucket", "avoid_volatility_bucket"}
+    assert all(r["recommended_value"] == 0.0 for r in result)
+
+
+@patch("src.learning.recommendations.models")
+def test_generate_indicator_bucket_recommendations_not_ready_returns_empty(mock_models):
+    assert generate_indicator_bucket_recommendations("paper", status=_NOT_READY) == []
+    mock_models.get_recently_closed_trades.assert_not_called()
+
+
+@patch("src.learning.recommendations.models")
+def test_generate_indicator_bucket_recommendations_no_trades_returns_empty(mock_models):
+    mock_models.get_recently_closed_trades.return_value = []
+    assert generate_indicator_bucket_recommendations("paper", status=_READY) == []
 
 
 # --- generate_symbol_recommendations: avoid-symbol idempotency ---

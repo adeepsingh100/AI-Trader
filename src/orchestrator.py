@@ -5,14 +5,18 @@ completion, exits — see PROJECT_SPEC.md §5.
 Fully quant, zero LLM calls anywhere in this module: OpportunityScorer
 (src/features/) deterministically scores every scanned symbol, and
 reaching MIN_OPPORTUNITY_SCORE/TOP_N_CANDIDATES (entry) or dropping below
-EXIT_SCORE_THRESHOLD (exit) IS the accept decision — there's no separate
-validation step asking anything for a second opinion. An LLM does get
-consulted elsewhere in this codebase, but only once an hour, offline from
-live trading, to propose stop_loss_pct/take_profit_pct candidates that
-still have to clear the same statistical gate as every other strategy
-change (src/learning/recommendations.py::generate_ai_exit_params_
-recommendations) — a bad or unavailable LLM call there costs one skipped
-hourly proposal, never a blocked trade.
+EXIT_SCORE_THRESHOLD (exit) is necessary but not sufficient — an entry
+candidate must ALSO clear the Net Expectancy Gate (risk_manager.
+compute_net_expectancy_pct: fees/GST/TDS/spread/slippage netted against
+the resolved stop/target and the system's own calibrated win-probability
+estimate) before an order is placed. Both gates are pure code, no LLM, no
+second opinion asked of anything. An LLM does get consulted elsewhere in
+this codebase, but only once an hour, offline from live trading, to
+propose stop_loss_pct/take_profit_pct candidates that still have to clear
+the same statistical gate as every other strategy change (src/learning/
+recommendations.py::generate_ai_exit_params_recommendations) — a bad or
+unavailable LLM call there costs one skipped hourly proposal, never a
+blocked trade.
 
 Spot-only: an accepted exit closes an existing held position for that
 symbol (there's no shorting on CoinDCX spot). An accepted entry opens one
@@ -34,8 +38,10 @@ from src.agents.execution.real import RealExecutionAgent
 from src.agents.risk_manager import (
     circuit_breaker_triggered,
     committed_capital,
+    compute_net_expectancy_pct,
     evaluate,
     exit_reason,
+    resolve_exit_params,
     target_hit,
     today_ist,
 )
@@ -197,7 +203,13 @@ def _sweep_stop_loss_take_profit(
         price = prices.get(trade["symbol"])
         if price is None:
             continue
-        reason = exit_reason(trade["entry_price"], price, params_json)
+        reason = exit_reason(
+            trade["entry_price"],
+            price,
+            params_json,
+            stored_stop_loss_price=trade.get("stop_loss_price"),
+            stored_take_profit_price=trade.get("take_profit_price"),
+        )
         if reason is None:
             continue
 
@@ -413,7 +425,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 f"quant score {opportunity_score:.1f} >= {MIN_OPPORTUNITY_SCORE} "
                 f"(trend={record['trend_score']:.0f} momentum={record['momentum_score']:.0f} "
                 f"volume={record['volume_score']:.0f} volatility={record['volatility_score']:.0f} "
-                f"risk={record['risk_score']:.0f}, regime={record['market_regime']})"
+                f"resistance_headroom={record['risk_score']:.0f}, regime={record['market_regime']})"
             )
             llm_raw_response = summary
 
@@ -445,61 +457,89 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
             if confidence_cleared:
                 capital_to_use = capital_config.get("capital_to_use") or 0
-                sizing_context = {
-                    "avg_correlation": _avg_correlation_with_book(symbol, open_trades, price_history),
-                    "candidate_volatility_pct": (record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}).get("atr_pct"),
-                    # Not computed live yet — no live mark-to-market equity
-                    # curve exists to derive it from (that's backtest-only,
-                    # src/backtest/portfolio_manager.py); the drawdown
-                    # factor defaults to neutral (1.0) rather than a
-                    # fabricated estimate.
-                    "recent_drawdown_pct": None,
-                    "current_exposure_pct": (
-                        committed_capital(open_trades) / capital_to_use * 100 if capital_to_use else None
-                    ),
-                    "strategy_win_rate": overall_win_rate,
-                    "market_regime": record["market_regime"],
-                    "confidence": calibrated["final_confidence"],
-                }
-                decision = evaluate(
-                    capital_config,
-                    daily_pnl,
-                    open_trades,
-                    market["last_price"],
-                    symbol=symbol,
-                    portfolio_positions=_portfolio_positions(open_trades, last_price_by_symbol),
-                    price_history=price_history,
-                    sizing_context=sizing_context,
+                current_exposure_pct = (
+                    committed_capital(open_trades) / capital_to_use * 100 if capital_to_use else None
                 )
-                risk_manager_result = decision.action
-                if decision.action == "size":
-                    fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
-                    params_json = version.get("params_json") or {}
-                    stop_loss_pct = params_json.get("stop_loss_pct")
-                    take_profit_pct = params_json.get("take_profit_pct")
-                    entry_price = fill["fill_price"]
-                    last_price = market["last_price"]
-                    trade = models.open_trade(
-                        mode=mode,
-                        version_id=version["id"],
+
+                # Net Expectancy Gate: a real risk boundary (evidence-
+                # validated params_json stop/target, falling back to an
+                # ATR-derived one only for a leg params_json doesn't
+                # configure — resolve_exit_params) and the fees/GST/TDS/
+                # spread/slippage this trade would actually incur decide
+                # whether it's worth taking — opportunity_score/confidence
+                # clearing their own gates is necessary but not sufficient.
+                atr_pct = (record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}).get("atr_pct")
+                params_json = version.get("params_json") or {}
+                stop_loss_pct, take_profit_pct = resolve_exit_params(params_json, atr_pct)
+                win_probability_pct = (
+                    calibrated["final_confidence"]
+                    if calibrated["final_confidence"] is not None
+                    else opportunity_score
+                )
+                net_expectancy = compute_net_expectancy_pct(
+                    stop_loss_pct, take_profit_pct, win_probability_pct / 100
+                )
+                expectancy_cleared = net_expectancy is not None and net_expectancy["net_expectancy_pct"] > 0
+                ne_display = f"{net_expectancy['net_expectancy_pct']:.4f}" if net_expectancy is not None else "n/a"
+                llm_reasoning += (
+                    f"; stop={stop_loss_pct} target={take_profit_pct} atr_pct={atr_pct} "
+                    f"exposure_pct={current_exposure_pct} net_expectancy_pct={ne_display}"
+                )
+
+                if expectancy_cleared:
+                    sizing_context = {
+                        "avg_correlation": _avg_correlation_with_book(symbol, open_trades, price_history),
+                        "candidate_volatility_pct": atr_pct,
+                        # Not computed live yet — no live mark-to-market equity
+                        # curve exists to derive it from (that's backtest-only,
+                        # src/backtest/portfolio_manager.py); the drawdown
+                        # factor defaults to neutral (1.0) rather than a
+                        # fabricated estimate.
+                        "recent_drawdown_pct": None,
+                        "current_exposure_pct": current_exposure_pct,
+                        "strategy_win_rate": overall_win_rate,
+                        "market_regime": record["market_regime"],
+                        "confidence": calibrated["final_confidence"],
+                    }
+                    decision = evaluate(
+                        capital_config,
+                        daily_pnl,
+                        open_trades,
+                        market["last_price"],
                         symbol=symbol,
-                        side="buy",
-                        qty=decision.qty,
-                        entry_price=entry_price,
-                        fees=fill["fees"],
-                        reasoning_text=llm_reasoning,
-                        stop_loss_price=entry_price * (1 - stop_loss_pct) if stop_loss_pct else None,
-                        take_profit_price=entry_price * (1 + take_profit_pct) if take_profit_pct else None,
-                        entry_slippage_pct=(entry_price - last_price) / last_price * 100 if last_price else None,
-                        market_regime=record["market_regime"],
+                        portfolio_positions=_portfolio_positions(open_trades, last_price_by_symbol),
+                        price_history=price_history,
+                        sizing_context=sizing_context,
+                        stop_loss_pct=stop_loss_pct,
                     )
-                    models.log_agent_event("orchestrator", "info", f"opened buy {symbol}")
-                    opened.append(trade)
-                    open_trades.append(trade)
-                    open_by_symbol[symbol] = trade
-                    final_decision, reason, trade_id = "buy", llm_reasoning, trade["id"]
+                    risk_manager_result = decision.action
+                    if decision.action == "size":
+                        fill = execution_agent.place_order(symbol, "buy", decision.qty, market["last_price"])
+                        entry_price = fill["fill_price"]
+                        last_price = market["last_price"]
+                        trade = models.open_trade(
+                            mode=mode,
+                            version_id=version["id"],
+                            symbol=symbol,
+                            side="buy",
+                            qty=decision.qty,
+                            entry_price=entry_price,
+                            fees=fill["fees"],
+                            reasoning_text=llm_reasoning,
+                            stop_loss_price=entry_price * (1 - stop_loss_pct) if stop_loss_pct else None,
+                            take_profit_price=entry_price * (1 + take_profit_pct) if take_profit_pct else None,
+                            entry_slippage_pct=(entry_price - last_price) / last_price * 100 if last_price else None,
+                            market_regime=record["market_regime"],
+                        )
+                        models.log_agent_event("orchestrator", "info", f"opened buy {symbol}")
+                        opened.append(trade)
+                        open_trades.append(trade)
+                        open_by_symbol[symbol] = trade
+                        final_decision, reason, trade_id = "buy", llm_reasoning, trade["id"]
+                    else:
+                        reason = f"risk_manager blocked: {decision.action}"
                 else:
-                    reason = f"risk_manager blocked: {decision.action}"
+                    reason = f"net_expectancy gated: {ne_display}"
             else:
                 reason = f"confidence gated: {calibrated['final_confidence']:.1f} < {MIN_FINAL_CONFIDENCE}"
 

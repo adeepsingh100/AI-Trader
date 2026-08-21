@@ -25,8 +25,13 @@ from src.config import (
     MIN_OPPORTUNITY_SCORE,
     OPPORTUNITY_SCORE_BUCKET_WIDTH,
     SORTINO_MAR_PCT,
+    VOLATILITY_EXTREME_MIN_PCT,
+    VOLATILITY_HIGH_MIN_PCT,
+    VOLATILITY_LOW_MAX_PCT,
+    VOLATILITY_VERY_LOW_MAX_PCT,
 )
 from src.db import models
+from src.features.opportunity_scorer import PRIMARY_TIMEFRAME
 from src.utils import parse_timestamp as _parse_ts
 
 _DIMENSION_TYPES = (
@@ -38,7 +43,45 @@ _DIMENSION_TYPES = (
     "weekday",
     "hour",
     "exit_reason",
+    "rsi_bucket",
+    "stoch_rsi_bucket",
+    "atr_volatility_bucket",
 )
+
+# RSI/StochRSI share the same 0-100 scale — same fixed edges answer Phases
+# 7 (RSI) and 8 (StochRSI) of the evidence audit: is a bucket's win rate/
+# expectancy actually better, not assumed from "high RSI = good momentum".
+_RSI_BUCKET_EDGES = (30, 40, 50, 60, 70, 80)
+
+
+def _rsi_style_bucket(value: float | None) -> str | None:
+    if value is None:
+        return None
+    lo = None
+    for edge in _RSI_BUCKET_EDGES:
+        if value < edge:
+            return f"<{edge}" if lo is None else f"{lo}-{edge}"
+        lo = edge
+    return f">{lo}"
+
+
+def _volatility_evidence_bucket(atr_pct: float | None) -> str | None:
+    """5-way evidence-only bucket (very_low/low/medium/high/extreme) for
+    learning_statistics — distinct from feature_engine.volatility_bucket()'s
+    3-way live-scoring split, which stays untouched. Reuses that module's
+    own low/high boundaries as 2 of these 4, rather than a second,
+    disconnected pair of thresholds."""
+    if atr_pct is None:
+        return None
+    if atr_pct <= VOLATILITY_VERY_LOW_MAX_PCT:
+        return "very_low"
+    if atr_pct <= VOLATILITY_LOW_MAX_PCT:
+        return "low"
+    if atr_pct < VOLATILITY_HIGH_MIN_PCT:
+        return "medium"
+    if atr_pct < VOLATILITY_EXTREME_MIN_PCT:
+        return "high"
+    return "extreme"
 
 
 def _downside_deviation(returns: list[float], mar: float) -> float | None:
@@ -220,7 +263,9 @@ def _assess_target(trade: dict) -> str | None:
     return "realistic" if trade.get("mfe_pct", 0) >= target_distance_pct else "too_ambitious"
 
 
-def _bucket_memberships(trade: dict, opportunity_score: float | None, confidence: float | None) -> dict:
+def _bucket_memberships(
+    trade: dict, opportunity_score: float | None, confidence: float | None, entry_eval: dict | None = None
+) -> dict:
     closed_at_ist = _parse_ts(trade["closed_at"]).astimezone(TRADING_DAY_TZ)
     memberships = {
         "symbol": trade["symbol"],
@@ -238,6 +283,20 @@ def _bucket_memberships(trade: dict, opportunity_score: float | None, confidence
     confidence_bucket = _bucket_label(confidence, CONFIDENCE_BUCKET_WIDTH)
     if confidence_bucket:
         memberships["confidence_bucket"] = confidence_bucket
+
+    # entry-time indicator snapshot, already stored in full on every
+    # opportunity_evaluations row (features jsonb) — no new data collection.
+    primary = ((entry_eval or {}).get("features") or {}).get(PRIMARY_TIMEFRAME) or {}
+    rsi_bucket = _rsi_style_bucket(primary.get("rsi"))
+    if rsi_bucket:
+        memberships["rsi_bucket"] = rsi_bucket
+    stoch_rsi_bucket = _rsi_style_bucket(primary.get("stoch_rsi_k"))
+    if stoch_rsi_bucket:
+        memberships["stoch_rsi_bucket"] = stoch_rsi_bucket
+    volatility_bucket = _volatility_evidence_bucket(primary.get("atr_pct"))
+    if volatility_bucket:
+        memberships["atr_volatility_bucket"] = volatility_bucket
+
     return memberships
 
 
@@ -269,7 +328,11 @@ def _evaluate_trade(trade: dict) -> dict:
         stop_loss_assessment=_assess_stop_loss(trade),
         target_assessment=_assess_target(trade),
     )
-    return {"opportunity_score": predicted_opportunity_score, "confidence": predicted_confidence}
+    return {
+        "opportunity_score": predicted_opportunity_score,
+        "confidence": predicted_confidence,
+        "entry_eval": entry_eval,
+    }
 
 
 def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], capital_to_use: float) -> None:
@@ -291,8 +354,12 @@ def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], cap
                 if _bucket_memberships(t, None, None).get(dimension_type) == dimension_value
             ]
         else:
-            # opportunity_score_bucket / confidence_bucket need each trade's
-            # predicted values, which aren't on the trade row itself.
+            # opportunity_score_bucket / confidence_bucket / rsi_bucket /
+            # stoch_rsi_bucket / atr_volatility_bucket all need each
+            # trade's entry-time evaluation, which isn't on the trade row
+            # itself — reuses _bucket_memberships (the single source of
+            # truth for how a trade maps to a bucket) rather than
+            # duplicating its label logic here.
             bucket_trades = []
             for t in all_recent:
                 entry_eval = models.get_entry_evaluation_for_trade(t["id"])
@@ -301,12 +368,7 @@ def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], cap
                 if entry_eval:
                     calibration = models.get_confidence_calibration_for_evaluation(entry_eval["id"])
                     confidence = calibration["final_confidence"] if calibration else None
-                label = (
-                    _bucket_label(score, OPPORTUNITY_SCORE_BUCKET_WIDTH)
-                    if dimension_type == "opportunity_score_bucket"
-                    else _bucket_label(confidence, CONFIDENCE_BUCKET_WIDTH)
-                )
-                if label == dimension_value:
+                if _bucket_memberships(t, score, confidence, entry_eval).get(dimension_type) == dimension_value:
                     bucket_trades.append(t)
 
         stats = compute_bucket_statistics(bucket_trades, capital_to_use)
@@ -335,7 +397,7 @@ def process_closed_trades(mode: str) -> list[dict]:
     for trade in new_trades:
         predicted = _evaluate_trade(trade)
         memberships = _bucket_memberships(
-            trade, predicted["opportunity_score"], predicted["confidence"]
+            trade, predicted["opportunity_score"], predicted["confidence"], predicted["entry_eval"]
         )
         touched_buckets.update(memberships.items())
 

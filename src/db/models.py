@@ -132,9 +132,11 @@ def promote_version(version_id: int) -> None:
 
 
 def set_strategy_version_promotion_eligible(version_id: int, eligible: bool) -> None:
-    """Code sets this flag only — never promoted_to_real itself (Scientific
-    Strategy Optimization Framework). A human reviews eligible rows in
-    Supabase and flips promoted_to_real themselves."""
+    """Mirrors src/learning/promotion_gate.py::evaluate_promotion()'s
+    PROMOTE/REJECT/EXTEND_VALIDATION verdict onto the row for visibility —
+    evolution_agent.py calls promote_version() itself immediately after on
+    PROMOTE, fully automatically, no human step. This flag is a record of
+    the decision, not a queue awaiting manual action."""
     get_client().table("strategy_versions").update({"promotion_eligible": eligible}).eq(
         "id", version_id
     ).execute()
@@ -1191,3 +1193,88 @@ def reset_circuit_breaker(component: str) -> None:
         {"component": component, "consecutive_failures": 0, "tripped_until": None},
         on_conflict="component",
     ).execute()
+
+
+# --- Data Retention ---
+# Keeps the free-tier Supabase disk from maxing out again the way it did
+# earlier — opportunity_evaluations is written every scanned symbol every
+# cycle, the highest-volume table by far. trades/strategy_versions/
+# recommendations/adaptive_strategy_versions/strategy_simulations/
+# learning_statistics/feature_importance/drift_alerts/
+# strategy_health_scores/historical_candles are deliberately NOT here: the
+# actual ledger, small-row-count decision history, compact rollups, or
+# low-volume/valuable backtest data respectively — see src/config.py's
+# Data Retention section.
+_RETENTION_TABLES = (
+    ("opportunity_evaluations", "timestamp"),
+    ("confidence_calibration", "created_at"),
+    ("agent_logs", "timestamp"),
+    ("model_usage", "timestamp"),
+    ("system_metrics", "recorded_at"),
+    ("data_quality_log", "created_at"),
+)
+
+
+# --- promotion_audit (src/learning/promotion_gate.py) ---
+
+
+def insert_promotion_audit(
+    mode: str,
+    event_type: str,
+    decision: str,
+    candidate_version_id: int | None = None,
+    previous_champion_id: int | None = None,
+    new_champion_id: int | None = None,
+    promotion_score: float | None = None,
+    gates: dict | None = None,
+    breakdown: dict | None = None,
+    reasons: list | None = None,
+) -> dict:
+    res = (
+        get_client()
+        .table("promotion_audit")
+        .insert(
+            {
+                "mode": mode,
+                "event_type": event_type,
+                "decision": decision,
+                "candidate_version_id": candidate_version_id,
+                "previous_champion_id": previous_champion_id,
+                "new_champion_id": new_champion_id,
+                "promotion_score": promotion_score,
+                "gates": gates or {},
+                "breakdown": breakdown or {},
+                "reasons": reasons or [],
+            }
+        )
+        .execute()
+    )
+    return res.data[0]
+
+
+def get_latest_promotion_audit(mode: str, event_type: str | None = None) -> dict | None:
+    query = get_client().table("promotion_audit").select("*").eq("mode", mode)
+    if event_type is not None:
+        query = query.eq("event_type", event_type)
+    res = query.order("created_at", desc=True).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def purge_old_data(cutoffs: dict[str, datetime]) -> dict[str, int]:
+    """Deletes rows older than `cutoffs[table]` for every table in
+    _RETENTION_TABLES a cutoff was supplied for (a table with no entry in
+    `cutoffs` is skipped, not purged with some default). Delete is
+    naturally idempotent (re-deleting an already-gone row is a no-op), so
+    this goes through _execute's retry like every other idempotent write
+    in this module. Returns {table: rows_deleted} for the caller to log —
+    the Supabase Python client's .delete() returns the deleted rows by
+    default (Prefer: return=representation), so the count is read straight
+    off that response with no separate count query."""
+    deleted: dict[str, int] = {}
+    for table, column in _RETENTION_TABLES:
+        cutoff = cutoffs.get(table)
+        if cutoff is None:
+            continue
+        res = _execute(get_client().table(table).delete().lt(column, cutoff.isoformat()))
+        deleted[table] = len(res.data or [])
+    return deleted

@@ -8,10 +8,12 @@
 -- change until the corresponding code ships, same deployment-order safety
 -- as every migration except 0008.
 
--- Code no longer auto-flips promoted_to_real (see evolution_agent.py) —
--- it flags eligibility here instead; a human reviews eligible rows in
--- Supabase and flips promoted_to_real themselves, closing the previous
--- zero-approval gap for real capital.
+-- Historical note: at the time this migration shipped, evolution_agent.py
+-- flagged eligibility here and a human flipped promoted_to_real manually.
+-- That manual step was later retired (see src/learning/promotion_gate.py)
+-- once promotion required strict multi-gate evidence instead of 3 raw
+-- thresholds — promoted_to_real is now auto-flipped the same run PROMOTE
+-- is decided, still fully automatic, just gated on far stricter evidence.
 alter table strategy_versions add column promotion_eligible boolean not null default false;
 
 -- Narrative "research report" version notes (Observation/Weakness/

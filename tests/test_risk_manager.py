@@ -1,9 +1,13 @@
+import pytest
+
 from src.agents.risk_manager import (
     RiskDecision,
     circuit_breaker_triggered,
     committed_capital,
+    compute_net_expectancy_pct,
     evaluate,
     exit_reason,
+    resolve_exit_params,
     target_hit,
 )
 
@@ -251,3 +255,164 @@ def test_evaluate_omitting_portfolio_context_skips_concentration_gate():
     capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
     decision = evaluate(capital_config, None, [], last_price=100.0, symbol="BTCINR")
     assert decision.action == "size"
+
+
+# --- risk-based position sizing (Phase 4): stop_loss_pct is a strict
+# ADDITIONAL cap, never grows qty relative to the existing flat/dynamic
+# formula. ---
+
+
+def test_evaluate_omitting_stop_loss_pct_matches_pre_existing_formula():
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0)
+    assert decision.qty == 10.0  # unchanged: no risk-based cap applied
+
+
+def test_evaluate_stop_loss_pct_caps_qty_below_flat_formula():
+    # flat formula: 10% of 10000 / 100 = 10 qty (worth 1000). RISK_PER_TRADE_PCT
+    # defaults to 1.0 -> max risk = 100. stop_loss_pct=0.05 -> max qty by
+    # risk = 100 / (0.05 * 100) = 20... loosen the stop to force a real cap:
+    # stop_loss_pct=0.5 -> max qty by risk = 100 / (0.5*100) = 2, well below 10.
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0, stop_loss_pct=0.5)
+    assert decision.action == "size"
+    assert decision.qty == 2.0
+
+
+def test_evaluate_stop_loss_pct_never_grows_qty_past_flat_formula():
+    # a tight stop (small stop_loss_pct) implies a LARGE max qty by risk —
+    # the cap must never override the flat formula upward, only min() with it.
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0, stop_loss_pct=0.001)
+    assert decision.qty == 10.0  # still the flat formula's qty, not the (huge) risk cap
+
+
+def test_evaluate_zero_stop_loss_pct_skips_risk_cap_like_none():
+    # falsy (0) stop_loss_pct is treated the same as "not supplied" —
+    # never a division by zero.
+    capital_config = _capital_config(capital_to_use=10000, position_size_pct=10)
+    decision = evaluate(capital_config, None, [], last_price=100.0, stop_loss_pct=0)
+    assert decision.qty == 10.0
+
+
+# --- Net Expectancy Gate (Phase 2): fees/GST/TDS/spread/slippage netted
+# against the resolved stop/target and the calibrated win-probability
+# estimate. Pure percentage math — no qty/entry_price needed. ---
+
+
+def test_compute_net_expectancy_pct_positive_at_high_win_probability():
+    result = compute_net_expectancy_pct(stop_loss_pct=0.02, take_profit_pct=0.04, win_probability=0.8)
+    assert result is not None
+    assert result["net_expectancy_pct"] > 0
+    assert result["risk_reward"] == 2.0  # 0.04 / 0.02
+
+
+def test_compute_net_expectancy_pct_negative_at_coin_flip_win_probability():
+    # Real finding: at 2%/4% (a textbook 1:2 R/R) and CoinDCX's actual
+    # round-trip cost (~2.3% of notional: 0.5% fee + 18% GST on that fee,
+    # both legs, plus 1% TDS on the sell leg, plus spread/slippage), a
+    # coin-flip win rate is NOT enough to break even — costs eat more than
+    # half the edge a naive 1:2 R/R "expects" to have. This is exactly why
+    # the gate exists: opportunity_score/confidence clearing their own
+    # thresholds is not the same as the trade being worth taking.
+    result = compute_net_expectancy_pct(stop_loss_pct=0.02, take_profit_pct=0.04, win_probability=0.5)
+    assert result is not None
+    assert result["net_expectancy_pct"] < 0
+
+
+def test_compute_net_expectancy_pct_none_when_stop_or_target_missing():
+    assert compute_net_expectancy_pct(None, 0.04, 0.8) is None
+    assert compute_net_expectancy_pct(0.02, None, 0.8) is None
+    assert compute_net_expectancy_pct(0.02, 0.04, None) is None
+
+
+def test_compute_net_expectancy_pct_none_for_non_positive_legs():
+    assert compute_net_expectancy_pct(0.0, 0.04, 0.8) is None
+    assert compute_net_expectancy_pct(0.02, -0.01, 0.8) is None
+
+
+def test_compute_net_expectancy_pct_clamps_win_probability_outside_0_1():
+    # a caller passing an out-of-range probability (e.g. a raw score not
+    # divided by 100) must never silently produce nonsense math.
+    over = compute_net_expectancy_pct(0.02, 0.04, win_probability=1.5)
+    under = compute_net_expectancy_pct(0.02, 0.04, win_probability=-0.5)
+    assert over["win_probability"] == 1.0
+    assert under["win_probability"] == 0.0
+
+
+def test_compute_net_expectancy_pct_never_nan_or_infinite():
+    for stop, target, prob in ((0.01, 0.10, 0.99), (0.10, 0.01, 0.01), (0.5, 0.5, 0.5)):
+        result = compute_net_expectancy_pct(stop, target, prob)
+        assert result is not None
+        for key in ("net_expectancy_pct", "cost_pct", "risk_reward"):
+            value = result[key]
+            assert value == value  # not NaN
+            assert value not in (float("inf"), float("-inf"))
+
+
+# --- ATR-based stop-loss fallback (Phase 5): params_json's evidence-
+# validated value always wins; ATR only fills a leg params_json omits. ---
+
+
+def test_resolve_exit_params_prefers_configured_params_json():
+    stop, target = resolve_exit_params({"stop_loss_pct": 0.02, "take_profit_pct": 0.04}, atr_pct=10.0)
+    assert (stop, target) == (0.02, 0.04)
+
+
+def test_resolve_exit_params_falls_back_to_atr_when_leg_missing():
+    # atr_pct=2.0 -> stop = clamp(0.02 * 1.5, 0.01, 0.10) = 0.03,
+    # target = clamp(0.02 * 3.0, 0.01, 0.10) = 0.06 (default multipliers).
+    stop, target = resolve_exit_params({}, atr_pct=2.0)
+    assert stop == pytest.approx(0.03)
+    assert target == pytest.approx(0.06)
+
+
+def test_resolve_exit_params_only_fills_the_missing_leg():
+    stop, target = resolve_exit_params({"stop_loss_pct": 0.02}, atr_pct=2.0)
+    assert stop == 0.02  # configured value untouched
+    assert target == pytest.approx(0.06)  # ATR-derived
+
+
+def test_resolve_exit_params_none_when_neither_configured_nor_atr_available():
+    assert resolve_exit_params({}, atr_pct=None) == (None, None)
+
+
+def test_resolve_exit_params_clamps_extreme_atr_within_sweep_range():
+    # a huge atr_pct must never produce an unbounded stop/target.
+    stop, target = resolve_exit_params({}, atr_pct=1000.0)
+    assert stop == pytest.approx(0.10)  # EXIT_PARAM_SWEEP_MAX_PCT ceiling
+    assert target == pytest.approx(0.10)
+    # a tiny atr_pct must never produce a near-zero stop/target either.
+    stop, target = resolve_exit_params({}, atr_pct=0.0001)
+    assert stop == pytest.approx(0.01)  # EXIT_PARAM_SWEEP_MIN_PCT floor
+    assert target == pytest.approx(0.01)
+
+
+# --- exit_reason: stored-price fallback (Phase 5) — closes the "no stop
+# configured = unbounded downside" gap without disturbing the existing
+# live-recomputed-from-params_json behavior when a leg IS configured. ---
+
+
+def test_exit_reason_configured_leg_ignores_stored_price():
+    # params_json wins even if a stored (stale/different) price would
+    # otherwise have fired — no behavior change when a leg is configured.
+    assert exit_reason(100, 98, {"stop_loss_pct": 0.02}, stored_stop_loss_price=50) == "stop_loss"
+    assert exit_reason(100, 99, {"stop_loss_pct": 0.02}, stored_stop_loss_price=99) is None
+
+
+def test_exit_reason_stored_stop_loss_fallback_fires_when_unconfigured():
+    assert exit_reason(100, 89, {}, stored_stop_loss_price=90) == "stop_loss"
+
+
+def test_exit_reason_stored_take_profit_fallback_fires_when_unconfigured():
+    assert exit_reason(100, 111, {}, stored_take_profit_price=110) == "take_profit"
+
+
+def test_exit_reason_stored_prices_not_hit_returns_none():
+    assert exit_reason(100, 95, {}, stored_stop_loss_price=90, stored_take_profit_price=110) is None
+
+
+def test_exit_reason_no_stored_prices_and_no_params_json_is_none():
+    # the original "unbounded downside" case: neither a configured value
+    # nor a stored fallback exists — nothing to check against.
+    assert exit_reason(100, 50, {}) is None

@@ -1,8 +1,9 @@
 import datetime
 from unittest.mock import patch
 
-from src.agents.evolution_agent import compute_metrics, promotion_eligible, promotion_ready, run_evolution
+from src.agents.evolution_agent import compute_metrics, promotion_ready, run_evolution
 from src.learning.learning_status import LearningStatus
+from src.learning.promotion_gate import PromotionDecision
 
 
 def _trade(pnl, closed_at):
@@ -111,50 +112,14 @@ def test_promotion_blocked_when_drawdown_too_deep():
     assert promotion_ready(_version(days_ago=14), _metrics(max_drawdown_pct=16)) is False
 
 
-# --- promotion_eligible (Scientific Strategy Optimization Framework) ---
-
-
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
-@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
-def test_promotion_eligible_false_when_promotion_ready_fails():
-    trades = [_trade(100, "2026-01-01T00:00:00Z")]
-    assert promotion_eligible(_version(days_ago=1), _metrics(), trades, fitness_score=90.0) is False
-
-
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
-@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
-@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
-def test_promotion_eligible_false_when_bootstrap_ci_crosses_zero(mock_bootstrap):
-    mock_bootstrap.return_value = {"ci_low": -0.5, "ci_high": 50.0}
-    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(-90, "2026-01-02T00:00:00Z")]
-    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=90.0) is False
-
-
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
-@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
-@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
-def test_promotion_eligible_false_when_fitness_below_floor(mock_bootstrap):
-    mock_bootstrap.return_value = {"ci_low": 5.0, "ci_high": 50.0}
-    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(90, "2026-01-02T00:00:00Z")]
-    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=40.0) is False
-
-
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
-@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
-@patch("src.backtest.statistical_validation.bootstrap_confidence_interval")
-def test_promotion_eligible_true_when_everything_clears(mock_bootstrap):
-    mock_bootstrap.return_value = {"ci_low": 5.0, "ci_high": 50.0}
-    trades = [_trade(100, "2026-01-01T00:00:00Z"), _trade(90, "2026-01-02T00:00:00Z")]
-    assert promotion_eligible(_version(days_ago=14), _metrics(), trades, fitness_score=90.0) is True
-
-
 # --- run_evolution ---
+# The old promotion_eligible() 5-gate boolean is retired — run_evolution
+# now delegates the actual decision to src/learning/promotion_gate.py::
+# evaluate_promotion (see tests/test_promotion_gate.py for its own
+# thorough coverage). These tests only prove run_evolution's WIRING:
+# PROMOTE -> promote_version + eligible flag + audit row; REJECT/
+# EXTEND_VALIDATION -> neither; already-promoted/real-mode -> the gate
+# isn't even evaluated.
 # No LLM call, no new strategy_versions row — a promotion-readiness
 # monitor only. Trades are real (small, deterministic) so
 # compute_bucket_statistics/compute_fitness_score/bootstrap_confidence_interval
@@ -168,12 +133,10 @@ _CLEARLY_PROFITABLE_TRADES = [
 
 
 @patch("src.learning.learning_status.compute_learning_status")
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_CUMULATIVE_PNL", 0)
-@patch("src.agents.evolution_agent.PROMOTION_MAX_DRAWDOWN_PCT", 15)
-@patch("src.agents.evolution_agent.PROMOTION_MIN_FITNESS_SCORE", 60)
+@patch("src.learning.promotion_gate.build_symbol_to_pair")
+@patch("src.learning.promotion_gate.evaluate_promotion")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models, mock_learning_status):
+def test_run_evolution_promotes_on_PROMOTE_decision(mock_models, mock_evaluate, mock_build_pair, mock_learning_status):
     status = _status("HYPOTHESIS", 120)
     mock_learning_status.return_value = status
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
@@ -181,57 +144,81 @@ def test_run_evolution_flags_promotion_eligible_when_criteria_clear(mock_models,
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
+    mock_models.get_latest_promoted_version.return_value = None
+    mock_build_pair.return_value = None
+    mock_evaluate.return_value = PromotionDecision("PROMOTE", 85.0, {"g": {"passed": True}}, ["all gates cleared"], {})
 
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is True
     assert result["promoted"] is True
+    assert result["promotion_decision"] == "PROMOTE"
     assert result["learning_status"] is status
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, True)
-    mock_models.insert_strategy_version.assert_not_called()
     mock_models.promote_version.assert_called_once_with(1)
+    mock_models.insert_promotion_audit.assert_called_once()
+    audit_kwargs = mock_models.insert_promotion_audit.call_args.kwargs
+    assert audit_kwargs["event_type"] == "promotion"
+    assert audit_kwargs["decision"] == "PROMOTE"
+    assert audit_kwargs["candidate_version_id"] == 1
+    assert audit_kwargs["new_champion_id"] == 1
 
 
 @patch("src.learning.learning_status.compute_learning_status")
-@patch("src.agents.evolution_agent.PROMOTION_MIN_PAPER_DAYS", 14)
+@patch("src.learning.promotion_gate.build_symbol_to_pair")
+@patch("src.learning.promotion_gate.evaluate_promotion")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_does_not_flag_eligible_when_too_young(mock_models, mock_learning_status):
+def test_run_evolution_does_not_promote_on_REJECT_decision(mock_models, mock_evaluate, mock_build_pair, mock_learning_status):
     mock_learning_status.return_value = _status("BOOTSTRAP", 10)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
-    # Starts eligible=True (e.g. a manual test fixture) so the too-young
-    # check genuinely flips it to False, proving the guard actually fires
-    # rather than the flag simply staying at its already-False default.
-    version = _version(days_ago=2, promotion_eligible=True)  # too young
+    # Starts eligible=True (e.g. a manual test fixture) so a REJECT
+    # decision genuinely flips it to False, proving the write actually
+    # fires rather than the flag simply staying at its default.
+    version = _version(days_ago=2, promotion_eligible=True)
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
+    mock_models.get_latest_promoted_version.return_value = None
+    mock_build_pair.return_value = None
+    mock_evaluate.return_value = PromotionDecision("REJECT", 20.0, {"g": {"passed": False}}, ["drawdown too deep"], {})
 
     result = run_evolution(mode="paper")
 
     assert result["promotion_eligible"] is False
+    assert result["promotion_decision"] == "REJECT"
     assert result["promoted"] is False
     mock_models.set_strategy_version_promotion_eligible.assert_called_once_with(1, False)
     mock_models.promote_version.assert_not_called()
+    assert mock_models.insert_promotion_audit.call_args.kwargs["event_type"] == "evaluation"
 
 
 @patch("src.learning.learning_status.compute_learning_status")
+@patch("src.learning.promotion_gate.build_symbol_to_pair")
+@patch("src.learning.promotion_gate.evaluate_promotion")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_skips_setting_flag_when_unchanged(mock_models, mock_learning_status):
-    mock_learning_status.return_value = _status("BOOTSTRAP", 0)
+def test_run_evolution_extend_validation_does_not_promote(mock_models, mock_evaluate, mock_build_pair, mock_learning_status):
+    mock_learning_status.return_value = _status("BOOTSTRAP", 10)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
-    version = _version(days_ago=2, promotion_eligible=False)  # too young -> stays False
+    version = _version(days_ago=2, promotion_eligible=False)
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = []
+    mock_models.get_latest_promoted_version.return_value = None
+    mock_build_pair.return_value = None
+    mock_evaluate.return_value = PromotionDecision("EXTEND_VALIDATION", None, {}, ["not enough paper trades"], {})
 
     run_evolution(mode="paper")
 
+    # eligible stays False, matching the version's existing flag -> no write
     mock_models.set_strategy_version_promotion_eligible.assert_not_called()
+    mock_models.promote_version.assert_not_called()
+    assert mock_models.insert_promotion_audit.call_args.kwargs["event_type"] == "evaluation"
 
 
 @patch("src.learning.learning_status.compute_learning_status")
+@patch("src.learning.promotion_gate.evaluate_promotion")
 @patch("src.agents.evolution_agent.models")
-def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_status):
+def test_run_evolution_never_evaluates_promotion_for_real_mode(mock_models, mock_evaluate, mock_learning_status):
     mock_learning_status.return_value = _status("HYPOTHESIS", 120)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
     version = _version(days_ago=20, promoted=True)
@@ -242,5 +229,74 @@ def test_run_evolution_never_eligible_for_real_mode(mock_models, mock_learning_s
     result = run_evolution(mode="real")
 
     assert result["promotion_eligible"] is False
+    assert result["promotion_decision"] is None
     assert result["promoted"] is False
     mock_models.promote_version.assert_not_called()
+    mock_models.insert_promotion_audit.assert_not_called()
+    mock_evaluate.assert_not_called()
+
+
+@patch("src.learning.learning_status.compute_learning_status")
+@patch("src.learning.promotion_gate.evaluate_promotion")
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_skips_gate_for_already_promoted_version(mock_models, mock_evaluate, mock_learning_status):
+    mock_learning_status.return_value = _status("HYPOTHESIS", 120)
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    version = _version(days_ago=20, promoted=True)  # already promoted_to_real
+    version.update({"id": 1, "version_number": 3})
+    mock_models.get_latest_version.return_value = version
+    mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
+
+    result = run_evolution(mode="paper")
+
+    assert result["promotion_decision"] is None
+    mock_evaluate.assert_not_called()
+    mock_models.insert_promotion_audit.assert_not_called()
+
+
+# --- data retention purge (piggybacked on this already-hourly step) ---
+
+
+@patch("src.learning.learning_status.compute_learning_status")
+@patch("src.agents.evolution_agent.OPERATIONAL_LOG_RETENTION_DAYS", 30)
+@patch("src.agents.evolution_agent.LEARNING_HISTORY_WINDOW_DAYS", 180)
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_purges_old_data_with_correct_cutoffs(mock_models, mock_learning_status):
+    mock_learning_status.return_value = _status("BOOTSTRAP", 3)
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    # promoted=True so the promotion-gate branch (unrelated to this test,
+    # would otherwise need its own mocking) is skipped entirely.
+    mock_models.get_latest_version.return_value = _version(days_ago=1, promoted=True)
+    mock_models.get_closed_trades.return_value = []
+    mock_models.purge_old_data.return_value = {"opportunity_evaluations": 5, "agent_logs": 2}
+
+    run_evolution(mode="paper")
+
+    cutoffs = mock_models.purge_old_data.call_args[0][0]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    assert set(cutoffs) == {
+        "opportunity_evaluations", "confidence_calibration", "agent_logs",
+        "model_usage", "system_metrics", "data_quality_log",
+    }
+    # learning-relevant tables reuse LEARNING_HISTORY_WINDOW_DAYS (180d);
+    # pure operational logs use the shorter OPERATIONAL_LOG_RETENTION_DAYS (30d)
+    assert abs((now - cutoffs["opportunity_evaluations"]).days - 180) <= 1
+    assert abs((now - cutoffs["agent_logs"]).days - 30) <= 1
+    mock_models.log_agent_event.assert_any_call(
+        "evolution_agent", "info", "data retention purge: {'opportunity_evaluations': 5, 'agent_logs': 2}"
+    )
+
+
+@patch("src.learning.learning_status.compute_learning_status")
+@patch("src.agents.evolution_agent.models")
+def test_run_evolution_purge_failure_fails_open(mock_models, mock_learning_status):
+    # a purge error must never block the promotion-monitor result above it.
+    mock_learning_status.return_value = _status("BOOTSTRAP", 3)
+    mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_latest_version.return_value = _version(days_ago=1, promoted=True)
+    mock_models.get_closed_trades.return_value = []
+    mock_models.purge_old_data.side_effect = RuntimeError("supabase unavailable")
+
+    result = run_evolution(mode="paper")
+
+    assert result["promotion_eligible"] is False

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 from src.db import models
@@ -323,3 +324,114 @@ def test_get_trade_evaluation_ids_returns_set(monkeypatch):
     monkeypatch.setattr(models, "get_client", lambda: client)
 
     assert models.get_trade_evaluation_ids([1, 2, 3]) == {1, 3}
+
+
+# --- purge_old_data (Data Retention) ---
+
+
+def test_purge_old_data_deletes_rows_past_cutoff_per_table(monkeypatch):
+    tables = {
+        "opportunity_evaluations": _fluent_mock([{"id": 1}, {"id": 2}]),
+        "agent_logs": _fluent_mock([{"id": 5}]),
+    }
+    client = Mock(table=Mock(side_effect=lambda name: tables[name]))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    result = models.purge_old_data({"opportunity_evaluations": cutoff, "agent_logs": cutoff})
+
+    assert result == {"opportunity_evaluations": 2, "agent_logs": 1}
+    tables["opportunity_evaluations"].lt.assert_called_with("timestamp", cutoff.isoformat())
+    tables["agent_logs"].lt.assert_called_with("timestamp", cutoff.isoformat())
+    tables["opportunity_evaluations"].delete.assert_called_once()
+
+
+def test_purge_old_data_skips_tables_without_a_cutoff(monkeypatch):
+    calls = []
+
+    def _table(name):
+        calls.append(name)
+        return _fluent_mock([])
+
+    client = Mock(table=Mock(side_effect=_table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.purge_old_data({"agent_logs": datetime.now(timezone.utc)})
+
+    assert calls == ["agent_logs"]  # every other _RETENTION_TABLES entry skipped, no query at all
+    assert result == {"agent_logs": 0}
+
+
+def test_purge_old_data_empty_cutoffs_touches_nothing(monkeypatch):
+    client = Mock()
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    assert models.purge_old_data({}) == {}
+    client.table.assert_not_called()
+
+
+# --- promotion_audit (src/learning/promotion_gate.py) ---
+
+
+def test_insert_promotion_audit_inserts_expected_row(monkeypatch):
+    table = _fluent_mock([{"id": 1}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.insert_promotion_audit(
+        mode="paper",
+        event_type="promotion",
+        decision="PROMOTE",
+        candidate_version_id=5,
+        previous_champion_id=3,
+        new_champion_id=5,
+        promotion_score=85.0,
+        gates={"g": {"passed": True}},
+        breakdown={"metrics": {}},
+        reasons=["all gates cleared"],
+    )
+
+    client.table.assert_called_with("promotion_audit")
+    inserted = table.insert.call_args[0][0]
+    assert inserted["mode"] == "paper"
+    assert inserted["event_type"] == "promotion"
+    assert inserted["decision"] == "PROMOTE"
+    assert inserted["candidate_version_id"] == 5
+    assert inserted["previous_champion_id"] == 3
+    assert inserted["new_champion_id"] == 5
+    assert inserted["promotion_score"] == 85.0
+    assert result == {"id": 1}
+
+
+def test_insert_promotion_audit_defaults_jsonb_fields(monkeypatch):
+    table = _fluent_mock([{"id": 1}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    models.insert_promotion_audit(mode="paper", event_type="evaluation", decision="REJECT")
+
+    inserted = table.insert.call_args[0][0]
+    assert inserted["gates"] == {}
+    assert inserted["breakdown"] == {}
+    assert inserted["reasons"] == []
+
+
+def test_get_latest_promotion_audit_filters_by_mode_and_event_type(monkeypatch):
+    table = _fluent_mock([{"id": 7, "decision": "PROMOTE"}])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    result = models.get_latest_promotion_audit("paper", event_type="promotion")
+
+    client.table.assert_called_with("promotion_audit")
+    table.eq.assert_any_call("mode", "paper")
+    table.eq.assert_any_call("event_type", "promotion")
+    assert result == {"id": 7, "decision": "PROMOTE"}
+
+
+def test_get_latest_promotion_audit_returns_none_when_empty(monkeypatch):
+    table = _fluent_mock([])
+    client = Mock(table=Mock(return_value=table))
+    monkeypatch.setattr(models, "get_client", lambda: client)
+
+    assert models.get_latest_promotion_audit("paper") is None

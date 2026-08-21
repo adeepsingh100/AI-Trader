@@ -19,7 +19,18 @@ def _capital_config(**overrides):
 
 
 def _version(**overrides):
-    base = {"id": 1, "version_number": 1, "prompt_text": "be a trader"}
+    # stop_loss_pct/take_profit_pct present by default so the Net
+    # Expectancy Gate (risk_manager.compute_net_expectancy_pct) has a
+    # computable stop/target without needing real ATR data from
+    # candles_by_timeframe (most fixtures leave that empty) — matches this
+    # test suite's existing default of "a trade opens unless the test is
+    # specifically about something blocking it."
+    base = {
+        "id": 1,
+        "version_number": 1,
+        "prompt_text": "be a trader",
+        "params_json": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04},
+    }
     base.update(overrides)
     return base
 
@@ -120,6 +131,44 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
 
 
 @patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.calibrate_confidence")
+@patch("src.orchestrator.find_similar_trades")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_net_expectancy_gate_blocks_entry_despite_high_score(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
+):
+    # opportunity_score/confidence both clear their own gates, but the
+    # configured stop/target is a bad enough risk/reward (a 1% target
+    # against a 10% stop) that even a WIN loses money net of fees/GST/TDS/
+    # spread/slippage — net expectancy is negative regardless of win
+    # probability, so no order should ever be placed.
+    mock_models.get_capital_config.return_value = _capital_config()
+    version = _version()
+    version["params_json"] = {"stop_loss_pct": 0.10, "take_profit_pct": 0.01}
+    mock_models.get_latest_version.return_value = version
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_snapshot.return_value = [_market()]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = [{"symbol": "BTCINR"}]
+    mock_similar.return_value = _empty_similar()
+    mock_calibrate.return_value = _permissive_calibration()
+
+    execution_agent = Mock()
+    result = run_cycle(execution_agent=execution_agent)
+
+    assert result["opened"] == []
+    execution_agent.place_order.assert_not_called()
+    mock_models.open_trade.assert_not_called()
+    log_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
+    assert log_kwargs["final_decision"] == "hold"
+    assert "net_expectancy gated" in log_kwargs["reason"]
+
+
+@patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.select_top_candidates")
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
@@ -154,9 +203,14 @@ def test_run_cycle_skips_symbol_not_in_candidate_set(
 @patch("src.orchestrator.score_opportunity")
 @patch("src.orchestrator.models")
 @patch("src.orchestrator.get_market_snapshot")
+@patch("src.orchestrator.get_ticker")
 def test_run_cycle_llm_accepts_but_risk_manager_blocks_max_positions(
-    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
+    mock_ticker, mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
+    # unrelated open positions at flat price (0% change) so the stop-loss/
+    # take-profit sweep leaves them alone — this test is about the
+    # max_positions block on a NEW entry candidate, not the sweep.
+    mock_ticker.return_value = [{"market": "ETHINR", "last_price": 10}, {"market": "SOLINR", "last_price": 10}]
     mock_models.get_capital_config.return_value = _capital_config(max_concurrent_positions=2)
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
@@ -610,7 +664,12 @@ def test_run_cycle_real_mode_uses_promoted_version_not_latest(
 ):
     # latest overall version is #7 (unvetted paper draft), but only #3 is
     # promoted — real mode must open trades against #3, not #7
-    promoted_version = {"id": 3, "version_number": 3, "prompt_text": "promoted prompt"}
+    promoted_version = {
+        "id": 3,
+        "version_number": 3,
+        "prompt_text": "promoted prompt",
+        "params_json": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04},
+    }
     mock_models.get_capital_config.return_value = _capital_config()
     mock_models.get_latest_promoted_version.return_value = promoted_version
     mock_models.get_daily_pnl.return_value = None

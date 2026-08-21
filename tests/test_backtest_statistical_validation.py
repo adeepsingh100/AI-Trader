@@ -48,6 +48,14 @@ def test_monte_carlo_drawdown_actual_matches_realized_sequence():
     assert result["actual_drawdown_pct"] == 3.0  # 30/1000*100
 
 
+def test_monte_carlo_drawdown_exposes_full_sorted_distribution():
+    pnls = [10, -30, 5, 20, -15, 8, -3]
+    result = monte_carlo_drawdown_distribution(pnls, starting_capital=1000, iterations=100, seed=1)
+    assert len(result["drawdowns"]) == 100
+    assert result["drawdowns"] == sorted(result["drawdowns"])
+    assert result["drawdowns"][-1] == result["simulated_worst_drawdown_pct"]
+
+
 def test_parameter_stability_sweep_none_below_three_points():
     assert parameter_stability_sweep([1.0, 2.0]) == {"stable": None, "jaggedness_score": None}
 

@@ -325,6 +325,35 @@ def _avoid_bucket_recommendations(
     return results
 
 
+def generate_indicator_bucket_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+    """RSI/StochRSI/volatility evidence (Phases 7-9): "avoid bucket X" using
+    the exact same generic two-proportion-z-test check
+    _avoid_bucket_recommendations already runs for market_regime/symbol —
+    same advisory-only, human-approved, RECOMMENDATION_MIN_SAMPLE_SIZE-gated
+    pattern, just 3 more dimension types. Never auto-applied, same as every
+    other recommendation in this module."""
+    status = status or compute_learning_status(mode)
+    if not status.can_generate_hypotheses():
+        return []
+
+    all_trades = _recently_closed(mode)
+    wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
+    n_overall = len(all_trades)
+    if n_overall == 0:
+        return []
+
+    results = []
+    for dimension_type, metric_prefix in (
+        ("rsi_bucket", "avoid_rsi_bucket"),
+        ("stoch_rsi_bucket", "avoid_stoch_rsi_bucket"),
+        ("atr_volatility_bucket", "avoid_volatility_bucket"),
+    ):
+        results.extend(
+            _avoid_bucket_recommendations(mode, dimension_type, metric_prefix, "indicator", wins_overall, n_overall)
+        )
+    return results
+
+
 def generate_regime_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
     """Step 4: "avoid regime X" plus regime-conditioned weight
     recommendations (e.g. trend weight matters more in a bull regime than

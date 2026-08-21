@@ -40,6 +40,82 @@ PROMOTION_MIN_PAPER_DAYS = int(os.getenv("PROMOTION_MIN_PAPER_DAYS", "14"))
 PROMOTION_MIN_CUMULATIVE_PNL = float(os.getenv("PROMOTION_MIN_CUMULATIVE_PNL", "0"))
 PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15"))
 
+# --- Promotion Gate (src/learning/promotion_gate.py) -------------------------
+# Multi-dimensional, evidence-gated auto-promotion — stays fully automatic
+# (no human-approval step), but a candidate must clear sample-size floors,
+# risk/statistical/Monte-Carlo gates, regime/symbol robustness, and a
+# significant, same-market-data improvement over the current real-mode
+# champion before PROMOTE; missing required evidence (e.g. no historical
+# candles ingested yet for walk-forward/champion-challenger) always yields
+# EXTEND_VALIDATION, never a silent skip or a promotion on partial evidence.
+
+# Minimum sample sizes (Phase 3) — trade-COUNT floors, additional to the
+# existing PROMOTION_MIN_PAPER_DAYS time floor above.
+PROMOTION_MIN_BACKTEST_TRADES = int(os.getenv("PROMOTION_MIN_BACKTEST_TRADES", "1000"))
+PROMOTION_MIN_WALK_FORWARD_TRADES = int(os.getenv("PROMOTION_MIN_WALK_FORWARD_TRADES", "300"))
+PROMOTION_MIN_PAPER_TRADES = int(os.getenv("PROMOTION_MIN_PAPER_TRADES", "300"))
+# TRUE paired-observation count (champion and challenger backtest-replay
+# snapshots matched by shared decision-cycle timestamp) — deliberately NOT
+# min(champion_trade_count, challenger_trade_count), which counts
+# independent trades that don't necessarily correspond to the same market
+# observation at all.
+PROMOTION_MIN_PAIRED_OBSERVATIONS = int(os.getenv("PROMOTION_MIN_PAIRED_OBSERVATIONS", "200"))
+
+# Monte Carlo promotion gate (Phase 14) — reuses
+# statistical_validation.monte_carlo_drawdown_distribution (drawdown-path
+# shuffle) and a bootstrap resample of trade pnls for probability-of-profit.
+PROMOTION_MC_MIN_PROFITABLE_PCT = float(os.getenv("PROMOTION_MC_MIN_PROFITABLE_PCT", "70"))
+PROMOTION_MC_MAX_CATASTROPHIC_DD_PROBABILITY_PCT = float(
+    os.getenv("PROMOTION_MC_MAX_CATASTROPHIC_DD_PROBABILITY_PCT", "5")
+)
+PROMOTION_MC_CATASTROPHIC_DD_THRESHOLD_PCT = float(
+    os.getenv("PROMOTION_MC_CATASTROPHIC_DD_THRESHOLD_PCT", "25")
+)
+PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MC_MAX_WORST_DRAWDOWN_PCT", "25"))
+
+# Regime/symbol robustness (Phases 7, 8) — a candidate must not be
+# catastrophically worse than champion in any regime/symbol bucket with
+# enough samples to trust (RECOMMENDATION_MIN_SAMPLE_SIZE, reused).
+PROMOTION_MAX_REGIME_DEGRADATION_PCT = float(os.getenv("PROMOTION_MAX_REGIME_DEGRADATION_PCT", "30"))
+PROMOTION_MAX_SYMBOL_PROFIT_CONCENTRATION_PCT = float(
+    os.getenv("PROMOTION_MAX_SYMBOL_PROFIT_CONCENTRATION_PCT", "60")
+)
+PROMOTION_MIN_PROFITABLE_SYMBOLS = int(os.getenv("PROMOTION_MIN_PROFITABLE_SYMBOLS", "2"))
+
+# Champion-vs-challenger minimum improvement (Phase 5) — required ON TOP OF
+# statistical significance, never either alone. Significance itself is a
+# PAIRED test (candidate-minus-champion equity delta at each matching
+# backtest-replay snapshot, same symbols/date range/decision-cycle grid —
+# "is the challenger better", not "is the challenger profitable") gated at
+# PROMOTION_MIN_CONFIDENCE_PCT confidence, not the unpaired candidate-alone
+# significance check this replaced.
+PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT", "10"))
+PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT", "5"))
+PROMOTION_MAX_DRAWDOWN_INCREASE_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_INCREASE_PCT", "0"))
+PROMOTION_MIN_CONFIDENCE_PCT = float(os.getenv("PROMOTION_MIN_CONFIDENCE_PCT", "95"))
+
+# Promotion cooldown (Phase 22) — blocks rapid-fire promotions regardless
+# of how many candidates happen to clear every other gate in one run.
+PROMOTION_COOLDOWN_DAYS = int(os.getenv("PROMOTION_COOLDOWN_DAYS", "7"))
+
+# Promotion Score (Phase 17) — renormalized among available components via
+# weighted_average (opportunity_scorer.py's existing convention), same
+# "necessary but never sufficient" rule as everywhere else in this repo:
+# every hard gate above must ALSO independently pass regardless of score.
+PROMOTION_SCORE_WEIGHT_OUT_OF_SAMPLE = float(os.getenv("PROMOTION_SCORE_WEIGHT_OUT_OF_SAMPLE", "0.20"))
+PROMOTION_SCORE_WEIGHT_CHAMPION_IMPROVEMENT = float(
+    os.getenv("PROMOTION_SCORE_WEIGHT_CHAMPION_IMPROVEMENT", "0.20")
+)
+PROMOTION_SCORE_WEIGHT_RISK = float(os.getenv("PROMOTION_SCORE_WEIGHT_RISK", "0.20"))
+PROMOTION_SCORE_WEIGHT_STATISTICAL_SIGNIFICANCE = float(
+    os.getenv("PROMOTION_SCORE_WEIGHT_STATISTICAL_SIGNIFICANCE", "0.15")
+)
+PROMOTION_SCORE_WEIGHT_REGIME_ROBUSTNESS = float(os.getenv("PROMOTION_SCORE_WEIGHT_REGIME_ROBUSTNESS", "0.10"))
+PROMOTION_SCORE_WEIGHT_EXECUTION_QUALITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_EXECUTION_QUALITY", "0.05"))
+PROMOTION_SCORE_WEIGHT_STABILITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_STABILITY", "0.05"))
+PROMOTION_SCORE_WEIGHT_SIMPLICITY = float(os.getenv("PROMOTION_SCORE_WEIGHT_SIMPLICITY", "0.05"))
+PROMOTION_MIN_SCORE = float(os.getenv("PROMOTION_MIN_SCORE", "70"))
+
 # --- Feature Engine / Opportunity Scorer -----------------------------------
 # Quant-first pipeline: Feature Engine computes indicators per timeframe,
 # Opportunity Scorer turns them into a deterministic 0-100 score, only the
@@ -105,6 +181,15 @@ VOLATILITY_SCORE_EXTREME = float(os.getenv("VOLATILITY_SCORE_EXTREME", "40"))
 RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE = float(
     os.getenv("RISK_RESISTANCE_DISTANCE_FOR_MAX_SCORE", "5.0")
 )
+
+# Evidence-only 5-way volatility bucket for learning_statistics
+# (dimension_type="atr_volatility_bucket", src/learning/statistics.py) —
+# very_low/extreme add 2 boundaries around the existing 3-way live-scoring
+# split (VOLATILITY_LOW_MAX_PCT/VOLATILITY_HIGH_MIN_PCT above, which stays
+# untouched for live opportunity scoring). Reporting/recommendations only,
+# never read by the live scorer.
+VOLATILITY_VERY_LOW_MAX_PCT = float(os.getenv("VOLATILITY_VERY_LOW_MAX_PCT", "0.2"))
+VOLATILITY_EXTREME_MIN_PCT = float(os.getenv("VOLATILITY_EXTREME_MIN_PCT", "10.0"))
 
 # Final opportunity_score = weighted blend of the 5 sub-scores. Scorer
 # renormalizes these to sum to 1.0 at call time, so a misconfigured sum
@@ -409,6 +494,35 @@ TRADING_FEE_PCT = float(os.getenv("TRADING_FEE_PCT", "0.5"))
 GST_PCT_ON_FEE = float(os.getenv("GST_PCT_ON_FEE", "18"))
 SELL_TDS_PCT = float(os.getenv("SELL_TDS_PCT", "1"))
 SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5"))
+# Synthetic half-spread cost for the live Net Expectancy Gate
+# (risk_manager.compute_net_expectancy_pct) — live has no real order-book
+# data any more than backtest does (see BACKTEST_SPREAD_BPS's docstring),
+# so this mirrors that same documented approximation. Market impact isn't
+# modeled as a separate cost — no order-book depth data exists to model it
+# from, so it's treated as already covered by SLIPPAGE_BPS, same as every
+# other execution-cost estimate in this codebase.
+EXPECTANCY_SPREAD_BPS = float(os.getenv("EXPECTANCY_SPREAD_BPS", "10"))
+
+# --- Net Expectancy Gate + Risk-Based Sizing + ATR Stop Fallback -------------
+# src/agents/risk_manager.py. A candidate must clear opportunity_score AND
+# net expectancy (fees+GST+TDS+spread+slippage-aware) before it can trade —
+# net_expectancy_pct <= 0 is itself the "no trade" decision, not a bug.
+# Position sizing gets an ADDITIONAL cap derived from stop distance (never
+# grows size beyond what the existing flat/dynamic formula already allows,
+# only ever shrinks it). Stop-loss/take-profit stay primarily whatever the
+# evidence-validated strategy_versions.params_json says (unchanged, still
+# the walk-forward-gated learned value) — ATR-derived values are a FALLBACK
+# only for a leg params_json doesn't configure, closing the "no stop
+# configured = unbounded downside" gap statistics.py's _assess_risk already
+# flags, without overriding anything the learning pipeline has validated.
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+# Multiplier on atr_pct (already computed by the Feature Engine) to derive
+# a fallback stop/target distance. 1.5/3.0 gives a natural 1:2 risk/reward
+# baseline before anything's been learned. Reuses EXIT_PARAM_SWEEP_MIN_PCT/
+# MAX_PCT (below, Scientific Strategy Optimization section) as the sane
+# clamp bounds on the result — no separate min/max constants needed.
+STOP_LOSS_ATR_MULTIPLIER = float(os.getenv("STOP_LOSS_ATR_MULTIPLIER", "1.5"))
+TAKE_PROFIT_ATR_MULTIPLIER = float(os.getenv("TAKE_PROFIT_ATR_MULTIPLIER", "3.0"))
 
 # --- Execution Optimizer ----------------------------------------------------
 # src/execution_optimizer/optimizer.py. Real trades: recommendation is
@@ -483,6 +597,19 @@ CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECON
 # the chain, not a flat retry).
 LLM_MAX_RETRIES_PER_MODEL = int(os.getenv("LLM_MAX_RETRIES_PER_MODEL", "2"))
 LLM_BACKOFF_BASE_SECONDS = float(os.getenv("LLM_BACKOFF_BASE_SECONDS", "1.0"))
+
+# --- Data Retention ------------------------------------------------------------
+# src/db/models.py::purge_old_data(), called hourly from evolution_agent.py's
+# already-scheduled run_evolution() (no new cron). Keeps the free-tier
+# Supabase disk from maxing out the way it did earlier (opportunity_evaluations
+# is written every scanned symbol every cycle — the highest-volume table by
+# far). learning_statistics/trades/strategy_versions/recommendations/etc.
+# stay permanent (small row counts or the actual ledger) — only the noisy,
+# never-queried-past-their-window log/eval tables get purged.
+# opportunity_evaluations/confidence_calibration reuse LEARNING_HISTORY_WINDOW_DAYS
+# (above) rather than a second constant, since nothing ever queries either
+# table beyond that window anyway.
+OPERATIONAL_LOG_RETENTION_DAYS = int(os.getenv("OPERATIONAL_LOG_RETENTION_DAYS", "30"))
 
 # --- Scientific Strategy Optimization ----------------------------------------
 # src/learning/fitness.py + recommendations.py/simulation.py's extended
