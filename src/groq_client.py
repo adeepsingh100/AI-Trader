@@ -76,7 +76,14 @@ def _gemini_completion(model: str, messages: list[dict], max_tokens: int) -> str
         for m in messages
         if m["role"] != "system"
     ]
-    payload: dict = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
+    # thinkingBudget=0 disables Gemini 2.5's default reasoning pass — left
+    # on, its <think> chain eats the whole maxOutputTokens budget before
+    # ever emitting the requested JSON, so every call comes back truncated
+    # and unparseable (see signal_agent.py's fallback-to-reject path).
+    payload: dict = {
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}},
+    }
     if system_text:
         payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 

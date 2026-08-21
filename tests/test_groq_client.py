@@ -136,7 +136,7 @@ def test_gemini_completion_posts_expected_shape(monkeypatch):
     assert kwargs["params"] == {"key": "test-key"}
     assert kwargs["json"] == {
         "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-        "generationConfig": {"maxOutputTokens": 512},
+        "generationConfig": {"maxOutputTokens": 512, "thinkingConfig": {"thinkingBudget": 0}},
         "systemInstruction": {"parts": [{"text": "be terse"}]},
     }
 
