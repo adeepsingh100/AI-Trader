@@ -11,6 +11,7 @@ export default function OverviewClient() {
   const mode = useMode();
   const [config, setConfig] = useState<CapitalConfig | null | undefined>(undefined);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl | null>(null);
+  const [capitalInUse, setCapitalInUse] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -20,6 +21,7 @@ export default function OverviewClient() {
       const [
         { data: configRow, error: configError },
         { data: pnlRow, error: pnlError },
+        { data: openTrades, error: tradesError },
       ] = await Promise.all([
         supabase.from("capital_config").select("*").eq("mode", mode).maybeSingle(),
         supabase
@@ -28,12 +30,16 @@ export default function OverviewClient() {
           .eq("mode", mode)
           .eq("date", todayIst())
           .maybeSingle(),
+        supabase.from("trades").select("qty, entry_price").eq("mode", mode).eq("status", "open"),
       ]);
       if (cancelled) return;
-      const err = configError ?? pnlError;
+      const err = configError ?? pnlError ?? tradesError;
       setError(err ? err.message : null);
       setConfig(err ? undefined : (configRow ?? null));
       setDailyPnl(pnlRow ?? null);
+      // Committed capital = sum(qty * entry_price) over open positions —
+      // same formula risk_manager.py's committed_capital() gates sizing against.
+      setCapitalInUse((openTrades ?? []).reduce((sum, t) => sum + t.qty * t.entry_price, 0));
     }
 
     load();
@@ -74,8 +80,9 @@ export default function OverviewClient() {
           />
           <StatCard
             label="Capital in use"
-            value={`₹${config.capital_to_use.toLocaleString("en-IN")}`}
-            sub={`of ₹${config.total_capital.toLocaleString("en-IN")}`}
+            value={`₹${capitalInUse.toLocaleString("en-IN")}`}
+            sub={`₹${Math.max(config.capital_to_use - capitalInUse, 0).toLocaleString("en-IN")} left of ₹${config.capital_to_use.toLocaleString("en-IN")} limit`}
+            tone={capitalInUse > config.capital_to_use ? "critical" : "neutral"}
           />
           <StatCard
             label="Today's PnL"
