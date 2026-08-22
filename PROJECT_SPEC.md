@@ -624,10 +624,20 @@ checking 5-10x more often than the live one ever does.
   trade-repartition logic (different question: would this parameter set
   have made money on a historical period it never saw, vs. does a weight
   recommendation separate already-observed outcomes better).
-- **`strategy_comparison.py`**: pairwise run comparison reusing
+- **`strategy_comparison.py`** — **ANALYTICS ONLY**, not the live
+  auto-promotion authority: pairwise run comparison reusing
   `z_test_two_proportions`/`z_test_two_means` directly — "only recommend
   promotion if statistically superior" means the test rejects the null in
-  B's favor, not just that B's raw number is bigger.
+  B's favor, not just that B's raw number is bigger. Its sole runtime
+  consumer is `simulation.py`'s exit-params CANDIDATE gate (whether an
+  `adaptive_strategy_versions` row is even worth creating), an ordinary
+  unpaired two-sample z-test over one backtest-replay window. `promotion_
+  gate.py` never imports or calls it — the authoritative champion-vs-
+  challenger statistic for real-money promotion is `promotion_gate.py`'s
+  own paired Moving Block Bootstrap comparison (§3e), a different, later,
+  time-series-aware method. Despite the field name, this module's
+  `promotion_recommended` output never drives `strategy_versions.
+  promoted_to_real` anywhere — only `evaluate_promotion()`'s decision does.
 - **`statistical_validation.py`**: confidence intervals via **seeded
   bootstrap resampling**, not a parametric t-interval — this codebase has
   zero numpy/scipy, and a hand-rolled regularized-incomplete-beta
@@ -639,10 +649,14 @@ checking 5-10x more often than the live one ever does.
   from a local `random.Random(BACKTEST_RANDOM_SEED)` instance, never the
   global `random` module — reruns are bit-identical.
 - **`overfitting_detection.py`**: aggregates walk-forward fold results +
-  parameter stability into a verdict (`robust`/`marginal`/`overfit`).
-  "Reject weak strategies automatically" means automatic **status
-  marking** only, never automatic deletion or live application — same
-  human-approval precedent as `recommendations`/`adaptive_strategy_versions`.
+  parameter stability into a verdict (`robust`/`marginal`/`overfit`). This
+  module only classifies; it never deletes anything and never touches
+  `strategy_versions`/`promoted_to_real` itself — but the verdict IS a
+  mandatory reject-capable gate inside the live auto-promotion pipeline
+  (`promotion_gate.py`: `verdict == "overfit"` → `REJECT`), same as the
+  candidate-pipeline's own `recommendations`/`adaptive_strategy_versions`
+  status marking. Auto-promotion elsewhere in this codebase is fully
+  automatic — no human-approval step anywhere.
 - **`report.py`**: HTML (reusing `reporting_agent._table`) + CSV/JSON via
   stdlib. No PDF — the HTML report is already print-to-PDF-ready in any
   browser, and this codebase's zero-non-essential-dependency discipline
@@ -953,13 +967,17 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   now-exposed raw shuffled-distribution list — additive, existing callers
   destructure by key), `walk_forward_validator.run_walk_forward` +
   `overfitting_detection.detect` for the walk-forward/overfitting gate,
-  `strategy_comparison.compare` for champion-vs-challenger (candidate's
-  and champion's `params_json` replayed via `BacktestEngine` over the
-  IDENTICAL symbols/date range — "same market data" is only honest via
-  backtest replay, since paper trades happen sequentially, never
-  simultaneously). New pieces genuinely added: sample-size floors
-  (`PROMOTION_MIN_BACKTEST_TRADES`/`_WALK_FORWARD_TRADES`/`_PAPER_TRADES`/
-  `_CHAMPION_CHALLENGER_TRADES`) that route to `EXTEND_VALIDATION` (never
+  a paired same-market-data comparison for champion-vs-challenger
+  (candidate's and champion's `params_json` replayed via `BacktestEngine`
+  over the IDENTICAL symbols/date range — "same market data" is only
+  honest via backtest replay, since paper trades happen sequentially,
+  never simultaneously; this is `_paired_champion_comparison`, evaluated
+  via the Moving Block Bootstrap described below — never
+  `strategy_comparison.compare`, which has zero coupling to this module,
+  see its ANALYTICS ONLY note further down). New pieces genuinely added:
+  sample-size floors (`PROMOTION_MIN_BACKTEST_TRADES`/`_WALK_FORWARD_TRADES`/
+  `_PAPER_TRADES`/`_PAIRED_SNAPSHOTS`/`_PAIRED_RETURN_OBSERVATIONS`) that
+  route to `EXTEND_VALIDATION` (never
   `REJECT` — "not enough evidence" isn't the same claim as "the evidence
   says no"); regime/symbol robustness (candidate's own bucketed
   `learning_statistics`-shaped stats compared against the champion's same

@@ -1,9 +1,12 @@
 """Step 12: overfitting detection, composed from what walk_forward_validator
 and statistical_validation already computed — no new statistical machinery
-here, just aggregation + verdict. "Reject weak strategies automatically"
-means automatic STATUS marking only (see strategy_comparison.py's
-promotion_recommended) — never automatic deletion or live application,
-matching this session's established human-approval precedent throughout."""
+here, just aggregation + verdict. This module only classifies a candidate's
+fold-failure pattern into a verdict (robust/marginal/overfit); it never
+deletes anything and never touches strategy_versions/promoted_to_real
+itself. This verdict IS a mandatory reject-capable gate in the live
+auto-promotion pipeline (src/learning/promotion_gate.py's overfitting
+gate: verdict == "overfit" -> REJECT) — auto-promotion elsewhere in this
+codebase is fully automatic, no human-approval step anywhere."""
 
 from __future__ import annotations
 
