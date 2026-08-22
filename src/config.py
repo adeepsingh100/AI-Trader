@@ -54,12 +54,21 @@ PROMOTION_MAX_DRAWDOWN_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_PCT", "15")
 PROMOTION_MIN_BACKTEST_TRADES = int(os.getenv("PROMOTION_MIN_BACKTEST_TRADES", "1000"))
 PROMOTION_MIN_WALK_FORWARD_TRADES = int(os.getenv("PROMOTION_MIN_WALK_FORWARD_TRADES", "300"))
 PROMOTION_MIN_PAPER_TRADES = int(os.getenv("PROMOTION_MIN_PAPER_TRADES", "300"))
-# TRUE paired-observation count (champion and challenger backtest-replay
-# snapshots matched by shared decision-cycle timestamp) — deliberately NOT
+# Two distinct counts, never conflated: paired_snapshot_count is the
+# number of matched (champion, challenger) backtest-replay snapshots
+# (shared decision-cycle timestamp) — deliberately NOT
 # min(champion_trade_count, challenger_trade_count), which counts
 # independent trades that don't necessarily correspond to the same market
-# observation at all.
-PROMOTION_MIN_PAIRED_OBSERVATIONS = int(os.getenv("PROMOTION_MIN_PAIRED_OBSERVATIONS", "200"))
+# observation at all. paired_return_observations is one fewer
+# (consecutive-snapshot deltas) — the series the statistical significance
+# gate actually consumes.
+PROMOTION_MIN_PAIRED_SNAPSHOTS = int(os.getenv("PROMOTION_MIN_PAIRED_SNAPSHOTS", "200"))
+PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS = int(os.getenv("PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS", "200"))
+# Moving Block Bootstrap block length (Fix 1) — resamples contiguous
+# blocks of this many consecutive paired return observations (not
+# individual points) to preserve local temporal dependence a plain
+# point-wise bootstrap would destroy.
+PROMOTION_BOOTSTRAP_BLOCK_LENGTH = int(os.getenv("PROMOTION_BOOTSTRAP_BLOCK_LENGTH", "5"))
 
 # Monte Carlo promotion gate (Phase 14) — reuses
 # statistical_validation.monte_carlo_drawdown_distribution (drawdown-path
@@ -84,11 +93,16 @@ PROMOTION_MIN_PROFITABLE_SYMBOLS = int(os.getenv("PROMOTION_MIN_PROFITABLE_SYMBO
 
 # Champion-vs-challenger minimum improvement (Phase 5) — required ON TOP OF
 # statistical significance, never either alone. Significance itself is a
-# PAIRED test (candidate-minus-champion equity delta at each matching
-# backtest-replay snapshot, same symbols/date range/decision-cycle grid —
-# "is the challenger better", not "is the challenger profitable") gated at
-# PROMOTION_MIN_CONFIDENCE_PCT confidence, not the unpaired candidate-alone
-# significance check this replaced.
+# PAIRED test (candidate-minus-champion return at each matching backtest-
+# replay snapshot, same symbols/date range/decision-cycle grid — "is the
+# challenger better", not "is the challenger profitable") via a Moving
+# Block Bootstrap (PROMOTION_BOOTSTRAP_BLOCK_LENGTH above) over the paired
+# return-difference series, never the unpaired candidate-alone significance
+# check this replaced. PROMOTION_MIN_CONFIDENCE_PCT is NOT a generic
+# "confidence" — it is the minimum required
+# bootstrap_probability_candidate_better_pct: the percentage of Moving
+# Block Bootstrap resamples of the paired candidate-minus-champion return
+# series whose cumulative (summed) difference is positive.
 PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_SHARPE_IMPROVEMENT_PCT", "10"))
 PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT = float(os.getenv("PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT", "5"))
 PROMOTION_MAX_DRAWDOWN_INCREASE_PCT = float(os.getenv("PROMOTION_MAX_DRAWDOWN_INCREASE_PCT", "0"))

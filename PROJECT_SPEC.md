@@ -53,23 +53,38 @@ are binding unless the user says otherwise. Everything marked
   verdict, and a statistically significant, same-market-data improvement
   over the current real-mode champion — not 3-5 simple thresholds. The
   champion-vs-challenger significance test itself is PAIRED and is the
-  ONLY test — no fallback to a weaker unpaired test ever exists: candidate-
-  minus-champion equity delta at matching backtest-replay snapshots,
-  matched by their shared decision-cycle identifier (`snapshot_time`, via
-  explicit intersection, never by list index/position), gated at
-  `PROMOTION_MIN_CONFIDENCE_PCT` against an explicitly-named
-  `bootstrap_probability_candidate_better_pct` statistic — "is the
-  challenger better than the champion", not "is the challenger profitable
-  on its own". `PROMOTION_MIN_PAIRED_OBSERVATIONS` gates the TRUE matched-
-  observation count (never `min(champion_trades, challenger_trades)` —
-  independent trade counts don't imply matched market observations). A
-  bot's first-ever promotion (no champion) marks the champion-comparison
-  gate AND the paired-observations sample gate both `NOT_APPLICABLE`
-  rather than leaving the sample gate permanently unresolved — otherwise
-  every first promotion would deadlock at `EXTEND_VALIDATION` forever
-  regardless of how clean every other gate looked. Missing required
-  evidence (e.g. no historical candles ingested yet for the walk-forward/
-  paired-observation backtest-replay gates) always yields
+  ONLY test — no fallback to a weaker unpaired test ever exists (the old
+  `src.backtest.strategy_comparison.compare` z-test is not imported or
+  called anywhere in `promotion_gate.py`; it stays live only for its own
+  different, genuine consumer, `simulation.py`'s exit-params candidate
+  gate). Observations are matched by their shared decision-cycle
+  identifier — each backtest-replay snapshot's `snapshot_time` — via
+  explicit set intersection, never by list index/position, and a
+  duplicate identifier on either side is dropped as ambiguous rather than
+  silently resolved. Two DIFFERENT counts, never conflated:
+  `paired_snapshot_count` (matched snapshot pairs) and
+  `paired_return_observations` (one fewer — the consecutive-snapshot
+  return deltas the statistical test actually consumes), gated
+  independently by `PROMOTION_MIN_PAIRED_SNAPSHOTS` /
+  `PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS` (never
+  `min(champion_trades, challenger_trades)` — independent trade counts
+  don't imply matched market observations). Significance itself is a
+  **Moving Block Bootstrap** (`statistical_validation.moving_block_
+  bootstrap_probability`, block length `PROMOTION_BOOTSTRAP_BLOCK_LENGTH`)
+  over the paired return-difference series — resamples contiguous BLOCKS,
+  not individual points, preserving the local temporal dependence a plain
+  point-wise bootstrap would destroy — gated at `PROMOTION_MIN_
+  CONFIDENCE_PCT` against an explicitly-named `bootstrap_probability_
+  candidate_better_pct` statistic (the percentage of bootstrap resamples
+  whose cumulative candidate-minus-champion difference is positive —
+  never called generic "confidence"), deterministic given the same
+  data/block_length/iterations/seed. A bot's first-ever promotion (no
+  champion) marks the champion-comparison gate AND both paired sample
+  gates `NOT_APPLICABLE` rather than leaving them permanently unresolved
+  — otherwise every first promotion would deadlock at `EXTEND_VALIDATION`
+  forever regardless of how clean every other gate looked. Missing
+  required evidence (e.g. no historical candles ingested yet for the
+  walk-forward/paired-observation backtest-replay gates) always yields
   `EXTEND_VALIDATION`, never a silent skip and never a promotion on
   partial evidence — see `promotion_gate.py`'s own module docstring for
   the full gate-by-gate breakdown and §3e for how it composes almost
@@ -982,7 +997,28 @@ rigorous candidate pipeline (§3b), extended rather than rebuilt:
   improvement gate and the paired-observations sample gate
   `NOT_APPLICABLE` so it can still reach `PROMOTE` (previously the sample
   gate stayed permanently unresolved with no champion to pair against,
-  deadlocking every first promotion at `EXTEND_VALIDATION`).
+  deadlocking every first promotion at `EXTEND_VALIDATION`). Third
+  hardening pass, statistical rigor: the significance test is now a
+  **Moving Block Bootstrap** (`statistical_validation.moving_block_
+  bootstrap_probability`) over the paired return-difference series
+  instead of an ordinary point-wise bootstrap — financial returns are
+  time-dependent, and resampling individual points destroys that local
+  dependence; deterministic given the same data/`PROMOTION_BOOTSTRAP_
+  BLOCK_LENGTH`/iterations/seed. `PROMOTION_MIN_PAIRED_OBSERVATIONS` is
+  retired and split into `PROMOTION_MIN_PAIRED_SNAPSHOTS` (matched
+  snapshot pairs) and `PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS` (one
+  fewer — the actual return series the statistical gate consumes), never
+  conflated. A duplicate `snapshot_time` on either engine's own side is
+  now dropped as ambiguous before matching, not silently kept. The old
+  `strategy_comparison.compare` z-test — already informational-only after
+  the second pass — is no longer imported or called by this module at
+  all; it remains exactly as it was for its own genuine, different
+  consumer (`simulation.py`'s exit-params candidate backtest-replay
+  gate), just structurally unreachable from the promotion pipeline. One
+  authoritative result dict (mean/median/std/p25/p75/p95 difference,
+  bootstrap method/block_length/iterations/seed, confidence threshold, an
+  explicit PASS/FAIL status+reason) is computed once and consumed
+  verbatim everywhere it's needed — nothing recomputes significance.
 - **`statistics.py`** (extended): `accuracy_rates(trade_ids)` — aggregate
   confidence/opportunity-score/risk/stop-loss/target accuracy percentages
   over `trade_evaluations`, which `_evaluate_trade` already tagged

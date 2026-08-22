@@ -78,6 +78,52 @@ def monte_carlo_drawdown_distribution(
     }
 
 
+def moving_block_bootstrap_probability(
+    diffs: list[float],
+    block_length: int,
+    iterations: int = BACKTEST_BOOTSTRAP_ITERATIONS,
+    seed: int = BACKTEST_RANDOM_SEED,
+) -> dict | None:
+    """Time-series-aware bootstrap (Moving Block Bootstrap) for a
+    SEQUENTIAL return-difference series — e.g. promotion_gate.py's paired
+    candidate-minus-champion period returns. Financial return observations
+    are time-dependent, not i.i.d.; resampling individual POINTS (as
+    bootstrap_confidence_interval above does) destroys that local
+    dependence. This resamples overlapping contiguous BLOCKS of
+    `block_length` consecutive points with replacement instead, preserving
+    it. Each iteration concatenates resampled blocks into a series the
+    same length as `diffs`, sums it, and the reported percentage is the
+    fraction of iterations whose sum is positive.
+
+    Deterministic given the same (diffs, block_length, iterations, seed) —
+    same local random.Random(seed) convention as every other resampling
+    function in this module, no global `random` state touched. Caller
+    (promotion_gate.py) applies whatever business threshold it wants to
+    the returned probability; this function has no opinion on what counts
+    as "significant"."""
+    n = len(diffs)
+    if n < 2:
+        return None
+    block_length = max(1, min(block_length, n))
+    starts = list(range(0, n - block_length + 1)) or [0]
+    rng = random.Random(seed)
+    positive = 0
+    for _ in range(iterations):
+        reconstructed: list[float] = []
+        while len(reconstructed) < n:
+            start = starts[rng.randrange(len(starts))]
+            reconstructed.extend(diffs[start : start + block_length])
+        if sum(reconstructed[:n]) > 0:
+            positive += 1
+    return {
+        "bootstrap_probability_positive_pct": positive / iterations * 100,
+        "bootstrap_method": "moving_block",
+        "bootstrap_block_length": block_length,
+        "bootstrap_iterations": iterations,
+        "seed": seed,
+    }
+
+
 def parameter_stability_sweep(metric_values: list[float]) -> dict:
     """Given a swept parameter's resulting metric values (e.g. expectancy
     at each candidate threshold), flags jaggedness — a smooth curve

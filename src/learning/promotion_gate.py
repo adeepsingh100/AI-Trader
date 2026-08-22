@@ -56,6 +56,37 @@ Second hardening pass (closes remaining loopholes in the first pass):
   to pair against, deadlocking every first promotion at EXTEND_VALIDATION
   regardless of how good every other gate looked.
 
+Third hardening pass (statistical rigor + reproducibility):
+- The paired significance test is now a Moving Block Bootstrap
+  (statistical_validation.moving_block_bootstrap_probability), not an
+  ordinary point-wise bootstrap — financial return observations are
+  time-dependent, and resampling individual points (as the ordinary
+  bootstrap does) destroys that local dependence. Deterministic given the
+  same data/block_length/iterations/seed.
+- paired_snapshot_count (matched timestamps) and paired_return_
+  observations (one fewer — the consecutive-snapshot deltas the
+  statistical test actually consumes) are two DIFFERENT numbers with two
+  DIFFERENT config floors (PROMOTION_MIN_PAIRED_SNAPSHOTS/
+  PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS) — never conflated, never
+  called "paired observations" ambiguously.
+- A duplicate snapshot_time within either engine's own snapshot list is
+  dropped from matching entirely (ambiguous identifier), never silently
+  resolved by last-write-wins.
+- src.backtest.strategy_comparison.compare (z_test_two_means/
+  z_test_two_proportions/winner=="b"/promotion_recommended) is no longer
+  imported or called anywhere in this module — it was already informational
+  -only (never drove `passed`) after the second hardening pass; now it has
+  zero coupling to the promotion pipeline at all. It stays exactly as it
+  was for its own genuine, different consumer (simulation.py's exit-params
+  candidate backtest-replay gate) — not deleted, just structurally
+  unreachable from here.
+- One authoritative statistical result dict (returned by
+  _paired_champion_comparison) carries every number this gate needs —
+  mean/median/std/p25/p75/p95 difference, bootstrap method/block_length/
+  iterations/seed, the confidence threshold, and an explicit PASS/FAIL
+  status+reason. _champion_improvement_gate consumes it verbatim; nothing
+  recomputes significance anywhere else.
+
 Two gate categories, deliberately never conflated:
 - "extend-only" gates (sample sizes): a definite below-floor count is
   EXTEND_VALIDATION, never REJECT — "not enough evidence yet" is not the
@@ -78,18 +109,22 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from statistics import median
+from statistics import median, quantiles, stdev
 
 from src.agents.evolution_agent import compute_metrics, promotion_ready
 from src.backtest.overfitting_detection import OverfittingReport, detect as detect_overfitting
-from src.backtest.statistical_validation import bootstrap_confidence_interval, monte_carlo_drawdown_distribution
-from src.backtest.strategy_comparison import compare as compare_strategies
+from src.backtest.statistical_validation import (
+    bootstrap_confidence_interval,
+    monte_carlo_drawdown_distribution,
+    moving_block_bootstrap_probability,
+)
 from src.backtest.walk_forward_validator import run_walk_forward
 from src.config import (
     BACKTEST_BOOTSTRAP_ITERATIONS,
     BACKTEST_RANDOM_SEED,
     BACKTEST_TICK_TIMEFRAME,
     LEARNING_HISTORY_WINDOW_DAYS,
+    PROMOTION_BOOTSTRAP_BLOCK_LENGTH,
     PROMOTION_COOLDOWN_DAYS,
     PROMOTION_MAX_DRAWDOWN_INCREASE_PCT,
     PROMOTION_MAX_REGIME_DEGRADATION_PCT,
@@ -102,7 +137,8 @@ from src.config import (
     PROMOTION_MIN_CONFIDENCE_PCT,
     PROMOTION_MIN_EXPECTANCY_IMPROVEMENT_PCT,
     PROMOTION_MIN_FITNESS_SCORE,
-    PROMOTION_MIN_PAIRED_OBSERVATIONS,
+    PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS,
+    PROMOTION_MIN_PAIRED_SNAPSHOTS,
     PROMOTION_MIN_PAPER_TRADES,
     PROMOTION_MIN_PROFITABLE_SYMBOLS,
     PROMOTION_MIN_SCORE,
@@ -126,7 +162,9 @@ from src.learning.statistics import compute_bucket_statistics
 from src.utils import clamp
 from src.utils import parse_timestamp as _parse_ts
 
-_EXTEND_ONLY_GATES = ("paper_trades", "backtest_trades", "walk_forward_trades", "paired_observations")
+_EXTEND_ONLY_GATES = (
+    "paper_trades", "backtest_trades", "walk_forward_trades", "paired_snapshots", "paired_return_observations",
+)
 _REJECT_CAPABLE_GATES = (
     "paper_days_pnl_drawdown", "bootstrap_ci", "fitness_floor", "monte_carlo",
     "regime_robustness", "symbol_robustness", "overfitting", "champion_improvement",
@@ -192,46 +230,91 @@ def _bootstrap_probability_of_profit(
     return positive / iterations * 100
 
 
+def _dedup_by_snapshot_time(snapshots: list[dict]) -> dict:
+    """Fix 3: drop any snapshot_time that appears more than once within a
+    single engine's own list before matching against the other side — an
+    ambiguous duplicate identifier must never be silently resolved by
+    last-write-wins the way a plain dict comprehension would."""
+    counts: dict = {}
+    equity_by_time: dict = {}
+    for s in snapshots:
+        t = s["snapshot_time"]
+        counts[t] = counts.get(t, 0) + 1
+        equity_by_time[t] = s["equity"]
+    return {t: eq for t, eq in equity_by_time.items() if counts[t] == 1}
+
+
+def _percentile(data: list[float], pct: int) -> float | None:
+    if len(data) < 2:
+        return None
+    return quantiles(sorted(data), n=100, method="inclusive")[pct - 1]
+
+
 def _paired_champion_comparison(champion_result: dict, candidate_result: dict) -> dict | None:
-    """THE primary champion-vs-challenger significance test — candidate
-    MINUS champion, not candidate-alone profitability, and the only one:
-    no unpaired fallback exists anywhere downstream of this function.
+    """THE one authoritative champion-vs-challenger statistical result
+    (Fix 6) — candidate MINUS champion, not candidate-alone profitability,
+    and the ONLY significance test in this module: no fallback to a
+    weaker/unpaired statistic exists anywhere downstream of this function.
 
     Observations are paired by their shared decision-cycle identifier —
     each backtest-replay snapshot's `snapshot_time` (BacktestEngine.run()
     fires it off `self.clock`'s deterministic tick grid, identical for
     both engines since both replay the same symbols/date range/decision-
-    cycle cadence, only params_json differs) — matched by explicit
-    identifier equality via dict-key intersection, NEVER by list index. A
-    length or ordering mismatch between the two snapshot lists (e.g. one
-    run circuit-breaking out earlier) must never silently mispair an
-    observation the way a blind zip(a, b) would.
+    cycle cadence, only params_json differs) — normalized via
+    _dedup_by_snapshot_time, matched by explicit identifier intersection,
+    NEVER by list index. A length/ordering mismatch between the two
+    snapshot lists (e.g. one run circuit-breaking out earlier) must never
+    silently mispair an observation the way a blind zip(a, b) would.
 
-    paired_observation_count is the count of matched (champion, challenger)
-    snapshot pairs itself — the number actually compared against
-    PROMOTION_MIN_PAIRED_OBSERVATIONS — not the one-fewer count of period-
-    over-period diffs the bootstrap consumes internally. Reuses
-    _bootstrap_probability_of_profit's resampling (built for the Monte
-    Carlo risk gate below) against those diffs — "is this positive" is the
-    same question either way."""
-    champ_by_time = {s["snapshot_time"]: s["equity"] for s in champion_result["snapshots"]}
-    cand_by_time = {s["snapshot_time"]: s["equity"] for s in candidate_result["snapshots"]}
+    Two DIFFERENT counts (Fix 2), never conflated:
+    - paired_snapshot_count: matched (champion, challenger) snapshot pairs.
+    - paired_return_observations: paired_snapshot_count - 1, the
+      consecutive-snapshot RETURN deltas the statistical test below
+      actually consumes.
+
+    Significance itself is a Moving Block Bootstrap (Fix 1) over the
+    paired return-difference series — resamples contiguous BLOCKS, not
+    individual points, preserving the local temporal dependence a plain
+    point-wise bootstrap would destroy. `PROMOTION_MIN_CONFIDENCE_PCT` is
+    applied HERE, once — the only place this module decides "significant"."""
+    champ_by_time = _dedup_by_snapshot_time(champion_result["snapshots"])
+    cand_by_time = _dedup_by_snapshot_time(candidate_result["snapshots"])
     shared_times = sorted(set(champ_by_time) & set(cand_by_time))
-    paired_observation_count = len(shared_times)
-    if paired_observation_count < 3:  # need >= 2 diffs for the bootstrap below to mean anything
+    paired_snapshot_count = len(shared_times)
+    if paired_snapshot_count < 3:  # need >= 2 return observations for the bootstrap below to mean anything
         return None
     champ_eq = [champ_by_time[t] for t in shared_times]
     cand_eq = [cand_by_time[t] for t in shared_times]
-    diffs = [(cand_eq[i] - cand_eq[i - 1]) - (champ_eq[i] - champ_eq[i - 1]) for i in range(1, paired_observation_count)]
-    bootstrap_probability_candidate_better_pct = _bootstrap_probability_of_profit(diffs)
-    if bootstrap_probability_candidate_better_pct is None:
+    diffs = [(cand_eq[i] - cand_eq[i - 1]) - (champ_eq[i] - champ_eq[i - 1]) for i in range(1, paired_snapshot_count)]
+    paired_return_observations = len(diffs)
+
+    bootstrap = moving_block_bootstrap_probability(diffs, PROMOTION_BOOTSTRAP_BLOCK_LENGTH)
+    if bootstrap is None:
         return None
+    bootstrap_probability_candidate_better_pct = bootstrap["bootstrap_probability_positive_pct"]
+    significant = bootstrap_probability_candidate_better_pct >= PROMOTION_MIN_CONFIDENCE_PCT
+
     return {
-        "paired_observation_count": paired_observation_count,
+        "paired_snapshot_count": paired_snapshot_count,
+        "paired_return_observations": paired_return_observations,
         "mean_difference": sum(diffs) / len(diffs),
         "median_difference": median(diffs),
+        "std_difference": stdev(diffs) if len(diffs) >= 2 else None,
+        "p25_difference": _percentile(diffs, 25),
+        "p75_difference": _percentile(diffs, 75),
+        "p95_difference": _percentile(diffs, 95),
         "bootstrap_probability_candidate_better_pct": bootstrap_probability_candidate_better_pct,
-        "significant": bootstrap_probability_candidate_better_pct >= PROMOTION_MIN_CONFIDENCE_PCT,
+        "bootstrap_method": bootstrap["bootstrap_method"],
+        "bootstrap_block_length": bootstrap["bootstrap_block_length"],
+        "bootstrap_iterations": bootstrap["bootstrap_iterations"],
+        "confidence_threshold_pct": PROMOTION_MIN_CONFIDENCE_PCT,
+        "statistical_gate_status": "PASS" if significant else "FAIL",
+        "statistical_gate_reason": (
+            f"bootstrap_probability_candidate_better_pct={bootstrap_probability_candidate_better_pct:.1f} "
+            f"{'>=' if significant else '<'} threshold {PROMOTION_MIN_CONFIDENCE_PCT}"
+        ),
+        "seed": bootstrap["seed"],
+        "significant": significant,
     }
 
 
@@ -251,7 +334,8 @@ def _sample_size_gates(
     paper_count: int,
     backtest_count: int | None,
     walk_forward_count: int | None,
-    paired_observation_count: int | None,
+    paired_snapshot_count: int | None,
+    paired_return_observations: int | None,
     champion_present: bool,
 ) -> dict:
     gates = {
@@ -281,25 +365,36 @@ def _sample_size_gates(
             "count": walk_forward_count,
             "minimum": PROMOTION_MIN_WALK_FORWARD_TRADES,
         }
+    # Fix 2: paired SNAPSHOT count and paired RETURN observation count are
+    # two different numbers with two different floors — never conflated,
+    # both required where a champion exists.
     if not champion_present:
-        # Fix 3: nothing to pair against on a bot's first-ever promotion —
+        # Fix 9: nothing to pair against on a bot's first-ever promotion —
         # NOT_APPLICABLE, never a perpetual EXTEND_VALIDATION deadlock.
-        gates["paired_observations"] = {
-            "passed": True,
-            "status": "NOT_APPLICABLE",
-            "detail": "no current champion — nothing to pair against (first-ever promotion)",
-        }
-    elif paired_observation_count is None:
-        gates["paired_observations"] = {
-            "passed": None,
-            "detail": "paired champion-challenger comparison not available (no historical data)",
-        }
+        _na = {"passed": True, "status": "NOT_APPLICABLE", "detail": "no current champion — nothing to pair against (first-ever promotion)"}
+        gates["paired_snapshots"] = dict(_na)
+        gates["paired_return_observations"] = dict(_na)
     else:
-        gates["paired_observations"] = {
-            "passed": paired_observation_count >= PROMOTION_MIN_PAIRED_OBSERVATIONS,
-            "count": paired_observation_count,
-            "minimum": PROMOTION_MIN_PAIRED_OBSERVATIONS,
-        }
+        if paired_snapshot_count is None:
+            gates["paired_snapshots"] = {
+                "passed": None, "detail": "paired champion-challenger comparison not available (no historical data)",
+            }
+        else:
+            gates["paired_snapshots"] = {
+                "passed": paired_snapshot_count >= PROMOTION_MIN_PAIRED_SNAPSHOTS,
+                "count": paired_snapshot_count,
+                "minimum": PROMOTION_MIN_PAIRED_SNAPSHOTS,
+            }
+        if paired_return_observations is None:
+            gates["paired_return_observations"] = {
+                "passed": None, "detail": "paired champion-challenger comparison not available (no historical data)",
+            }
+        else:
+            gates["paired_return_observations"] = {
+                "passed": paired_return_observations >= PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS,
+                "count": paired_return_observations,
+                "minimum": PROMOTION_MIN_PAIRED_RETURN_OBSERVATIONS,
+            }
     return gates
 
 
@@ -408,15 +503,20 @@ def _backtest_evidence(candidate: dict, champion: dict | None, candidate_trades:
     """None fields throughout when historical data isn't available —
     every caller treats None as "can't evaluate this gate yet", never a
     failure. Reuses BacktestEngine/walk_forward_validator/
-    strategy_comparison/overfitting_detection exactly as the existing
-    exit-params candidate pipeline (simulation.py) already does."""
+    overfitting_detection exactly as the existing exit-params candidate
+    pipeline (simulation.py) already does. Deliberately does NOT call
+    src.backtest.strategy_comparison.compare (Fix 5) — that unpaired
+    z-test has zero coupling to the promotion pipeline; the paired
+    comparison below (_paired_champion_comparison) is the ONLY
+    statistical result this module produces or consumes."""
     result = {
         "backtest_trades_count": None,
         "walk_forward_folds": None,
         "walk_forward_trades_count": None,
         "overfitting_report": None,
         "champion_challenger": None,
-        "paired_observation_count": None,
+        "paired_snapshot_count": None,
+        "paired_return_observations": None,
     }
     closed = [t for t in candidate_trades if t.get("closed_at")]
     if not closed or not symbol_to_pair:
@@ -457,17 +557,16 @@ def _backtest_evidence(candidate: dict, champion: dict | None, candidate_trades:
         )
         paired_comparison = _paired_champion_comparison(champion_result, candidate_result)
         result["champion_challenger"] = {
-            "comparison": compare_strategies(
-                champion_result["closed_trades"], candidate_result["closed_trades"], champion_metrics, candidate_metrics
-            ),
             "paired_comparison": paired_comparison,
             "candidate_metrics": candidate_metrics,
             "champion_metrics": champion_metrics,
         }
-        # Fix 2: the TRUE matched-observation count, not
-        # min(champion_trades, candidate_trades) — independent trade
-        # counts don't imply matched market observations at all.
-        result["paired_observation_count"] = paired_comparison["paired_observation_count"] if paired_comparison else None
+        # Fix 2: the TRUE matched counts, not min(champion_trades,
+        # candidate_trades) — independent trade counts don't imply matched
+        # market observations at all.
+        if paired_comparison is not None:
+            result["paired_snapshot_count"] = paired_comparison["paired_snapshot_count"]
+            result["paired_return_observations"] = paired_comparison["paired_return_observations"]
 
     return result
 
@@ -498,16 +597,10 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
             "detail": "champion-challenger comparison not available (no historical data)",
         }
 
-    comparison = cc["comparison"]  # informational only — see Fix 1, never drives `passed`
     cand, champ = cc["candidate_metrics"], cc["champion_metrics"]
     expectancy_improvement_pct = _pct_improvement(champ.get("expectancy"), cand.get("expectancy"))
     if expectancy_improvement_pct is None:
-        return {
-            "passed": None,
-            "status": "UNAVAILABLE",
-            "detail": "expectancy improvement not computable yet",
-            "comparison": comparison,
-        }
+        return {"passed": None, "status": "UNAVAILABLE", "detail": "expectancy improvement not computable yet"}
 
     sharpe_improvement_pct = _pct_improvement(champ.get("sharpe_ratio"), cand.get("sharpe_ratio"))
     if sharpe_improvement_pct is None:
@@ -519,18 +612,17 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
             "status": "UNAVAILABLE",
             "detail": "Insufficient Sharpe evidence",
             "expectancy_improvement_pct": expectancy_improvement_pct,
-            "comparison": comparison,
         }
 
     sortino_improvement_pct = _pct_improvement(champ.get("sortino_ratio"), cand.get("sortino_ratio"))
     profit_factor_change_pct = _pct_improvement(champ.get("profit_factor"), cand.get("profit_factor"))
     drawdown_increase_pct = (cand.get("max_drawdown_pct") or 0) - (champ.get("max_drawdown_pct") or 0)
 
-    # Fix 1: the paired comparison is the ONLY significance test — no
-    # fallback to the older unpaired win-rate/expectancy z-test
-    # (`comparison`, still carried above for the audit record only) when
-    # the paired series can't be computed. Missing paired evidence is
-    # missing evidence, never a substitute pass and never inferred.
+    # Fix 5/6: `paired` (_paired_champion_comparison's return) is the ONE
+    # authoritative statistical result this gate consumes — no other
+    # statistical test participates, and nothing here recomputes
+    # significance from scratch. Missing paired evidence is missing
+    # evidence, never a substitute pass and never inferred.
     paired = cc.get("paired_comparison")
     if paired is None:
         return {
@@ -542,7 +634,6 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
             "sortino_improvement_pct": sortino_improvement_pct,
             "profit_factor_change_pct": profit_factor_change_pct,
             "drawdown_increase_pct": drawdown_increase_pct,
-            "comparison": comparison,
         }
 
     significant = paired["significant"]
@@ -557,10 +648,22 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
         "status": "AVAILABLE",
         "result": "candidate_significantly_better" if significant else "not_significant",
         "significant": significant,
-        "paired_observation_count": paired["paired_observation_count"],
+        "paired_snapshot_count": paired["paired_snapshot_count"],
+        "paired_return_observations": paired["paired_return_observations"],
         "mean_difference": paired["mean_difference"],
         "median_difference": paired["median_difference"],
+        "std_difference": paired["std_difference"],
+        "p25_difference": paired["p25_difference"],
+        "p75_difference": paired["p75_difference"],
+        "p95_difference": paired["p95_difference"],
         "bootstrap_probability_candidate_better_pct": paired["bootstrap_probability_candidate_better_pct"],
+        "bootstrap_method": paired["bootstrap_method"],
+        "bootstrap_block_length": paired["bootstrap_block_length"],
+        "bootstrap_iterations": paired["bootstrap_iterations"],
+        "confidence_threshold_pct": paired["confidence_threshold_pct"],
+        "statistical_gate_status": paired["statistical_gate_status"],
+        "statistical_gate_reason": paired["statistical_gate_reason"],
+        "seed": paired["seed"],
         "sharpe_improvement_pct": sharpe_improvement_pct,
         "sortino_improvement_pct": sortino_improvement_pct,
         "expectancy_improvement_pct": expectancy_improvement_pct,
@@ -568,7 +671,6 @@ def _champion_improvement_gate(champion: dict | None, backtest_evidence: dict) -
         "drawdown_increase_pct": drawdown_increase_pct,
         "candidate_metrics": cand,
         "champion_metrics": champ,
-        "comparison": comparison,
     }
 
 
@@ -694,7 +796,8 @@ def evaluate_promotion(
         len(closed_trades),
         backtest_evidence["backtest_trades_count"],
         backtest_evidence["walk_forward_trades_count"],
-        backtest_evidence["paired_observation_count"],
+        backtest_evidence["paired_snapshot_count"],
+        backtest_evidence["paired_return_observations"],
         champion is not None,
     ))
     gates.update(_risk_gates(candidate, metrics, closed_trades, fitness_score, capital_to_use))
@@ -750,19 +853,31 @@ def evaluate_promotion(
     risk_status = "fail" if any(r is False for r in risk_results) else "pending" if any(r is None for r in risk_results) else "pass"
 
     summary = {
+        # Fix 11: the one authoritative promotion result — every field
+        # named exactly, nothing recomputed elsewhere.
         "candidate_id": candidate.get("id"),
         "version": candidate.get("version_number"),
         "champion_id": champion.get("id") if champion else None,
         "champion_version": champion.get("version_number") if champion else None,
-        "backtest_trade_count": backtest_evidence["backtest_trades_count"],
-        "walkforward_trade_count": backtest_evidence["walk_forward_trades_count"],
-        "paper_trade_count": len(closed_trades),
-        "paired_observation_count": backtest_evidence["paired_observation_count"],
+        "paired_snapshot_count": backtest_evidence["paired_snapshot_count"],
+        "paired_return_observations": backtest_evidence["paired_return_observations"],
+        "bootstrap_method": champion_gate.get("bootstrap_method"),
+        "bootstrap_block_length": champion_gate.get("bootstrap_block_length"),
+        "bootstrap_iterations": champion_gate.get("bootstrap_iterations"),
+        "bootstrap_probability_candidate_better_pct": champion_gate.get("bootstrap_probability_candidate_better_pct"),
+        "statistical_threshold_pct": champion_gate.get("confidence_threshold_pct"),
+        "statistical_status": champion_gate.get("statistical_gate_status"),
         "champion_comparison_status": champion_gate.get("status"),
         "champion_comparison_result": champion_gate.get("result"),
         "mean_difference": champion_gate.get("mean_difference"),
         "median_difference": champion_gate.get("median_difference"),
-        "bootstrap_probability_candidate_better_pct": champion_gate.get("bootstrap_probability_candidate_better_pct"),
+        "std_difference": champion_gate.get("std_difference"),
+        "p25_difference": champion_gate.get("p25_difference"),
+        "p75_difference": champion_gate.get("p75_difference"),
+        "p95_difference": champion_gate.get("p95_difference"),
+        "backtest_trade_count": backtest_evidence["backtest_trades_count"],
+        "walkforward_trade_count": backtest_evidence["walk_forward_trades_count"],
+        "paper_trade_count": len(closed_trades),
         "sharpe_improvement_pct": champion_gate.get("sharpe_improvement_pct"),
         "sortino_improvement_pct": champion_gate.get("sortino_improvement_pct"),
         "expectancy_improvement_pct": champion_gate.get("expectancy_improvement_pct"),
@@ -777,7 +892,7 @@ def evaluate_promotion(
         "passed_gates": [n for n, g in gates.items() if g.get("passed") is True],
         "failed_gates": [n for n, g in gates.items() if g.get("passed") is False],
         "missing_gates": [n for n, g in gates.items() if g.get("passed") is None],
-        "promotion_status": decision,
+        "final_status": decision,
         "promotion_reason": "; ".join(reasons),
     }
 
