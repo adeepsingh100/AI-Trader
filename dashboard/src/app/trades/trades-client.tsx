@@ -144,6 +144,7 @@ export default function TradesClient() {
                   "PnL",
                   "Status",
                   "Opened",
+                  "Closed",
                   "Reasoning",
                 ].map((h) => (
                   <th key={h} className="px-3 py-2.5 font-medium">
@@ -215,6 +216,11 @@ export default function TradesClient() {
                   </td>
                   <td className="px-3 py-2.5 whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
                     {new Date(t.opened_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
+                  </td>
+                  <td className="px-3 py-2.5 whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
+                    {t.closed_at
+                      ? new Date(t.closed_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
+                      : "-"}
                   </td>
                   <td className="px-3 py-2.5 max-w-xs" style={{ color: "var(--text-secondary)" }}>
                     {t.reasoning_text}
