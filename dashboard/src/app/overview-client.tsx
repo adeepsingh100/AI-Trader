@@ -1,11 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { todayIst } from "@/lib/date";
+import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { StatCard } from "@/components/StatCard";
 import type { CapitalConfig, DailyPnl } from "@/lib/types";
+
+interface OverviewData {
+  config: CapitalConfig | null;
+  dailyPnl: DailyPnl | null;
+  openTrades: { qty: number; entry_price: number }[];
+}
 
 export default function OverviewClient() {
   const mode = useMode();
@@ -18,28 +23,20 @@ export default function OverviewClient() {
     let cancelled = false;
 
     async function load() {
-      const [
-        { data: configRow, error: configError },
-        { data: pnlRow, error: pnlError },
-        { data: openTrades, error: tradesError },
-      ] = await Promise.all([
-        supabase.from("capital_config").select("*").eq("mode", mode).maybeSingle(),
-        supabase
-          .from("daily_pnl")
-          .select("*")
-          .eq("mode", mode)
-          .eq("date", todayIst())
-          .maybeSingle(),
-        supabase.from("trades").select("qty, entry_price").eq("mode", mode).eq("status", "open"),
-      ]);
-      if (cancelled) return;
-      const err = configError ?? pnlError ?? tradesError;
-      setError(err ? err.message : null);
-      setConfig(err ? undefined : (configRow ?? null));
-      setDailyPnl(pnlRow ?? null);
-      // Committed capital = sum(qty * entry_price) over open positions —
-      // same formula risk_manager.py's committed_capital() gates sizing against.
-      setCapitalInUse((openTrades ?? []).reduce((sum, t) => sum + t.qty * t.entry_price, 0));
+      try {
+        const data = await fetchJson<OverviewData>(`/api/overview?mode=${mode}`);
+        if (cancelled) return;
+        setError(null);
+        setConfig(data.config);
+        setDailyPnl(data.dailyPnl);
+        // Committed capital = sum(qty * entry_price) over open positions —
+        // same formula risk_manager.py's committed_capital() gates sizing against.
+        setCapitalInUse(data.openTrades.reduce((sum, t) => sum + t.qty * t.entry_price, 0));
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setConfig(undefined);
+      }
     }
 
     load();

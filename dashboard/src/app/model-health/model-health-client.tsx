@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { supabase } from "@/lib/supabase";
+import { fetchJson } from "@/lib/api";
 import { aggregateModelUsage } from "@/lib/modelUsageStats";
 import { CHROME, SERIES } from "@/lib/palette";
 import type { ModelUsage } from "@/lib/types";
@@ -13,15 +13,16 @@ export default function ModelHealthClient() {
 
   useEffect(() => {
     let cancelled = false;
-    supabase
-      .from("model_usage")
-      .select("*")
-      .order("timestamp", { ascending: false })
-      .limit(500)
-      .then(({ data, error }) => {
+    fetchJson<ModelUsage[]>("/api/model-health")
+      .then((data) => {
         if (cancelled) return;
-        setError(error ? error.message : null);
-        setEvents(error ? null : (data ?? []));
+        setError(null);
+        setEvents(data);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setEvents(null);
       });
     return () => {
       cancelled = true;

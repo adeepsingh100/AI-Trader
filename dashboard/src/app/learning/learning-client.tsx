@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { supabase } from "@/lib/supabase";
+import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
 import { collectEvidence, computeLearningStage, rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
@@ -14,9 +14,6 @@ import type {
   StrategySimulation,
 } from "@/lib/types";
 
-// LEARNING_HISTORY_WINDOW_DAYS default (src/config.py) — the window
-// rejection_breakdown() uses when no explicit `since` is passed.
-const HISTORY_WINDOW_DAYS = 180;
 // LEARNING_STAGE_OBSERVATION_MIN_TRADES default (src/config.py) — same
 // floor identify_weaknesses() gates buckets on.
 const MIN_SAMPLE_SIZE = 25;
@@ -227,75 +224,16 @@ export default function LearningClient() {
     let cancelled = false;
 
     async function load() {
-      const sinceIso = new Date(Date.now() - HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
-
-      const [stats, evals, recs, sims, versions, trades, strategyVersions, features] = await Promise.all([
-        supabase
-          .from("learning_statistics")
-          .select("dimension_type,dimension_value,expectancy,trades_count")
-          .eq("mode", mode),
-        supabase
-          .from("opportunity_evaluations")
-          .select("symbol,market_regime,timestamp,final_decision,llm_decision,reason,risk_manager_result")
-          .eq("mode", mode)
-          .gte("timestamp", sinceIso)
-          .limit(5000),
-        supabase
-          .from("recommendations")
-          .select("category,metric_name,current_value,recommended_value,confidence,sample_size,rationale,status,created_at")
-          .eq("mode", mode)
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("strategy_simulations")
-          .select("id,created_at,passed,p_value,research_note")
-          .eq("mode", mode)
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("adaptive_strategy_versions")
-          .select("version_number,status,fitness_score,notes,created_at,source_simulation_id")
-          .eq("mode", mode)
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("trades")
-          .select("pnl")
-          .eq("mode", mode)
-          .eq("status", "closed")
-          .gte("closed_at", sinceIso),
-        supabase
-          .from("strategy_versions")
-          .select("promotion_eligible")
-          .order("version_number", { ascending: false })
-          .limit(1),
-        supabase.from("feature_importance").select("feature_name,timeframe").eq("mode", mode),
-      ]);
-      if (cancelled) return;
-
-      const err =
-        stats.error?.message ??
-        evals.error?.message ??
-        recs.error?.message ??
-        sims.error?.message ??
-        versions.error?.message ??
-        trades.error?.message ??
-        strategyVersions.error?.message ??
-        features.error?.message;
-      setError(err ?? null);
-      setData(
-        err
-          ? null
-          : {
-              learningStats: stats.data ?? [],
-              evaluations: evals.data ?? [],
-              featureNames: (features.data ?? [])
-                .filter((f) => f.timeframe !== "blended")
-                .map((f) => f.feature_name),
-              recommendations: recs.data ?? [],
-              simulations: sims.data ?? [],
-              versions: versions.data ?? [],
-              closedTrades: trades.data ?? [],
-              promotionEligible: strategyVersions.data?.[0]?.promotion_eligible ?? false,
-            }
-      );
+      try {
+        const result = await fetchJson<LearningData>(`/api/learning?mode=${mode}`);
+        if (cancelled) return;
+        setError(null);
+        setData(result);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setData(null);
+      }
     }
 
     load();

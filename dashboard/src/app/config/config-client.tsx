@@ -1,28 +1,32 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabase";
+import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
 import type { CapitalConfig } from "@/lib/types";
 
 export default function ConfigClient() {
-  const [session, setSession] = useState<Session | null | undefined>(undefined);
+  const [authed, setAuthed] = useState<boolean | undefined>(undefined);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
+    fetchJson<{ authed: boolean }>("/api/config/auth")
+      .then((data) => setAuthed(data.authed))
+      .catch(() => setAuthed(false));
   }, []);
+
+  async function handleSignOut() {
+    await fetch("/api/config/auth", { method: "DELETE" });
+    setAuthed(false);
+  }
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Config</h1>
-        {session && (
+        {authed && (
           <button
-            onClick={() => supabase.auth.signOut()}
+            onClick={handleSignOut}
             className="text-sm hover:underline"
             style={{ color: "var(--text-muted)" }}
           >
@@ -31,15 +35,14 @@ export default function ConfigClient() {
         )}
       </div>
 
-      {session === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
-      {session === null && <LoginForm />}
-      {session && <ConfigForm />}
+      {authed === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
+      {authed === false && <LoginForm onSignedIn={() => setAuthed(true)} />}
+      {authed && <ConfigForm />}
     </div>
   );
 }
 
-function LoginForm() {
-  const [email, setEmail] = useState("");
+function LoginForm({ onSignedIn }: { onSignedIn: () => void }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -48,9 +51,18 @@ function LoginForm() {
     e.preventDefault();
     setSubmitting(true);
     setError(null);
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-    setSubmitting(false);
-    if (error) setError(error.message);
+    try {
+      await fetchJson("/api/config/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      onSignedIn();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -62,15 +74,6 @@ function LoginForm() {
       <p className="text-sm" style={{ color: "var(--text-muted)" }}>
         Sign in to edit capital, target, and loss limits.
       </p>
-      <input
-        type="email"
-        placeholder="Email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-        className="w-full rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-neutral-900/20"
-        style={{ border: "1px solid var(--border)" }}
-        required
-      />
       <input
         type="password"
         placeholder="Password"
@@ -117,27 +120,34 @@ function ConfigForm() {
   useEffect(() => {
     setConfig(undefined);
     setLoadError(null);
-    supabase
-      .from("capital_config")
-      .select("*")
-      .eq("mode", mode)
-      .maybeSingle()
-      .then(({ data, error }) => {
-        setLoadError(error ? error.message : null);
-        setConfig(error ? undefined : (data ?? null));
+    fetchJson<CapitalConfig | null>(`/api/config?mode=${mode}`)
+      .then((data) => {
+        setConfig(data);
         if (data) {
           const next: Record<string, number> = {};
           for (const f of FIELDS) next[f.key] = data[f.key] as number;
           setForm(next);
         }
+      })
+      .catch((e) => {
+        setLoadError(e instanceof Error ? e.message : String(e));
+        setConfig(undefined);
       });
   }, [mode]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setStatus("saving");
-    const { error } = await supabase.from("capital_config").update(form).eq("mode", mode);
-    setStatus(error ? "error" : "saved");
+    try {
+      await fetchJson(`/api/config?mode=${mode}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      setStatus("saved");
+    } catch {
+      setStatus("error");
+    }
   }
 
   async function togglePaused() {
@@ -145,12 +155,17 @@ function ConfigForm() {
     const next = !config.paused;
     setPauseSaving(true);
     setPauseError(null);
-    const { error } = await supabase.from("capital_config").update({ paused: next }).eq("mode", mode);
-    setPauseSaving(false);
-    if (error) {
-      setPauseError(error.message);
-    } else {
+    try {
+      await fetchJson(`/api/config?mode=${mode}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paused: next }),
+      });
       setConfig({ ...config, paused: next });
+    } catch (e) {
+      setPauseError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPauseSaving(false);
     }
   }
 
@@ -243,7 +258,7 @@ function ConfigForm() {
           )}
           {status === "error" && (
             <p className="text-sm" style={{ color: "var(--status-critical)" }}>
-              Save failed — check you&apos;re signed in and RLS allows the update.
+              Save failed — check the server logs.
             </p>
           )}
         </form>

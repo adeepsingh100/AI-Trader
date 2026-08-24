@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabase";
+import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { STATUS } from "@/lib/palette";
 import type { Trade } from "@/lib/types";
@@ -12,10 +12,10 @@ const STATUS_COLOR: Record<Trade["status"], string> = {
   flattened: STATUS.critical,
 };
 
-// How often to re-poll the latest close price for open positions. Supabase
-// Realtime would push updates instantly, but needs the table added to the
-// realtime publication (unconfirmed for this project) — polling is the
-// simpler, dependency-free way to get a "live" column without that setup.
+// How often to re-poll the latest close price for open positions. A push-
+// based feed would update instantly, but needs infrastructure this app
+// doesn't have — polling is the simpler, dependency-free way to get a
+// "live" column without that setup.
 const PRICE_POLL_MS = 20_000;
 
 function timeframeMinutes(timeframe: string): number {
@@ -45,16 +45,16 @@ export default function TradesClient() {
 
   useEffect(() => {
     let cancelled = false;
-    supabase
-      .from("trades")
-      .select("*")
-      .eq("mode", mode)
-      .order("opened_at", { ascending: false })
-      .limit(50)
-      .then(({ data, error }) => {
+    fetchJson<Trade[]>(`/api/trades?mode=${mode}`)
+      .then((data) => {
         if (cancelled) return;
-        setError(error ? error.message : null);
-        setTrades(error ? null : (data ?? []));
+        setError(null);
+        setTrades(data);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setTrades(null);
       });
     return () => {
       cancelled = true;
@@ -75,13 +75,9 @@ export default function TradesClient() {
     let cancelled = false;
 
     async function loadPrices() {
-      const { data } = await supabase
-        .from("opportunity_evaluations")
-        .select("symbol,timestamp,features")
-        .eq("mode", mode)
-        .in("symbol", openSymbols)
-        .order("timestamp", { ascending: false })
-        .limit(200);
+      const data = await fetchJson<{ symbol: string; features: Record<string, { close?: number | null }> }[]>(
+        `/api/trades/prices?mode=${mode}&symbols=${openSymbols.join(",")}`
+      ).catch(() => null);
       if (cancelled || !data) return;
 
       const bySymbol = new Map<string, number>();

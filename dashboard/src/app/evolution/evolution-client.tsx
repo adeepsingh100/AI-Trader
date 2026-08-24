@@ -10,10 +10,15 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { supabase } from "@/lib/supabase";
+import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
 import { CHROME, SERIES } from "@/lib/palette";
 import type { DailyPnl, StrategyVersion } from "@/lib/types";
+
+interface EvolutionData {
+  versions: StrategyVersion[];
+  dailyPnl: DailyPnl[];
+}
 
 export default function EvolutionClient() {
   const mode = useMode();
@@ -25,18 +30,18 @@ export default function EvolutionClient() {
     let cancelled = false;
 
     async function load() {
-      const [
-        { data: versionRows, error: versionsError },
-        { data: pnlRows, error: pnlError },
-      ] = await Promise.all([
-        supabase.from("strategy_versions").select("*").order("version_number", { ascending: false }),
-        supabase.from("daily_pnl").select("*").eq("mode", mode).order("date", { ascending: true }),
-      ]);
-      if (cancelled) return;
-      const err = versionsError ?? pnlError;
-      setError(err ? err.message : null);
-      setVersions(err ? null : (versionRows ?? []));
-      setDailyPnl(err ? null : (pnlRows ?? []));
+      try {
+        const data = await fetchJson<EvolutionData>(`/api/evolution?mode=${mode}`);
+        if (cancelled) return;
+        setError(null);
+        setVersions(data.versions);
+        setDailyPnl(data.dailyPnl);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setVersions(null);
+        setDailyPnl(null);
+      }
     }
 
     load();
