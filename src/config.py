@@ -29,8 +29,11 @@ GEMINI_MODEL_CHAIN = [
 ]
 
 # --- Credentials -------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+# Neon Postgres, pooled connection string — this repo's DB traffic shape
+# (many short queries per short-lived cron process) is exactly what
+# pooled is for. The unpooled/direct string is only for manual psql/
+# pg_dump work (schema migrations) — never read by this module.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET", "")

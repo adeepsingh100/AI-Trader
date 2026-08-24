@@ -24,8 +24,7 @@ jobs:
       # Framework) — no LLM call anymore, so no LLM secrets needed.
       - run: python -m src.agents.evolution_agent
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
       # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — the
       # sole authoritative strategy-change pipeline (Scientific Strategy
       # Optimization Framework). Mostly pure statistics; makes one
@@ -38,8 +37,7 @@ jobs:
       # skips that one candidate, never blocks this step.
       - run: python -m src.learning.adaptive_strategy_engine
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -51,9 +49,7 @@ jobs:
       # no LLM calls, so no LLM secrets needed.
       - run: python -m src.learning.drift_detection
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
       - run: python -m src.learning.strategy_health
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
