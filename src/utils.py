@@ -12,7 +12,11 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def parse_timestamp(raw: str) -> datetime:
+def parse_timestamp(raw: str | datetime) -> datetime:
+    """`raw` is a str (ISO, from JSON/tests) or already a datetime
+    (psycopg2 returns native tz-aware datetimes for timestamptz columns)."""
+    if isinstance(raw, datetime):
+        return raw
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
