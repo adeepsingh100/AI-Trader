@@ -23,16 +23,14 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m src.orchestrator --mode=paper --risk-only
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
       # Self Diagnostics (PROJECT_SPEC.md §3d) — its own step, not merged
       # into run_risk_check, so it fails independently of the SL/TP sweep
       # above. Piggybacks on this cron's 5-minute interval rather than a
       # new workflow file, which risks silently going stale unnoticed.
       - run: python -m src.monitoring.diagnostics --mode=paper
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
   real:
     runs-on: ubuntu-latest
@@ -47,9 +45,7 @@ jobs:
         env:
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
       - run: python -m src.monitoring.diagnostics --mode=real
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}

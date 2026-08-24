@@ -1,11 +1,13 @@
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 from src.db import models
 from src.monitoring.diagnostics import run_health_check
 
 
 def _healthy_mocks(monkeypatch):
-    monkeypatch.setattr(models, "get_client", lambda: Mock())
+    # MagicMock (not plain Mock) — models.ping() does `with get_client().
+    # cursor() as cur:`, which needs the context-manager protocol.
+    monkeypatch.setattr(models, "get_client", lambda: MagicMock())
     monkeypatch.setattr(models, "get_entry_evaluations_since", lambda mode, since: [{"id": 1}])
     monkeypatch.setattr(
         models,
