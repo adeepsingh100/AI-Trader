@@ -56,8 +56,8 @@ def generate_backtest_report_html(run_id: int) -> str:
     trade_rows = [
         [
             html.escape(t["symbol"]),
-            html.escape(t["entry_time"]),
-            html.escape(t["exit_time"] or ""),
+            html.escape(str(t["entry_time"])),
+            html.escape(str(t["exit_time"]) if t["exit_time"] else ""),
             _fmt(t["pnl"]),
             _fmt(t["return_pct"]),
             html.escape(t["exit_reason"] or ""),

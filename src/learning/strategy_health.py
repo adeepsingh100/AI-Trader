@@ -41,7 +41,7 @@ from src.learning.fitness import (
 )
 from src.learning.statistics import compute_bucket_statistics, z_test_two_means
 from src.resilience import log_fail_open
-from src.utils import clamp
+from src.utils import clamp, parse_timestamp
 
 # Each component contributes 0-100, weighted equally — a simple, explicit
 # blend rather than an opaque learned weighting (this whole learning
@@ -107,7 +107,7 @@ def compute_health_score(
 ) -> dict:
     trades = models.get_closed_trades(mode, version["id"])
     recent_since = datetime.now(timezone.utc) - timedelta(days=30)
-    recent_trades = [t for t in trades if t.get("closed_at") and t["closed_at"] >= recent_since.isoformat()]
+    recent_trades = [t for t in trades if t.get("closed_at") and parse_timestamp(t["closed_at"]) >= recent_since]
 
     overall_stats = compute_bucket_statistics(trades, capital_to_use)
     recent_stats = compute_bucket_statistics(recent_trades, capital_to_use)

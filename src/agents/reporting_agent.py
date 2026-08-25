@@ -82,7 +82,7 @@ def _trade_log_html(trades: list[dict]) -> str:
             f"{t['qty'] * t['exit_price']:.2f}" if t["exit_price"] is not None else "-",
             f"{t['pnl']:.2f}" if t["pnl"] is not None else "-",
             html.escape(t["status"]),
-            html.escape(t["opened_at"]),
+            html.escape(str(t["opened_at"])),
             html.escape(t["reasoning_text"] or ""),
         ]
         for t in trades
@@ -140,7 +140,7 @@ def _versions_html(versions: list[dict]) -> str:
             str(v["version_number"]),
             "real" if v["promoted_to_real"] else "paper-only",
             html.escape(v.get("notes") or ""),
-            html.escape(v["created_at"]),
+            html.escape(str(v["created_at"])),
         ]
         for v in versions
     ]

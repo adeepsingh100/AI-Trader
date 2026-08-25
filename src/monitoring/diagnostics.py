@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.config import SYSTEM_METRICS_LEARNING_STALE_HOURS, SYSTEM_METRICS_MARKET_FEED_STALE_MINUTES
 from src.resilience import log_fail_open
+from src.utils import parse_timestamp
 
 
 def _check_database() -> dict:
@@ -45,8 +46,8 @@ def _check_learning_engine(mode: str = "paper") -> dict:
         if not stats:
             return {"healthy": None, "detail": "no learning_statistics rows yet"}
         stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=SYSTEM_METRICS_LEARNING_STALE_HOURS)
-        newest = max(s["updated_at"] for s in stats if s.get("updated_at"))
-        return {"healthy": newest >= stale_cutoff.isoformat()}
+        newest = max(parse_timestamp(s["updated_at"]) for s in stats if s.get("updated_at"))
+        return {"healthy": newest >= stale_cutoff}
     except Exception as e:
         return {"healthy": False, "detail": str(e)}
 
