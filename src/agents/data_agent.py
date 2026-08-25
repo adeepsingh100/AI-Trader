@@ -30,7 +30,10 @@ def _validated_candles(pair: str, interval: str) -> list[dict]:
     was repairable — a DB write failure here degrades to "log skipped",
     never blocks the trading cycle (data quality logging is advisory, the
     circuit breaker/risk manager are the actual safety gates)."""
-    raw = get_candles(pair, interval=interval, limit=FEATURE_CANDLE_LIMIT)
+    # CoinDCX returns candles DESCENDING by time (see feature_engine.py's
+    # module docstring) — the validator's order/gap/spike checks assume
+    # ascending, so sort here first or every fetch floods out_of_order.
+    raw = sorted(get_candles(pair, interval=interval, limit=FEATURE_CANDLE_LIMIT), key=lambda c: c["time"])
     report = _validator.validate(raw, pair, interval, expected_pair=pair, live_fetch=True)
     repaired, repair_log = _repairer.repair(report.usable_candles, report, pair, interval)
 
@@ -48,6 +51,7 @@ def _validated_candles(pair: str, interval: str) -> list[dict]:
                         "severity": i.severity,
                         "detail": i.detail,
                         "repaired": any(r.candle_time == i.candle_time for r in repair_log),
+                        "candle_time": i.candle_time,
                     }
                     for i in report.issues
                 ]

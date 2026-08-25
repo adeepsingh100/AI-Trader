@@ -968,9 +968,24 @@ def get_hold_evaluations_since(mode: str, since: datetime) -> list[dict]:
 
 
 def insert_data_quality_issues(rows: list[dict]) -> None:
+    """ON CONFLICT DO NOTHING on (pair, interval, issue_type, candle_time) --
+    the same rolling candle window is re-validated every cycle, so an
+    unrepaired issue on a still-in-window candle would otherwise be
+    re-logged every cycle forever (the root cause of a real disk-fill
+    incident)."""
     if not rows:
         return
-    _insert_rows("data_quality_log", rows)
+    cols = list(rows[0].keys())
+    col_list = ", ".join(cols)
+    query = f"INSERT INTO data_quality_log ({col_list}) VALUES %s ON CONFLICT (pair, interval, issue_type, candle_time) DO NOTHING"
+    conn = get_client()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, query, [tuple(r[c] for c in cols) for r in rows])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_data_quality_log(pair: str | None = None, source: str | None = None, limit: int = 200) -> list[dict]:

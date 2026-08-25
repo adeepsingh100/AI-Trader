@@ -76,6 +76,7 @@ def ingest(pair: str, interval: str, start_ms: int, end_ms: int) -> int:
                     "severity": i.severity,
                     "detail": i.detail,
                     "repaired": any(r.candle_time == i.candle_time for r in repair_log),
+                    "candle_time": i.candle_time,
                 }
                 for i in report.issues
             ]
