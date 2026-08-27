@@ -130,6 +130,7 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
     mock_process.assert_called_once_with("paper")
 
 
+@patch("src.orchestrator.PAPER_TRADES_ON_NEGATIVE_EXPECTANCY", False)
 @patch("src.orchestrator.process_closed_trades")
 @patch("src.orchestrator.calibrate_confidence")
 @patch("src.orchestrator.find_similar_trades")
@@ -166,6 +167,46 @@ def test_run_cycle_net_expectancy_gate_blocks_entry_despite_high_score(
     log_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
     assert log_kwargs["final_decision"] == "hold"
     assert "net_expectancy gated" in log_kwargs["reason"]
+
+
+@patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.calibrate_confidence")
+@patch("src.orchestrator.find_similar_trades")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_paper_mode_trades_through_negative_expectancy_by_default(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
+):
+    # Same deliberately-bad 10%-stop/1%-target setup as the blocked-gate
+    # test above, but this time PAPER_TRADES_ON_NEGATIVE_EXPECTANCY is left
+    # at its true default — paper mode still opens the trade so it can
+    # accumulate the evidence real mode's stricter gate never lets through.
+    mock_models.get_capital_config.return_value = _capital_config()
+    version = _version()
+    version["params_json"] = {"stop_loss_pct": 0.10, "take_profit_pct": 0.01}
+    mock_models.get_latest_version.return_value = version
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_snapshot.return_value = [_market()]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = [{"symbol": "BTCINR"}]
+    mock_models.open_trade.return_value = {"id": 99}
+    mock_models.log_opportunity_evaluation.return_value = {"id": 501}
+    mock_similar.return_value = _empty_similar()
+    mock_calibrate.return_value = _permissive_calibration()
+
+    execution_agent = Mock()
+    execution_agent.place_order.return_value = {"fill_price": 1_000_500, "fees": 1.0}
+
+    result = run_cycle(execution_agent=execution_agent)
+
+    assert result["opened"] == [{"id": 99}]
+    execution_agent.place_order.assert_called_once()
+    mock_models.open_trade.assert_called_once()
+    eval_kwargs = mock_models.log_opportunity_evaluation.call_args.kwargs
+    assert eval_kwargs["final_decision"] == "buy"
 
 
 @patch("src.orchestrator.process_closed_trades")

@@ -540,6 +540,17 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
 # clamp bounds on the result — no separate min/max constants needed.
 STOP_LOSS_ATR_MULTIPLIER = float(os.getenv("STOP_LOSS_ATR_MULTIPLIER", "1.5"))
 TAKE_PROFIT_ATR_MULTIPLIER = float(os.getenv("TAKE_PROFIT_ATR_MULTIPLIER", "3.0"))
+# net_expectancy_pct <= 0 stays an unconditional "no trade" for REAL mode —
+# never touched by this flag. Paper mode risks nothing real, and with no
+# trade history it can never learn/calibrate/accumulate the evidence a
+# strategy needs to ever clear promotion in the first place, so by default
+# it still requires a valid stop/target + net expectancy computation but
+# trades regardless of the sign — the point is to find out whether the
+# model's cost/win-probability assumptions hold, not to only ever take
+# already-proven-positive setups. Set false to make paper as strict as real.
+PAPER_TRADES_ON_NEGATIVE_EXPECTANCY = (
+    os.getenv("PAPER_TRADES_ON_NEGATIVE_EXPECTANCY") or "true"
+).strip().lower() == "true"
 
 # --- Execution Optimizer ----------------------------------------------------
 # src/execution_optimizer/optimizer.py. Real trades: recommendation is

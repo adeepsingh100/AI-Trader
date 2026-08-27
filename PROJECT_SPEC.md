@@ -211,9 +211,16 @@ and where an LLM is still used elsewhere, offline from this cycle).
   (`calibrate_confidence`'s `final_confidence`, falling back to
   `opportunity_score` when there's no historical blend yet — never a new
   probability estimator). `net_expectancy_pct <= 0` is itself the "no
-  trade" decision — code is allowed to do nothing. Pure percentage-of-
-  notional math, no qty/entry_price needed, since every cost scales
-  linearly with notional.
+  trade" decision for **real mode**, unconditionally — code is allowed to
+  do nothing. Pure percentage-of-notional math, no qty/entry_price needed,
+  since every cost scales linearly with notional. **Paper mode** trades
+  through a negative `net_expectancy_pct` by default
+  (`PAPER_TRADES_ON_NEGATIVE_EXPECTANCY`, default true) — it risks
+  nothing real, and gating it identically to real mode meant it could
+  never accumulate the trade history confidence calibration and
+  promotion both need in the first place. Still requires a resolvable
+  stop/target (the gate itself, not just its sign) and still goes through
+  every other check (risk sizing, exposure, circuit breaker) unchanged.
 - **Stop-loss/take-profit resolution** (`risk_manager.resolve_exit_params`):
   the active strategy version's evidence-validated `params_json.
   stop_loss_pct`/`take_profit_pct` (already cleared the walk-forward/

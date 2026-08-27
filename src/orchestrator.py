@@ -54,6 +54,7 @@ from src.config import (
     LEARNING_CATCHUP_LOOKBACK_HOURS,
     MIN_FINAL_CONFIDENCE,
     MIN_OPPORTUNITY_SCORE,
+    PAPER_TRADES_ON_NEGATIVE_EXPECTANCY,
     RECENT_PERFORMANCE_LOOKBACK_TRADES,
     RECENT_STREAK_LOSS_MODIFIER_CAP,
     RECENT_STREAK_WIN_MODIFIER_CAP,
@@ -479,7 +480,10 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 net_expectancy = compute_net_expectancy_pct(
                     stop_loss_pct, take_profit_pct, win_probability_pct / 100
                 )
-                expectancy_cleared = net_expectancy is not None and net_expectancy["net_expectancy_pct"] > 0
+                expectancy_cleared = net_expectancy is not None and (
+                    net_expectancy["net_expectancy_pct"] > 0
+                    or (mode == "paper" and PAPER_TRADES_ON_NEGATIVE_EXPECTANCY)
+                )
                 ne_display = f"{net_expectancy['net_expectancy_pct']:.4f}" if net_expectancy is not None else "n/a"
                 llm_reasoning += (
                     f"; stop={stop_loss_pct} target={take_profit_pct} atr_pct={atr_pct} "
