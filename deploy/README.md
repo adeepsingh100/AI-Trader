@@ -95,7 +95,27 @@ for JOB in trading-cycle risk-check evolution; do
 done
 ```
 
-### 4. Cloud Scheduler — the 3 triggers, matching current cadence exactly
+### 4. Cloud Scheduler — the 3 triggers
+
+Risk-check runs every minute, not every 5 — a position whose stop/target
+was hit could otherwise sit unwatched for most of a 5min gap and turn a
+winner into a loss before the next poll (`src/orchestrator.py::
+run_risk_check` guards this cadence with a DB mutex — an overlapping run
+skips instead of double-closing a position — see migration
+`0015_risk_check_lock.sql`). Trading-cycle stays at 10min (throttled by
+feature-computation cost, not by this concern).
+
+**Already deployed?** Update the existing job in place instead of
+`create` (which errors on a name that already exists):
+```bash
+gcloud scheduler jobs update http risk-check-trigger \
+  --location=asia-south1 \
+  --schedule="* * * * *"
+```
+Then apply migration `0015_risk_check_lock.sql` against Neon before the
+next trigger fires (the app doesn't need to be redeployed for a Job —
+just re-run `gcloud run jobs deploy risk-check --source . ...` from
+step 2 once, so the running image has the mutex code).
 
 ```bash
 gcloud scheduler jobs create http trading-cycle-trigger \
@@ -107,7 +127,7 @@ gcloud scheduler jobs create http trading-cycle-trigger \
 
 gcloud scheduler jobs create http risk-check-trigger \
   --location=asia-south1 \
-  --schedule="2-59/5 * * * *" \
+  --schedule="* * * * *" \
   --uri="https://asia-south1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT_ID/jobs/risk-check:run" \
   --http-method=POST \
   --oauth-service-account-email="scheduler-invoker@PROJECT_ID.iam.gserviceaccount.com"

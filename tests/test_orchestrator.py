@@ -798,6 +798,28 @@ def test_run_risk_check_closes_stop_loss_hit_without_touching_llm(mock_models, m
 
 
 @patch("src.orchestrator.models")
+def test_run_risk_check_skips_when_lock_not_acquired(mock_models):
+    mock_models.try_acquire_risk_check_lock.return_value = False
+
+    result = run_risk_check()
+
+    assert result == {"closed": [], "circuit_breaker": False, "skipped": "already_running"}
+    mock_models.get_active_strategy_types.assert_not_called()
+    mock_models.release_risk_check_lock.assert_not_called()
+
+
+@patch("src.orchestrator.models")
+def test_run_risk_check_releases_lock_even_when_body_raises(mock_models):
+    mock_models.try_acquire_risk_check_lock.return_value = True
+    mock_models.get_active_strategy_types.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        run_risk_check()
+
+    mock_models.release_risk_check_lock.assert_called_once_with("paper")
+
+
+@patch("src.orchestrator.models")
 def test_run_risk_check_skips_when_paused_or_unconfigured(mock_models):
     mock_models.get_capital_config.return_value = None
     mock_models.get_active_strategy_types.return_value = ["default"]

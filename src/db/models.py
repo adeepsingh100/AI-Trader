@@ -365,6 +365,29 @@ def get_closed_trades(mode: str, version_id: int) -> list[dict]:
     )
 
 
+# --- risk_check_lock ---
+
+
+def try_acquire_risk_check_lock(mode: str, stale_after_seconds: int = 180) -> bool:
+    """Non-blocking mutex for orchestrator.run_risk_check(mode) — a
+    tightened polling cadence means one run can still be in flight when
+    the next fires. `stale_after_seconds` self-heals a lock left held by
+    a crashed process rather than deadlocking the mode forever (ponytail:
+    fixed 3min ceiling, revisit only if a real run ever legitimately
+    takes that long)."""
+    rows = _run_write(
+        "UPDATE risk_check_lock SET locked_at = now() "
+        "WHERE mode = %s AND (locked_at IS NULL OR locked_at < now() - make_interval(secs => %s)) "
+        "RETURNING mode",
+        (mode, stale_after_seconds),
+    )
+    return bool(rows)
+
+
+def release_risk_check_lock(mode: str) -> None:
+    _run_write("UPDATE risk_check_lock SET locked_at = NULL WHERE mode = %s", (mode,))
+
+
 # --- daily_pnl ---
 
 

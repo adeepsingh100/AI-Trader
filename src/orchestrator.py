@@ -769,21 +769,29 @@ def run_risk_check(mode: str = MODE, execution_agent=None) -> dict:
     the stop-loss/take-profit sweep, per active strategy_type. Meant to
     run on a tighter cron than run_cycle (which is throttled by LLM
     budget), so a bad move gets cut off sooner than a full 10-minute
-    wait."""
-    if execution_agent is None:
-        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
+    wait. Guarded by a DB mutex (models.try_acquire_risk_check_lock) —
+    the cadence is tight enough that an overlapping run is possible, and
+    two overlapping sweeps could both see the same open trade and both
+    close it."""
+    if not models.try_acquire_risk_check_lock(mode):
+        return {"closed": [], "circuit_breaker": False, "skipped": "already_running"}
+    try:
+        if execution_agent is None:
+            execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
 
-    active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
-    if not active_types:
-        return {"closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
+        active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+        if not active_types:
+            return {"closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
 
-    results = {"closed": [], "circuit_breaker": False, "by_strategy_type": {}}
-    for strategy_type in active_types:
-        r = _run_risk_check_for_strategy_type(mode, strategy_type, execution_agent)
-        results["by_strategy_type"][strategy_type] = r
-        results["closed"].extend(r["closed"])
-        results["circuit_breaker"] = results["circuit_breaker"] or r["circuit_breaker"]
-    return results
+        results = {"closed": [], "circuit_breaker": False, "by_strategy_type": {}}
+        for strategy_type in active_types:
+            r = _run_risk_check_for_strategy_type(mode, strategy_type, execution_agent)
+            results["by_strategy_type"][strategy_type] = r
+            results["closed"].extend(r["closed"])
+            results["circuit_breaker"] = results["circuit_breaker"] or r["circuit_breaker"]
+        return results
+    finally:
+        models.release_risk_check_lock(mode)
 
 
 def _run_risk_check_for_strategy_type(mode: str, strategy_type: str, execution_agent) -> dict:

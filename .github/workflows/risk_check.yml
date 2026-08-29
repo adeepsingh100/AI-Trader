@@ -1,8 +1,10 @@
 name: Risk check
 
 # Stop-loss/take-profit + circuit-breaker sweep only — no LLM calls, no
-# market snapshot. Meant to run every 5min so an open position isn't
-# sitting unwatched for the full gap between trading_cycle.yml runs. See
+# market snapshot. Runs every 1min in prod (Cloud Scheduler, see
+# deploy/README.md) so an open position isn't sitting unwatched for the
+# full gap between trading_cycle.yml runs. This file is a manual
+# workflow_dispatch fallback only, not the live trigger — see
 # src/orchestrator.py:run_risk_check.
 #
 # No `schedule:` trigger — GitHub Actions' own cron is unreliable below

@@ -292,13 +292,17 @@ and where an LLM is still used elsewhere, offline from this cycle).
   `market_order`/`limit_order` only; stop-limit/take-profit exist solely
   in their margin product, which this bot deliberately doesn't use — see
   §1 spot-only). So this is enforced by polling, not by the exchange
-  watching the price continuously, and GitHub Actions free-tier cron is
-  best-effort — the actual gap between checks can exceed the nominal 5
-  minutes under platform load, with no hard ceiling. A fast, large move
-  can still realize a loss/gain past the configured percentage before the
-  next check fires. Closing this gap for real needs an always-on poller
-  (not cron-triggered), which is a deliberate scope decision not taken —
-  see if this ever actually bites before reaching for it.
+  watching the price continuously. Cloud Scheduler triggers the sweep
+  every 1 min in prod (tightened from 5 min — see §5 — after this exact
+  gap cost a real trade its exit), guarded by a DB mutex so an
+  overlapping run can't double-close a position (`risk_check_lock`,
+  migration `0015`), but it's still a poll, not the exchange watching the
+  price continuously: a fast, large move inside that 1-minute window can
+  still realize a loss/gain past the configured percentage before the
+  next check fires. A true always-on poller (a persistent process, not
+  cron-triggered at any interval) would close this the rest of the way —
+  deliberately not built yet, revisit if 1-minute polling still isn't
+  tight enough in practice.
 
 ### Execution Agent (`src/agents/execution/`)
 - Shared interface (`base.py`): `place_order`, `get_fill`, `flatten_all`.
@@ -1279,19 +1283,29 @@ step is offline from live trading entirely.
 
 ## 5. Deployment (free tier only)
 
-- Trading cycle: GitHub Actions workflow, `cron: '*/10 * * * *'`,
-  invokes the orchestrator script once per mode and exits. **Known
-  limitation**: GitHub Actions cron is best-effort, not guaranteed —
-  under platform load, runs can be delayed several minutes. The
-  Risk Manager's daily bookkeeping must tolerate skipped/late cycles
-  (it recomputes from `trades`/`daily_pnl`, not from cycle count).
-- Risk check: separate `risk_check.yml` workflow, `cron: '*/5 * * * *'`
-  (5 min is GitHub Actions' shortest supported schedule interval — going
-  tighter isn't possible on the free tier). Runs `orchestrator.py
-  --risk-only`: stop-loss/take-profit + circuit-breaker sweep only, no
-  market snapshot, so it's cheap enough to run twice as often as the
-  signal cycle. This is what actually bounds how long a bad move can run
-  unwatched, not the signal cycle's interval.
+**Stale below — the GitHub Actions cron/Supabase setup this section
+describes was superseded by Cloud Run Jobs + Cloud Scheduler on Neon;
+see `deploy/README.md` for the actual live cadence and secrets. The
+`.github/workflows/*.yml` files still exist as a manual
+`workflow_dispatch` fallback (no `schedule:` trigger of their own).**
+
+- Trading cycle: `cron: '*/10 * * * *'` equivalent via Cloud Scheduler,
+  invokes the orchestrator script once per mode and exits. The Risk
+  Manager's daily bookkeeping must tolerate skipped/late cycles (it
+  recomputes from `trades`/`daily_pnl`, not from cycle count).
+- Risk check: separate Cloud Scheduler trigger, `cron: '* * * * *'`
+  (every 1 min — tightened from 5 min because a position whose
+  stop/target was hit could otherwise sit unwatched for most of the gap
+  and turn a winner into a loss before the next poll; GitHub Actions'
+  own `schedule:` can't go this tight reliably, which is why Cloud
+  Scheduler dispatches it instead). Runs `orchestrator.py --risk-only`:
+  stop-loss/take-profit + circuit-breaker sweep only, no market
+  snapshot, cheap enough to run this often. Guarded by a DB mutex
+  (`risk_check_lock` table, migration `0015`) so an overlapping run
+  skips instead of double-closing a position. This is what actually
+  bounds how long a bad move can run unwatched, not the signal cycle's
+  interval — still not a hard guarantee (polling, not an exchange-side
+  stop order — see the Risk Manager section above).
 - Evolution job: separate hourly GH Actions workflow (§3b/§4) — cheap
   even at this cadence, since every gate downstream is keyed off
   accumulated trade data/elapsed calendar time, not run frequency.
