@@ -20,14 +20,14 @@ def _summarize(row: dict) -> dict:
     }
 
 
-def identify_weaknesses(mode: str) -> dict:
+def identify_weaknesses(mode: str, strategy_type: str = "default") -> dict:
     """worst/best bucket per dimension_type (gated on
     LEARNING_STAGE_OBSERVATION_MIN_TRADES — Progressive Learning Stages,
     Stage 1 OBSERVATION's flagship output, ranked by expectancy) plus
     worst/best indicator by correlation magnitude — never fabricated from a
     thin bucket, same "None below the sample floor" policy as everywhere
     else in src/learning/."""
-    stats_rows = models.get_learning_statistics(mode)
+    stats_rows = models.get_learning_statistics(mode, strategy_type=strategy_type)
     dimension_types = {r["dimension_type"] for r in stats_rows}
 
     worst_by_dimension, best_by_dimension = {}, {}
@@ -49,7 +49,7 @@ def identify_weaknesses(mode: str) -> dict:
     # related but different ranking).
     indicators = [
         r
-        for r in models.get_feature_importance(mode)
+        for r in models.get_feature_importance(mode, strategy_type=strategy_type)
         if r.get("timeframe") != "blended" and (r.get("sample_count") or 0) >= LEARNING_STAGE_OBSERVATION_MIN_TRADES
     ]
     worst_indicator = min(indicators, key=lambda r: r["correlation_score"], default=None)

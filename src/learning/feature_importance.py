@@ -65,7 +65,9 @@ def pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
     return (n * sum_xy - sum_x * sum_y) / denominator if denominator else None
 
 
-def compute_feature_importance(mode: str, timeframes: list[str] | None = None) -> list[dict]:
+def compute_feature_importance(
+    mode: str, timeframes: list[str] | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """Nightly/periodic (called from evolution_agent's cron), not per
     10-minute cycle — this is a batch statistical pass over a growing
     dataset, not something the trading loop needs fresh every cycle.
@@ -79,7 +81,9 @@ def compute_feature_importance(mode: str, timeframes: list[str] | None = None) -
     timeframes = timeframes if timeframes is not None else [PRIMARY_TIMEFRAME]
 
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-    trades = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+    trades = [
+        t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None
+    ]
     if len(trades) < LEARNING_FEATURE_IMPORTANCE_MIN_TRADES:
         return []
 
@@ -110,7 +114,9 @@ def compute_feature_importance(mode: str, timeframes: list[str] | None = None) -
             correlation = pearson_correlation(list(xs), list(ys))
             if correlation is None:
                 continue
-            models.upsert_feature_importance(mode, feature_name, correlation, len(pairs), timeframe)
+            models.upsert_feature_importance(
+                mode, feature_name, correlation, len(pairs), timeframe, strategy_type=strategy_type
+            )
             results.append(
                 {
                     "feature_name": feature_name,
@@ -124,7 +130,7 @@ def compute_feature_importance(mode: str, timeframes: list[str] | None = None) -
 
 
 def compute_subscore_correlation_weights(
-    mode: str, trades: list[dict] | None = None, cache: bool = True
+    mode: str, trades: list[dict] | None = None, cache: bool = True, strategy_type: str = "default"
 ) -> dict[str, float] | None:
     """Correlates the 5 already-flat opportunity_evaluations sub-score
     columns against win/loss, normalizes positive correlations into a
@@ -153,7 +159,9 @@ def compute_subscore_correlation_weights(
     (nothing to recommend from zero/negative signal)."""
     if trades is None:
         since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-        trades = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+        trades = [
+            t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None
+        ]
     if len(trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return None
 
@@ -177,7 +185,9 @@ def compute_subscore_correlation_weights(
         if correlation is not None:
             correlations[key] = correlation
             if cache:
-                models.upsert_feature_importance(mode, key, correlation, len(pairs), BLENDED_TIMEFRAME)
+                models.upsert_feature_importance(
+                    mode, key, correlation, len(pairs), BLENDED_TIMEFRAME, strategy_type=strategy_type
+                )
 
     if not correlations:
         return None

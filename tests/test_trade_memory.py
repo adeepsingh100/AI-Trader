@@ -143,7 +143,9 @@ def test_find_similar_trades_empty_when_no_candidates(mock_models):
 def test_feature_importance_weights_none_when_nothing_cached(mock_models):
     mock_models.get_feature_importance.return_value = []
     assert _feature_importance_weights("paper") is None
-    mock_models.get_feature_importance.assert_called_once_with("paper", timeframe="blended")
+    mock_models.get_feature_importance.assert_called_once_with(
+        "paper", timeframe="blended", strategy_type="default"
+    )
 
 
 @patch("src.learning.trade_memory.models")

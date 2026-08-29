@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeToggle";
 import { STATUS } from "@/lib/palette";
 import { collectEvidence, computeLearningStage, rejectionBreakdown, worstBucketByDimension } from "@/lib/learningAggregates";
 import type {
@@ -217,6 +218,7 @@ function LearningStatusCard({ status }: { status: LearningStatus }) {
 
 export default function LearningClient() {
   const mode = useMode();
+  const strategyType = useStrategyType();
   const [data, setData] = useState<LearningData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -225,7 +227,7 @@ export default function LearningClient() {
 
     async function load() {
       try {
-        const result = await fetchJson<LearningData>(`/api/learning?mode=${mode}`);
+        const result = await fetchJson<LearningData>(`/api/learning?mode=${mode}&strategy_type=${strategyType}`);
         if (cancelled) return;
         setError(null);
         setData(result);
@@ -240,7 +242,7 @@ export default function LearningClient() {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, strategyType]);
 
   const evidence = useMemo(
     () =>
@@ -298,7 +300,10 @@ export default function LearningClient() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Learning</h1>
-        <ModeToggle />
+        <div className="flex items-center gap-2">
+          <StrategyTypeToggle />
+          <ModeToggle />
+        </div>
       </div>
 
       {error && (

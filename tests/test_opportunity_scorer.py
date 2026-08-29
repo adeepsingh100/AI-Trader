@@ -232,3 +232,41 @@ def test_score_opportunity_includes_market_regime():
     features = _by_tf(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70, adx=30, volatility_regime="medium")
     result = score_opportunity(features)
     assert "market_regime" in result
+
+
+# --- multi-strategy-type: explicit profile args override the module
+# global, but a bare call (no args) still honors @patch on the global --
+# the two halves of the "resolved inside the body, not a signature
+# default" contract every parameterized function in this module follows.
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", _WEIGHTS)
+@patch("src.features.opportunity_scorer.OPPORTUNITY_WEIGHT_TREND", 1.0)
+@patch("src.features.opportunity_scorer.OPPORTUNITY_WEIGHT_MOMENTUM", 0.0)
+@patch("src.features.opportunity_scorer.OPPORTUNITY_WEIGHT_VOLUME", 0.0)
+@patch("src.features.opportunity_scorer.OPPORTUNITY_WEIGHT_VOLATILITY", 0.0)
+@patch("src.features.opportunity_scorer.OPPORTUNITY_WEIGHT_RISK", 0.0)
+def test_score_opportunity_explicit_profile_overrides_module_global_weights():
+    # Bullish trend (high) but weak momentum (low RSI) -- default global
+    # weights (all-trend) and an explicit all-momentum profile must
+    # disagree on the resulting opportunity_score.
+    features = _by_tf(
+        close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70,  # trend = 100
+        rsi=20,  # momentum pulled down
+    )
+    default_score = score_opportunity(features)["opportunity_score"]
+    momentum_profile_score = score_opportunity(
+        features, opportunity_weights={"trend": 0.0, "momentum": 1.0, "volume": 0.0, "volatility": 0.0, "risk": 0.0}
+    )["opportunity_score"]
+    assert default_score != pytest.approx(momentum_profile_score)
+
+
+@patch("src.features.opportunity_scorer.TIMEFRAME_WEIGHTS", {"1h": 1.0})
+def test_score_trend_explicit_timeframe_weights_still_overridable_when_patch_omitted():
+    # No @patch on this call site -- confirms the bare call still reads
+    # the (patched-by-the-class-decorator) module global, while a second
+    # call in the same test can override it with an explicit dict.
+    features = {"1h": _features(close=110, ema_20=100, ema_50=90, ema_100=80, ema_200=70)}
+    bare = score_trend(features)
+    explicit = score_trend(features, timeframe_weights={"1h": 1.0})
+    assert bare == explicit == 100.0

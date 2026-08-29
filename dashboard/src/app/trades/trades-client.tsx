@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeToggle";
 import { STATUS } from "@/lib/palette";
 import type { Trade } from "@/lib/types";
 
@@ -39,13 +40,14 @@ function latestClose(features: Record<string, { close?: number | null }> | null)
 
 export default function TradesClient() {
   const mode = useMode();
+  const strategyType = useStrategyType();
   const [trades, setTrades] = useState<Trade[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentPrices, setCurrentPrices] = useState<Map<string, number>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
-    fetchJson<Trade[]>(`/api/trades?mode=${mode}`)
+    fetchJson<Trade[]>(`/api/trades?mode=${mode}&strategy_type=${strategyType}`)
       .then((data) => {
         if (cancelled) return;
         setError(null);
@@ -59,7 +61,7 @@ export default function TradesClient() {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, strategyType]);
 
   const openSymbols = useMemo(
     () => Array.from(new Set((trades ?? []).filter((t) => t.status === "open").map((t) => t.symbol))).sort(),
@@ -102,7 +104,10 @@ export default function TradesClient() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Trades</h1>
-        <ModeToggle />
+        <div className="flex items-center gap-2">
+          <StrategyTypeToggle />
+          <ModeToggle />
+        </div>
       </div>
 
       {error && (

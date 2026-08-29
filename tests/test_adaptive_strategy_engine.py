@@ -66,6 +66,7 @@ def test_analyze_composes_all_generators_and_simulations(
 ):
     status = _status("HYPOTHESIS", 120)
     mock_learning_status.return_value = status
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_weight_recs.return_value = [{"metric_name": "OPPORTUNITY_WEIGHT_TREND", "batch_id": "abc"}]
     mock_regime_recs.return_value = [{"metric_name": "avoid_regime:sideways"}]
     mock_symbol_recs.return_value = []
@@ -80,18 +81,22 @@ def test_analyze_composes_all_generators_and_simulations(
     mock_rejections.return_value = [{"reason": "block_max_positions", "count": 5, "pct_of_rejections": 100.0}]
     mock_feature_importance.return_value = [{"feature_name": "rsi", "timeframe": "1m"}]
 
-    result = AdaptiveStrategyEngine().analyze(mode="paper")
+    result = AdaptiveStrategyEngine().analyze(mode="paper")["default"]
 
-    mock_weight_recs.assert_called_once_with("paper", status=status)
-    mock_regime_recs.assert_called_once_with("paper", status=status)
-    mock_symbol_recs.assert_called_once_with("paper", status=status)
-    mock_threshold_recs.assert_called_once_with("paper", weakness_context=mock_weaknesses.return_value, status=status)
-    mock_exit_params_recs.assert_called_once_with("paper", status=status)
-    mock_ai_exit_params_recs.assert_called_once_with("paper", status=status)
-    mock_indicator_recs.assert_called_once_with("paper", status=status)
-    mock_simulate_weight.assert_called_once_with("paper", "abc", status=status)
-    mock_simulate_threshold.assert_called_once_with("paper", status=status)
-    mock_simulate_exit_params.assert_called_once_with("paper", symbol_to_pair=None, status=status)
+    mock_weight_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_regime_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_symbol_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_threshold_recs.assert_called_once_with(
+        "paper", weakness_context=mock_weaknesses.return_value, status=status, strategy_type="default"
+    )
+    mock_exit_params_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_ai_exit_params_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_indicator_recs.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_simulate_weight.assert_called_once_with("paper", "abc", status=status, strategy_type="default")
+    mock_simulate_threshold.assert_called_once_with("paper", status=status, strategy_type="default")
+    mock_simulate_exit_params.assert_called_once_with(
+        "paper", symbol_to_pair=None, status=status, strategy_type="default"
+    )
 
     assert result["learning_status"] is status
     assert result["candidates_created"] == 2  # weight + exit-params simulations passed
@@ -136,6 +141,7 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_indicator_recs,
 ):
     mock_learning_status.return_value = _status("BOOTSTRAP", 3)
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_weight_recs.return_value = []
     mock_regime_recs.return_value = []
     mock_symbol_recs.return_value = []
@@ -147,7 +153,7 @@ def test_analyze_skips_simulation_when_no_recommendations_generated(
     mock_rejections.return_value = []
     mock_feature_importance.return_value = []
 
-    result = AdaptiveStrategyEngine().analyze()
+    result = AdaptiveStrategyEngine().analyze()["default"]
 
     mock_simulate_weight.assert_not_called()
     mock_simulate_threshold.assert_not_called()

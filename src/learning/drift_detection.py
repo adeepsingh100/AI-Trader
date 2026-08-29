@@ -78,10 +78,14 @@ def _split_by_window(trades: list[dict], now: datetime) -> tuple[list[dict], lis
     return baseline, recent
 
 
-def detect_feature_drift(mode: str, timeframe: str = PRIMARY_TIMEFRAME) -> list[dict]:
+def detect_feature_drift(
+    mode: str, timeframe: str = PRIMARY_TIMEFRAME, strategy_type: str | None = None
+) -> list[dict]:
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=DRIFT_BASELINE_WINDOW_DAYS)
-    trades = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+    trades = [
+        t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None
+    ]
     baseline_trades, recent_trades = _split_by_window(trades, now)
 
     def values_for(trade_list: list[dict], key: str) -> list[float]:
@@ -112,20 +116,28 @@ def detect_feature_drift(mode: str, timeframe: str = PRIMARY_TIMEFRAME) -> list[
                 severity=severity,
                 baseline_value=None,
                 recent_value=psi,
-                detail={"timeframe": timeframe, "psi": psi, "baseline_n": len(baseline_values), "recent_n": len(recent_values)},
+                detail={
+                    "timeframe": timeframe,
+                    "psi": psi,
+                    "baseline_n": len(baseline_values),
+                    "recent_n": len(recent_values),
+                    "strategy_type": strategy_type,
+                },
             )
         )
     return alerts
 
 
-def detect_feature_importance_drift(mode: str, timeframe: str = PRIMARY_TIMEFRAME) -> list[dict]:
+def detect_feature_importance_drift(
+    mode: str, timeframe: str = PRIMARY_TIMEFRAME, strategy_type: str = "default"
+) -> list[dict]:
     """feature_importance rows are nightly snapshots (already timestamped);
     compares the two most-recent rows per feature_key rather than raw
     values (a PSI over point correlations wouldn't mean anything) — a
     correlation-magnitude delta beyond the PSI thresholds (reused, not a
     third redundant constant pair — the two metrics live on a comparable
     0-1ish scale) counts as drift."""
-    rows = models.get_feature_importance(mode, timeframe=timeframe)
+    rows = models.get_feature_importance(mode, timeframe=timeframe, strategy_type=strategy_type)
     by_key: dict[str, list[dict]] = {}
     for r in rows:
         by_key.setdefault(r["feature_key"], []).append(r)
@@ -149,14 +161,19 @@ def detect_feature_importance_drift(mode: str, timeframe: str = PRIMARY_TIMEFRAM
                 severity=severity,
                 baseline_value=baseline_corr,
                 recent_value=recent_corr,
-                detail={"timeframe": timeframe, "delta": delta},
+                detail={"timeframe": timeframe, "delta": delta, "strategy_type": strategy_type},
             )
         )
     return alerts
 
 
 def _proportion_drift_alert(
-    component: str, drift_type: str, baseline_trades: list[dict], recent_trades: list[dict], is_win
+    component: str,
+    drift_type: str,
+    baseline_trades: list[dict],
+    recent_trades: list[dict],
+    is_win,
+    strategy_type: str | None = None,
 ) -> dict | None:
     if len(baseline_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(recent_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return None
@@ -175,11 +192,16 @@ def _proportion_drift_alert(
         severity=severity,
         baseline_value=baseline_rate,
         recent_value=recent_rate,
-        detail={"p_value": p_value, "baseline_n": len(baseline_trades), "recent_n": len(recent_trades)},
+        detail={
+            "p_value": p_value,
+            "baseline_n": len(baseline_trades),
+            "recent_n": len(recent_trades),
+            "strategy_type": strategy_type,
+        },
     )
 
 
-def detect_performance_drift(mode: str) -> list[dict]:
+def detect_performance_drift(mode: str, strategy_type: str | None = None) -> list[dict]:
     """win_rate + confidence-calibration accuracy + opportunity-score
     accuracy drift, each a proportion compared baseline-vs-recent via the
     existing z_test_two_proportions — reused directly, not reimplemented.
@@ -194,7 +216,9 @@ def detect_performance_drift(mode: str) -> list[dict]:
     in src/learning/."""
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=DRIFT_BASELINE_WINDOW_DAYS)
-    trades = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+    trades = [
+        t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None
+    ]
     baseline_trades, recent_trades = _split_by_window(trades, now)
 
     evaluations = {
@@ -207,7 +231,7 @@ def detect_performance_drift(mode: str) -> list[dict]:
 
     alerts = []
     win_rate_alert = _proportion_drift_alert(
-        "trading", "win_rate", baseline_trades, recent_trades, lambda t: t["pnl"] > 0
+        "trading", "win_rate", baseline_trades, recent_trades, lambda t: t["pnl"] > 0, strategy_type
     )
     if win_rate_alert:
         alerts.append(win_rate_alert)
@@ -218,6 +242,7 @@ def detect_performance_drift(mode: str) -> list[dict]:
         with_evaluation(baseline_trades, "confidence_was_accurate"),
         with_evaluation(recent_trades, "confidence_was_accurate"),
         lambda t: evaluations[t["id"]]["confidence_was_accurate"],
+        strategy_type,
     )
     if confidence_alert:
         alerts.append(confidence_alert)
@@ -228,6 +253,7 @@ def detect_performance_drift(mode: str) -> list[dict]:
         with_evaluation(baseline_trades, "opportunity_score_was_accurate"),
         with_evaluation(recent_trades, "opportunity_score_was_accurate"),
         lambda t: evaluations[t["id"]]["opportunity_score_was_accurate"],
+        strategy_type,
     )
     if opportunity_score_alert:
         alerts.append(opportunity_score_alert)
@@ -236,14 +262,24 @@ def detect_performance_drift(mode: str) -> list[dict]:
 
 
 def run_drift_detection(mode: str = "paper") -> dict:
-    feature_alerts = detect_feature_drift(mode)
-    importance_alerts = detect_feature_importance_drift(mode)
-    performance_alerts = detect_performance_drift(mode)
-    return {
-        "feature_drift_alerts": len(feature_alerts),
-        "feature_importance_drift_alerts": len(importance_alerts),
-        "performance_drift_alerts": len(performance_alerts),
-    }
+    """Loops every strategy_type with a seeded capital_config row for this
+    mode (same "ships dormant" gate as orchestrator/evolution_agent) so
+    default's and swing's differently-shaped trade distributions never get
+    blended into one meaningless drift signal."""
+    from src.config import STRATEGY_PROFILES
+
+    active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+    results = {}
+    for strategy_type in active_types:
+        feature_alerts = detect_feature_drift(mode, strategy_type=strategy_type)
+        importance_alerts = detect_feature_importance_drift(mode, strategy_type=strategy_type)
+        performance_alerts = detect_performance_drift(mode, strategy_type=strategy_type)
+        results[strategy_type] = {
+            "feature_drift_alerts": len(feature_alerts),
+            "feature_importance_drift_alerts": len(importance_alerts),
+            "performance_drift_alerts": len(performance_alerts),
+        }
+    return results
 
 
 if __name__ == "__main__":

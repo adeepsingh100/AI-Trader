@@ -15,8 +15,12 @@ const ALLOWED_FIELDS = new Set([
 
 export async function GET(request: NextRequest) {
   const mode = request.nextUrl.searchParams.get("mode") ?? "paper";
+  const strategyType = request.nextUrl.searchParams.get("strategy_type") ?? "default";
   try {
-    const res = await pool.query("SELECT * FROM capital_config WHERE mode = $1", [mode]);
+    const res = await pool.query(
+      "SELECT * FROM capital_config WHERE mode = $1 AND strategy_type = $2",
+      [mode, strategyType]
+    );
     return NextResponse.json(res.rows[0] ?? null);
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
@@ -30,6 +34,7 @@ export async function PATCH(request: NextRequest) {
   }
 
   const mode = request.nextUrl.searchParams.get("mode") ?? "paper";
+  const strategyType = request.nextUrl.searchParams.get("strategy_type") ?? "default";
   const body = await request.json().catch(() => ({}));
   const fields = Object.keys(body).filter((k) => ALLOWED_FIELDS.has(k));
   if (fields.length === 0) {
@@ -40,8 +45,8 @@ export async function PATCH(request: NextRequest) {
   const values = fields.map((f) => body[f]);
   try {
     await pool.query(
-      `UPDATE capital_config SET ${setClause} WHERE mode = $${fields.length + 1}`,
-      [...values, mode]
+      `UPDATE capital_config SET ${setClause} WHERE mode = $${fields.length + 1} AND strategy_type = $${fields.length + 2}`,
+      [...values, mode, strategyType]
     );
     return NextResponse.json({ ok: true });
   } catch (e) {

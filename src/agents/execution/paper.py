@@ -66,14 +66,14 @@ class PaperExecutionAgent(ExecutionAgent):
         fee_amount = fees(fill_price * qty, side)
         return {"fill_price": fill_price, "fees": fee_amount, "order_type": "market"}
 
-    def flatten_all(self, mode: str) -> list[dict]:
+    def flatten_all(self, mode: str, strategy_type: str | None = None) -> list[dict]:
         from src.coindcx_client import get_ticker
         from src.db import models
 
         last_price = {t["market"]: float(t["last_price"]) for t in get_ticker()}
 
         closed = []
-        for trade in models.get_open_trades(mode):
+        for trade in models.get_open_trades(mode, strategy_type):
             price = last_price.get(trade["symbol"])
             if price is None:
                 continue

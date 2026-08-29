@@ -140,6 +140,7 @@ def test_run_evolution_promotes_on_PROMOTE_decision(mock_models, mock_evaluate, 
     status = _status("HYPOTHESIS", 120)
     mock_learning_status.return_value = status
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version(days_ago=20)
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
@@ -148,7 +149,7 @@ def test_run_evolution_promotes_on_PROMOTE_decision(mock_models, mock_evaluate, 
     mock_build_pair.return_value = None
     mock_evaluate.return_value = PromotionDecision("PROMOTE", 85.0, {"g": {"passed": True}}, ["all gates cleared"], {})
 
-    result = run_evolution(mode="paper")
+    result = run_evolution(mode="paper")["default"]
 
     assert result["promotion_eligible"] is True
     assert result["promoted"] is True
@@ -171,6 +172,7 @@ def test_run_evolution_promotes_on_PROMOTE_decision(mock_models, mock_evaluate, 
 def test_run_evolution_does_not_promote_on_REJECT_decision(mock_models, mock_evaluate, mock_build_pair, mock_learning_status):
     mock_learning_status.return_value = _status("BOOTSTRAP", 10)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     # Starts eligible=True (e.g. a manual test fixture) so a REJECT
     # decision genuinely flips it to False, proving the write actually
     # fires rather than the flag simply staying at its default.
@@ -182,7 +184,7 @@ def test_run_evolution_does_not_promote_on_REJECT_decision(mock_models, mock_eva
     mock_build_pair.return_value = None
     mock_evaluate.return_value = PromotionDecision("REJECT", 20.0, {"g": {"passed": False}}, ["drawdown too deep"], {})
 
-    result = run_evolution(mode="paper")
+    result = run_evolution(mode="paper")["default"]
 
     assert result["promotion_eligible"] is False
     assert result["promotion_decision"] == "REJECT"
@@ -199,6 +201,7 @@ def test_run_evolution_does_not_promote_on_REJECT_decision(mock_models, mock_eva
 def test_run_evolution_extend_validation_does_not_promote(mock_models, mock_evaluate, mock_build_pair, mock_learning_status):
     mock_learning_status.return_value = _status("BOOTSTRAP", 10)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version(days_ago=2, promotion_eligible=False)
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
@@ -221,12 +224,13 @@ def test_run_evolution_extend_validation_does_not_promote(mock_models, mock_eval
 def test_run_evolution_never_evaluates_promotion_for_real_mode(mock_models, mock_evaluate, mock_learning_status):
     mock_learning_status.return_value = _status("HYPOTHESIS", 120)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version(days_ago=20, promoted=True)
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
 
-    result = run_evolution(mode="real")
+    result = run_evolution(mode="real")["default"]
 
     assert result["promotion_eligible"] is False
     assert result["promotion_decision"] is None
@@ -242,12 +246,13 @@ def test_run_evolution_never_evaluates_promotion_for_real_mode(mock_models, mock
 def test_run_evolution_skips_gate_for_already_promoted_version(mock_models, mock_evaluate, mock_learning_status):
     mock_learning_status.return_value = _status("HYPOTHESIS", 120)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version(days_ago=20, promoted=True)  # already promoted_to_real
     version.update({"id": 1, "version_number": 3})
     mock_models.get_latest_version.return_value = version
     mock_models.get_closed_trades.return_value = _CLEARLY_PROFITABLE_TRADES
 
-    result = run_evolution(mode="paper")
+    result = run_evolution(mode="paper")["default"]
 
     assert result["promotion_decision"] is None
     mock_evaluate.assert_not_called()
@@ -264,6 +269,7 @@ def test_run_evolution_skips_gate_for_already_promoted_version(mock_models, mock
 def test_run_evolution_purges_old_data_with_correct_cutoffs(mock_models, mock_learning_status):
     mock_learning_status.return_value = _status("BOOTSTRAP", 3)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     # promoted=True so the promotion-gate branch (unrelated to this test,
     # would otherwise need its own mocking) is skipped entirely.
     mock_models.get_latest_version.return_value = _version(days_ago=1, promoted=True)
@@ -293,10 +299,11 @@ def test_run_evolution_purge_failure_fails_open(mock_models, mock_learning_statu
     # a purge error must never block the promotion-monitor result above it.
     mock_learning_status.return_value = _status("BOOTSTRAP", 3)
     mock_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version(days_ago=1, promoted=True)
     mock_models.get_closed_trades.return_value = []
     mock_models.purge_old_data.side_effect = RuntimeError("supabase unavailable")
 
-    result = run_evolution(mode="paper")
+    result = run_evolution(mode="paper")["default"]
 
     assert result["promotion_eligible"] is False

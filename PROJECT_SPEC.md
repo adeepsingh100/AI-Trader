@@ -1173,6 +1173,66 @@ is derived on read from tables that already exist, same "don't store a
 derivable fact under a second name" precedent as everywhere else in this
 codebase.
 
+## 3f. Multi-Strategy-Type Support
+
+Before this, `strategy_versions` had no `mode` column at all — one single
+global lineage, differentiated only by `promoted_to_real` and which trades
+reference which `version_id`. `strategy_type` is a new dimension,
+orthogonal to `mode`, letting genuinely different strategies (e.g. today's
+short-term "default" plus a longer-horizon "swing") run concurrently with
+independent capital, circuit breaker, and learning evidence — never
+blended into one confused signal.
+
+**`src/config.py::STRATEGY_PROFILES`**: a small fixed Python registry, not
+a dynamic/DB-driven system. `"default"` reuses the pre-existing bare env
+vars byte-for-byte (proves zero behavior change); `"swing"` reads its own
+`SWING_*`-prefixed env vars — timeframe weights leaning on 1h/1d only
+(CoinDCX's candles API only supports `{1m,15m,1h,1d}`, confirmed — "swing"
+means reweighting that fixed set, not fetching new timeframes), ~2x wider
+ATR-fallback stop/target multipliers, a looser `exit_score_threshold` so
+it tolerates pullbacks. A profile only governs live scoring weights and
+the ATR *fallback* — the evidence-validated `params_json` value on a
+strategy_versions row (per strategy_type lineage) always wins once one
+exists, same as before. Adding a 3rd type later is one new dict entry, no
+other code changes.
+
+**Ships dormant.** A strategy_type only ever runs once its `capital_config`
+row exists (`models.get_active_strategy_types(mode)`, intersected with
+`STRATEGY_PROFILES` at every call site) — activating one is a
+`seed_config.py` run (it now also prompts for `strategy_type`), not a
+deploy. `default`'s capital/behavior is untouched until a second type is
+deliberately activated.
+
+**Schema** (migration `0014_multi_strategy_types.sql`): `strategy_type`
+added to `strategy_versions`, `promotion_audit`, `recommendations`,
+`strategy_simulations`, `adaptive_strategy_versions`; `capital_config`'s
+PK becomes `(mode, strategy_type)`, `daily_pnl`'s becomes `(date, mode,
+strategy_type)` (independent circuit breaker per type);
+`learning_statistics`/`feature_importance`'s unique constraints widen to
+include it (required, not optional — without this, one type's stats
+`ON CONFLICT`-overwrite the other's bucket row). No column on `trades` or
+`opportunity_evaluations` — both already carry `version_id →
+strategy_versions.strategy_type`, so it's derivable via join, same
+no-duplicate-derivable-fact precedent as everywhere else in this schema.
+
+**Orchestrator**: `run_cycle`/`run_risk_check` loop every active
+strategy_type, each with its own independent scoring/entry/exit pass —
+but the market snapshot (candle fetch) and per-symbol feature computation
+happen ONCE per cycle and are shared across every active type's scoring
+pass (only the weighting/thresholds differ per type, never the raw
+candles), and are skipped entirely if every active type turns out
+paused/tripped that cycle (no wasted API call). `flatten_all` and every
+DB read/write below the top-level loop take `strategy_type` too, so
+tripping one type's circuit breaker never flattens another's positions.
+
+**Evolution/adaptive engine**: `evolution_agent.run_evolution`,
+`adaptive_strategy_engine.analyze`, and `drift_detection.run_drift_detection`
+all loop the same way, returning `{strategy_type: {...}}`. Each type gets
+its own independent promotion cooldown clock and champion slot — `default`
+and `swing` can each independently reach real-mode promotion and end up
+trading real money concurrently, each in its own capital sleeve, with no
+special-casing beyond the scoping already described.
+
 ## 4. LLM integration (Groq, auto-falling back to Gemini — hourly, offline from live trading)
 
 **Not in the live trade path at all.** `src/agents/signal_agent.py`, the

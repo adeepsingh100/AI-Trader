@@ -388,6 +388,21 @@ def test_resolve_exit_params_clamps_extreme_atr_within_sweep_range():
     assert target == pytest.approx(0.01)
 
 
+def test_resolve_exit_params_explicit_multipliers_override_module_globals():
+    # A "swing" profile's wider multipliers (STRATEGY_PROFILES) must
+    # produce a different ATR-derived stop/target than the bare default
+    # call on the same atr_pct -- proves the override actually reaches
+    # the calc, not just accepted-and-ignored.
+    default_stop, default_target = resolve_exit_params({}, atr_pct=2.0)
+    swing_stop, swing_target = resolve_exit_params(
+        {}, atr_pct=2.0, stop_mult=3.0, target_mult=6.0, min_pct=0.01, max_pct=0.20
+    )
+    assert swing_stop == pytest.approx(0.06)
+    assert swing_target == pytest.approx(0.12)
+    assert swing_stop != pytest.approx(default_stop)
+    assert swing_target != pytest.approx(default_target)
+
+
 # --- exit_reason: stored-price fallback (Phase 5) — closes the "no stop
 # configured = unbounded downside" gap without disturbing the existing
 # live-recomputed-from-params_json behavior when a leg IS configured. ---

@@ -666,6 +666,75 @@ EXIT_PARAM_SWEEP_MIN_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MIN_PCT", "0.01"))
 EXIT_PARAM_SWEEP_MAX_PCT = float(os.getenv("EXIT_PARAM_SWEEP_MAX_PCT", "0.10"))
 EXIT_PARAM_SWEEP_STEP_PCT = float(os.getenv("EXIT_PARAM_SWEEP_STEP_PCT", "0.01"))
 
+# --- Strategy Profiles (multi-strategy-type support) -------------------------
+# A fixed registry, not a dynamic/DB-driven system — a strategy_type only
+# does anything once someone seeds its capital_config row (src/seed_config.py),
+# so adding a 3rd type later is a new dict entry + one seed run, no other
+# code changes. "default" reuses the bare globals above byte-for-byte (proves
+# parity with pre-multi-strategy behavior); "swing" is a longer-horizon
+# profile — CoinDCX's public candles API only supports {1m,15m,1h,1d}
+# (confirmed, 422s on anything else), so "swing" means reweighting/subsetting
+# that same fixed set toward 1h/1d, not fetching new timeframes, plus wider
+# ATR-fallback stop/target multipliers and a looser exit threshold so it
+# tolerates short-term pullbacks instead of bailing on noise. These are
+# starting points only — the evidence-validated params_json value on a
+# strategy_versions row (per strategy_type lineage) always wins once the
+# adaptive engine has validated one; this profile only governs the ATR
+# fallback + live scoring weights.
+def _parse_timeframe_weights(raw: str) -> dict[str, float]:
+    return {tf: float(w) for tf, w in (pair.split(":") for pair in raw.split(",") if pair.strip())}
+
+
+STRATEGY_PROFILES: dict[str, dict] = {
+    "default": {
+        "timeframe_weights": TIMEFRAME_WEIGHTS,
+        "opportunity_weights": {
+            "trend": OPPORTUNITY_WEIGHT_TREND,
+            "momentum": OPPORTUNITY_WEIGHT_MOMENTUM,
+            "volume": OPPORTUNITY_WEIGHT_VOLUME,
+            "volatility": OPPORTUNITY_WEIGHT_VOLATILITY,
+            "risk": OPPORTUNITY_WEIGHT_RISK,
+        },
+        "min_opportunity_score": MIN_OPPORTUNITY_SCORE,
+        "top_n_candidates": TOP_N_CANDIDATES,
+        "exit_score_threshold": EXIT_SCORE_THRESHOLD,
+        "stop_loss_atr_multiplier": STOP_LOSS_ATR_MULTIPLIER,
+        "take_profit_atr_multiplier": TAKE_PROFIT_ATR_MULTIPLIER,
+        "exit_param_sweep_min_pct": EXIT_PARAM_SWEEP_MIN_PCT,
+        "exit_param_sweep_max_pct": EXIT_PARAM_SWEEP_MAX_PCT,
+        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+    },
+    "swing": {
+        "timeframe_weights": _parse_timeframe_weights(
+            os.getenv("SWING_TIMEFRAME_WEIGHTS") or "1h:0.35,1d:0.65"
+        ),
+        "opportunity_weights": {
+            "trend": float(os.getenv("SWING_OPPORTUNITY_WEIGHT_TREND", "0.30")),
+            "momentum": float(os.getenv("SWING_OPPORTUNITY_WEIGHT_MOMENTUM", "0.25")),
+            "volume": float(os.getenv("SWING_OPPORTUNITY_WEIGHT_VOLUME", "0.15")),
+            "volatility": float(os.getenv("SWING_OPPORTUNITY_WEIGHT_VOLATILITY", "0.15")),
+            "risk": float(os.getenv("SWING_OPPORTUNITY_WEIGHT_RISK", "0.15")),
+        },
+        "min_opportunity_score": float(os.getenv("SWING_MIN_OPPORTUNITY_SCORE", str(MIN_OPPORTUNITY_SCORE))),
+        "top_n_candidates": int(os.getenv("SWING_TOP_N_CANDIDATES", str(TOP_N_CANDIDATES))),
+        "exit_score_threshold": float(os.getenv("SWING_EXIT_SCORE_THRESHOLD", "25")),
+        "stop_loss_atr_multiplier": float(os.getenv("SWING_STOP_LOSS_ATR_MULTIPLIER", "3.0")),
+        "take_profit_atr_multiplier": float(os.getenv("SWING_TAKE_PROFIT_ATR_MULTIPLIER", "6.0")),
+        "exit_param_sweep_min_pct": float(
+            os.getenv("SWING_EXIT_PARAM_SWEEP_MIN_PCT", str(EXIT_PARAM_SWEEP_MIN_PCT))
+        ),
+        "exit_param_sweep_max_pct": float(os.getenv("SWING_EXIT_PARAM_SWEEP_MAX_PCT", "0.20")),
+        "risk_per_trade_pct": float(os.getenv("SWING_RISK_PER_TRADE_PCT", str(RISK_PER_TRADE_PCT))),
+    },
+}
+for _name, _profile in STRATEGY_PROFILES.items():
+    if _profile["exit_score_threshold"] >= _profile["min_opportunity_score"]:
+        raise ValueError(
+            f"STRATEGY_PROFILES[{_name!r}]: exit_score_threshold must be < min_opportunity_score "
+            f"(got {_profile['exit_score_threshold']} >= {_profile['min_opportunity_score']})"
+        )
+del _name, _profile
+
 # --- Progressive Learning Stages ----------------------------------------------
 # Replaces RECOMMENDATION_MIN_SAMPLE_SIZE as the OVERALL "enough evidence
 # collected to attempt this artifact type at all" gate for each layer of the

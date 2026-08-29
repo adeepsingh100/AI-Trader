@@ -77,13 +77,15 @@ def current_weights() -> dict[str, float]:
     }
 
 
-def _recently_closed(mode: str) -> list[dict]:
+def _recently_closed(mode: str, strategy_type: str = "default") -> list[dict]:
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-    return [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+    return [t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None]
 
 
-def _not_materially_different(mode: str, metric_name: str, candidate_value: float) -> bool:
-    latest = models.get_latest_recommendation(mode, metric_name)
+def _not_materially_different(
+    mode: str, metric_name: str, candidate_value: float, strategy_type: str = "default"
+) -> bool:
+    latest = models.get_latest_recommendation(mode, metric_name, strategy_type=strategy_type)
     if latest is None or latest.get("recommended_value") is None:
         return False
     prior = latest["recommended_value"] or 1.0
@@ -132,7 +134,10 @@ def _find_optimal_threshold(
 
 
 def generate_recommendations(
-    mode: str, weakness_context: dict | None = None, status: LearningStatus | None = None
+    mode: str,
+    weakness_context: dict | None = None,
+    status: LearningStatus | None = None,
+    strategy_type: str = "default",
 ) -> list[dict]:
     """weakness_context (Scientific Strategy Optimization Framework,
     optional): weakness_detection.identify_weaknesses(mode)'s output —
@@ -143,10 +148,10 @@ def generate_recommendations(
     computes one and threads it into all 8 generator/simulator calls per
     run rather than each recomputing it; standalone/test callers omitting
     it get one computed here."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
-    closed = _recently_closed(mode)
+    closed = _recently_closed(mode, strategy_type)
 
     scored_trades = []
     for trade in closed:
@@ -156,7 +161,7 @@ def generate_recommendations(
     if len(scored_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return []
 
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
     baseline_trades = [t for score, t in scored_trades if score >= MIN_OPPORTUNITY_SCORE]
@@ -177,7 +182,7 @@ def generate_recommendations(
         return []
     best_threshold, best_stats, _improvement_pct = found
 
-    if _not_materially_different(mode, "MIN_OPPORTUNITY_SCORE", best_threshold):
+    if _not_materially_different(mode, "MIN_OPPORTUNITY_SCORE", best_threshold, strategy_type):
         return []
 
     rationale = (
@@ -199,25 +204,28 @@ def generate_recommendations(
         rationale=rationale,
         sample_size=best_stats["trades_count"],
         category="threshold",
+        strategy_type=strategy_type,
     )
     return [{"metric_name": "MIN_OPPORTUNITY_SCORE", "recommended_value": best_threshold, "rationale": rationale}]
 
 
-def generate_weight_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_weight_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """Step 2: candidate weight set from sub-score/outcome correlation,
     accepted only if it separates winners from losers significantly
     better (lower p-value) than the CURRENT weights do on the same trades
     — never just "is the correlation positive," which says nothing about
     whether it beats what's already configured."""
-    candidate_weights = compute_subscore_correlation_weights(mode)
+    candidate_weights = compute_subscore_correlation_weights(mode, strategy_type=strategy_type)
     if candidate_weights is None:
         return []
 
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    trades = _recently_closed(mode)
+    trades = _recently_closed(mode, strategy_type)
 
     candidate_sep = score_separation_p_value(trades, candidate_weights)
     if candidate_sep is None or candidate_sep["p_value"] is None or candidate_sep["p_value"] >= SIGNIFICANCE_THRESHOLD:
@@ -236,7 +244,7 @@ def generate_weight_recommendations(mode: str, status: LearningStatus | None = N
     results = []
     for key, recommended_weight in candidate_weights.items():
         metric_name = _SUBSCORE_TO_WEIGHT_CONFIG[key]
-        if _not_materially_different(mode, metric_name, recommended_weight):
+        if _not_materially_different(mode, metric_name, recommended_weight, strategy_type):
             continue
         if batch_id is None:
             batch_id = str(uuid.uuid4())
@@ -263,6 +271,7 @@ def generate_weight_recommendations(mode: str, status: LearningStatus | None = N
             confidence=confidence,
             evidence=evidence,
             batch_id=batch_id,
+            strategy_type=strategy_type,
         )
         results.append(
             {"metric_name": metric_name, "recommended_value": recommended_weight, "rationale": rationale, "batch_id": batch_id}
@@ -278,6 +287,7 @@ def _avoid_bucket_recommendations(
     category: str,
     wins_overall: int,
     n_overall: int,
+    strategy_type: str = "default",
 ) -> list[dict]:
     """Shared "is this bucket reliably worse than the overall baseline"
     check, used for both market_regime and symbol buckets — same
@@ -285,7 +295,7 @@ def _avoid_bucket_recommendations(
     overall_win_rate = wins_overall / n_overall
     results = []
     batch_id = None
-    for row in models.get_learning_statistics(mode, dimension_type=dimension_type):
+    for row in models.get_learning_statistics(mode, dimension_type=dimension_type, strategy_type=strategy_type):
         bucket = row["dimension_value"]
         n_bucket = row.get("trades_count") or 0
         win_rate = row.get("win_rate")
@@ -297,7 +307,7 @@ def _avoid_bucket_recommendations(
             continue
 
         metric_name = f"{metric_prefix}:{bucket}"
-        latest = models.get_latest_recommendation(mode, metric_name)
+        latest = models.get_latest_recommendation(mode, metric_name, strategy_type=strategy_type)
         if latest is not None and latest.get("recommended_value") == 0.0:
             continue  # already on record as "avoid" — append-only idempotency
 
@@ -320,23 +330,26 @@ def _avoid_bucket_recommendations(
             confidence=confidence,
             evidence=evidence,
             batch_id=batch_id,
+            strategy_type=strategy_type,
         )
         results.append({"metric_name": metric_name, "recommended_value": 0.0, "rationale": rationale})
     return results
 
 
-def generate_indicator_bucket_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_indicator_bucket_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """RSI/StochRSI/volatility evidence (Phases 7-9): "avoid bucket X" using
     the exact same generic two-proportion-z-test check
     _avoid_bucket_recommendations already runs for market_regime/symbol —
     same advisory-only, human-approved, RECOMMENDATION_MIN_SAMPLE_SIZE-gated
     pattern, just 3 more dimension types. Never auto-applied, same as every
     other recommendation in this module."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    all_trades = _recently_closed(mode)
+    all_trades = _recently_closed(mode, strategy_type)
     wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
     n_overall = len(all_trades)
     if n_overall == 0:
@@ -349,27 +362,31 @@ def generate_indicator_bucket_recommendations(mode: str, status: LearningStatus 
         ("atr_volatility_bucket", "avoid_volatility_bucket"),
     ):
         results.extend(
-            _avoid_bucket_recommendations(mode, dimension_type, metric_prefix, "indicator", wins_overall, n_overall)
+            _avoid_bucket_recommendations(
+                mode, dimension_type, metric_prefix, "indicator", wins_overall, n_overall, strategy_type
+            )
         )
     return results
 
 
-def generate_regime_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_regime_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """Step 4: "avoid regime X" plus regime-conditioned weight
     recommendations (e.g. trend weight matters more in a bull regime than
     in a sideways one), reusing generate_weight_recommendations'
     primitives scoped to each regime's own trade subset."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    all_trades = _recently_closed(mode)
+    all_trades = _recently_closed(mode, strategy_type)
 
     wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
     n_overall = len(all_trades)
 
     results = _avoid_bucket_recommendations(
-        mode, "market_regime", "avoid_regime", "regime", wins_overall, n_overall
+        mode, "market_regime", "avoid_regime", "regime", wins_overall, n_overall, strategy_type
     )
 
     regimes = {t.get("market_regime") for t in all_trades if t.get("market_regime")}
@@ -377,7 +394,9 @@ def generate_regime_recommendations(mode: str, status: LearningStatus | None = N
         regime_trades = [t for t in all_trades if t.get("market_regime") == regime]
         if len(regime_trades) < RECOMMENDATION_MIN_SAMPLE_SIZE:
             continue
-        regime_weights = compute_subscore_correlation_weights(mode, trades=regime_trades, cache=False)
+        regime_weights = compute_subscore_correlation_weights(
+            mode, trades=regime_trades, cache=False, strategy_type=strategy_type
+        )
         if regime_weights is None:
             continue
         candidate_sep = score_separation_p_value(regime_trades, regime_weights)
@@ -388,7 +407,7 @@ def generate_regime_recommendations(mode: str, status: LearningStatus | None = N
         confidence = (1 - candidate_sep["p_value"]) * 100
         for key, recommended_weight in regime_weights.items():
             metric_name = f"{_SUBSCORE_TO_WEIGHT_CONFIG[key]}:{regime}"
-            if _not_materially_different(mode, metric_name, recommended_weight):
+            if _not_materially_different(mode, metric_name, recommended_weight, strategy_type):
                 continue
             rationale = (
                 f"Within regime {regime} (n={len(regime_trades)}), a {key} weight of "
@@ -406,6 +425,7 @@ def generate_regime_recommendations(mode: str, status: LearningStatus | None = N
                 confidence=confidence,
                 evidence=evidence,
                 batch_id=batch_id,
+                strategy_type=strategy_type,
             )
             results.append({"metric_name": metric_name, "recommended_value": recommended_weight, "rationale": rationale})
 
@@ -433,24 +453,28 @@ def _symbol_metric_extractors() -> dict[str, callable]:
     }
 
 
-def generate_symbol_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_symbol_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """Step 5: "avoid symbol X" plus a per-symbol optimal-threshold sweep
     for confidence/opportunity_score/stop_distance/volatility — the same
     _find_optimal_threshold sweep generate_recommendations() uses
     globally, generalized and scoped per symbol."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    all_trades = _recently_closed(mode)
+    all_trades = _recently_closed(mode, strategy_type)
 
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
     wins_overall = sum(1 for t in all_trades if t["pnl"] > 0)
     n_overall = len(all_trades)
 
-    results = _avoid_bucket_recommendations(mode, "symbol", "avoid_symbol", "symbol", wins_overall, n_overall)
+    results = _avoid_bucket_recommendations(
+        mode, "symbol", "avoid_symbol", "symbol", wins_overall, n_overall, strategy_type
+    )
 
     symbols = {t["symbol"] for t in all_trades}
     extractors = _symbol_metric_extractors()
@@ -489,7 +513,7 @@ def generate_symbol_recommendations(mode: str, status: LearningStatus | None = N
             best_threshold, best_stats, improvement_pct = found
 
             metric_name = f"{metric_suffix}:{symbol}"
-            if _not_materially_different(mode, metric_name, best_threshold):
+            if _not_materially_different(mode, metric_name, best_threshold, strategy_type):
                 continue
 
             rationale = (
@@ -509,6 +533,7 @@ def generate_symbol_recommendations(mode: str, status: LearningStatus | None = N
                 confidence=None,
                 evidence=evidence,
                 batch_id=None,
+                strategy_type=strategy_type,
             )
             results.append({"metric_name": metric_name, "recommended_value": best_threshold, "rationale": rationale})
 
@@ -540,21 +565,23 @@ def _simulate_exit_pnl(trade: dict, stop_loss_pct: float | None, take_profit_pct
     return trade["pnl"]
 
 
-def generate_exit_params_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_exit_params_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """New candidate type (Scientific Strategy Optimization Framework):
     sweeps stop_loss_pct/take_profit_pct — previously only ever
     LLM-guessed via the now-retired evolution_agent.propose_next_version —
     against expectancy via _simulate_exit_pnl. Each leg is swept
     independently, holding the other at its current configured value."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    closed = _recently_closed(mode)
+    closed = _recently_closed(mode, strategy_type)
 
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
-    version = models.get_latest_version()
+    version = models.get_latest_version(strategy_type)
     current_params = (version.get("params_json") or {}) if version else {}
     current_stop, current_target = current_params.get("stop_loss_pct"), current_params.get("take_profit_pct")
 
@@ -586,7 +613,7 @@ def generate_exit_params_recommendations(mode: str, status: LearningStatus | Non
         )
         if improvement_pct < RECOMMENDATION_MIN_IMPROVEMENT_PCT:
             continue
-        if _not_materially_different(mode, param_name, best_value):
+        if _not_materially_different(mode, param_name, best_value, strategy_type):
             continue
 
         current_value = current_stop if param_name == "stop_loss_pct" else current_target
@@ -603,6 +630,7 @@ def generate_exit_params_recommendations(mode: str, status: LearningStatus | Non
             rationale=rationale,
             sample_size=len(closed),
             category="exit_params",
+            strategy_type=strategy_type,
         )
         results.append({"metric_name": param_name, "recommended_value": best_value, "rationale": rationale})
 
@@ -622,7 +650,9 @@ _AI_PROPOSER_SYSTEM_PROMPT = (
 )
 
 
-def generate_ai_exit_params_recommendations(mode: str, status: LearningStatus | None = None) -> list[dict]:
+def generate_ai_exit_params_recommendations(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> list[dict]:
     """AI-assisted sibling to generate_exit_params_recommendations — same
     idempotency pattern, same category="exit_params" recommendation row,
     same downstream walk-forward/bootstrap/fitness gate
@@ -633,14 +663,14 @@ def generate_ai_exit_params_recommendations(mode: str, status: LearningStatus | 
     response) just means no AI candidate this run — the pure-stat sweep
     above is unaffected and the caller (AdaptiveStrategyEngine, run
     hourly) keeps going."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_generate_hypotheses():
         return []
 
-    closed = _recently_closed(mode)
-    capital_config = models.get_capital_config(mode)
+    closed = _recently_closed(mode, strategy_type)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
-    version = models.get_latest_version()
+    version = models.get_latest_version(strategy_type)
     current_params = (version.get("params_json") or {}) if version else {}
 
     baseline_stats = compute_bucket_statistics(closed, capital_to_use)
@@ -679,7 +709,7 @@ def generate_ai_exit_params_recommendations(mode: str, status: LearningStatus | 
         value = proposal.get(param_name)
         if not isinstance(value, (int, float)) or not (EXIT_PARAM_SWEEP_MIN_PCT <= value <= EXIT_PARAM_SWEEP_MAX_PCT):
             continue
-        if _not_materially_different(mode, param_name, value):
+        if _not_materially_different(mode, param_name, value, strategy_type):
             continue
 
         current_value = current_params.get(param_name)
@@ -693,6 +723,7 @@ def generate_ai_exit_params_recommendations(mode: str, status: LearningStatus | 
             sample_size=len(closed),
             category="exit_params",
             evidence={"ai_raw_response": proposal},
+            strategy_type=strategy_type,
         )
         results.append({"metric_name": param_name, "recommended_value": value, "rationale": rationale})
 

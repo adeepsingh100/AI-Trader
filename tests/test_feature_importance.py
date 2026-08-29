@@ -52,7 +52,9 @@ def test_compute_feature_importance_defaults_to_primary_timeframe(mock_models):
     assert len(rsi_rows) == 1
     assert rsi_rows[0]["timeframe"] == "1h"
     assert rsi_rows[0]["correlation_score"] == pytest.approx(1.0)
-    mock_models.upsert_feature_importance.assert_any_call("paper", "rsi", pytest.approx(1.0), 2, "1h")
+    mock_models.upsert_feature_importance.assert_any_call(
+        "paper", "rsi", pytest.approx(1.0), 2, "1h", strategy_type="default"
+    )
 
 
 @patch("src.learning.feature_importance.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
@@ -108,7 +110,9 @@ def test_compute_subscore_correlation_weights_normalizes_and_caches(mock_models)
 
     assert weights["trend_score"] == pytest.approx(1.0)
     assert weights["momentum_score"] == pytest.approx(0.0)
-    mock_models.upsert_feature_importance.assert_any_call("paper", "trend_score", pytest.approx(1.0), 2, "blended")
+    mock_models.upsert_feature_importance.assert_any_call(
+        "paper", "trend_score", pytest.approx(1.0), 2, "blended", strategy_type="default"
+    )
 
 
 @patch("src.learning.feature_importance.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)

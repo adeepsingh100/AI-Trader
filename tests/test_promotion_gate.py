@@ -118,6 +118,26 @@ def test_cooldown_gate_clears_after_window():
         assert _cooldown_gate("paper")["passed"] is True
 
 
+def test_cooldown_gate_is_independent_per_strategy_type():
+    # default just promoted (recent) -> its own cooldown is active, but
+    # swing (queried with a different strategy_type) has no prior
+    # promotion of its own and must not be blocked by default's cooldown.
+    with patch("src.learning.promotion_gate.models") as mock_models, patch(
+        "src.learning.promotion_gate.PROMOTION_COOLDOWN_DAYS", 7
+    ):
+        recent = datetime.now(timezone.utc) - timedelta(days=1)
+
+        def _latest_audit(mode, event_type=None, strategy_type="default"):
+            if strategy_type == "default":
+                return {"created_at": recent.isoformat()}
+            return None  # swing: no prior promotion
+
+        mock_models.get_latest_promotion_audit.side_effect = _latest_audit
+
+        assert _cooldown_gate("paper", "default")["passed"] is False
+        assert _cooldown_gate("paper", "swing")["passed"] is True
+
+
 def test_sample_size_gates_below_floor_is_false_not_none():
     with patch("src.learning.promotion_gate.PROMOTION_MIN_PAPER_TRADES", 300):
         gates = _sample_size_gates(50, None, None, None, None, True)

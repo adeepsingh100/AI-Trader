@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeToggle";
 import { StatCard } from "@/components/StatCard";
 import type { CapitalConfig, DailyPnl } from "@/lib/types";
 
@@ -14,6 +15,7 @@ interface OverviewData {
 
 export default function OverviewClient() {
   const mode = useMode();
+  const strategyType = useStrategyType();
   const [config, setConfig] = useState<CapitalConfig | null | undefined>(undefined);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl | null>(null);
   const [capitalInUse, setCapitalInUse] = useState(0);
@@ -24,7 +26,7 @@ export default function OverviewClient() {
 
     async function load() {
       try {
-        const data = await fetchJson<OverviewData>(`/api/overview?mode=${mode}`);
+        const data = await fetchJson<OverviewData>(`/api/overview?mode=${mode}&strategy_type=${strategyType}`);
         if (cancelled) return;
         setError(null);
         setConfig(data.config);
@@ -43,13 +45,16 @@ export default function OverviewClient() {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, strategyType]);
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-        <ModeToggle />
+        <div className="flex items-center gap-2">
+          <StrategyTypeToggle />
+          <ModeToggle />
+        </div>
       </div>
 
       {error && (

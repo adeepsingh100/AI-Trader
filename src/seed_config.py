@@ -34,20 +34,27 @@ def _prompt_int(label: str, default: int) -> int:
     return int(raw) if raw else default
 
 
-def seed_initial_strategy_version() -> None:
-    if models.get_latest_version() is not None:
+def seed_initial_strategy_version(strategy_type: str = "default") -> None:
+    if models.get_latest_version(strategy_type) is not None:
         return
     models.insert_strategy_version(
         version_number=1,
         prompt_text=INITIAL_STRATEGY_PROMPT,
         params_json={},
-        notes="initial baseline",
+        notes=f"initial baseline ({strategy_type})",
+        strategy_type=strategy_type,
     )
-    print("strategy_versions: seeded version 1 (baseline prompt).")
+    print(f"strategy_versions: seeded version 1 (baseline prompt, strategy_type={strategy_type}).")
 
 
 def main() -> None:
     mode = input("mode (paper/real) [paper]: ").strip() or "paper"
+    # This IS the "activate a strategy_type" workflow (src/config.py's
+    # STRATEGY_PROFILES) — a type only ever runs once its capital_config
+    # row exists (orchestrator.run_cycle's models.get_active_strategy_types
+    # gate). Running this a second time with a different strategy_type
+    # activates a second strategy alongside the first, no code changes.
+    strategy_type = input("strategy_type (default/swing) [default]: ").strip() or "default"
     total_capital = _prompt_float("total_capital (INR)")
     capital_to_use = _prompt_float("capital_to_use (INR)", default=total_capital)
     daily_profit_target = _prompt_float("daily_profit_target (INR)")
@@ -63,10 +70,11 @@ def main() -> None:
         max_daily_loss=max_daily_loss,
         position_size_pct=position_size_pct,
         max_concurrent_positions=max_concurrent_positions,
+        strategy_type=strategy_type,
     )
-    print(f"capital_config[{mode}] saved.")
+    print(f"capital_config[{mode}][{strategy_type}] saved.")
 
-    seed_initial_strategy_version()
+    seed_initial_strategy_version(strategy_type)
 
 
 if __name__ == "__main__":

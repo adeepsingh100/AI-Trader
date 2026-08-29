@@ -50,20 +50,19 @@ from src.coindcx_client import get_ticker
 from src.config import (
     BUCKET_MODIFIER_CAP,
     BUCKET_MODIFIER_SENSITIVITY,
-    EXIT_SCORE_THRESHOLD,
     LEARNING_CATCHUP_LOOKBACK_HOURS,
     MIN_FINAL_CONFIDENCE,
-    MIN_OPPORTUNITY_SCORE,
     PAPER_TRADES_ON_NEGATIVE_EXPECTANCY,
     RECENT_PERFORMANCE_LOOKBACK_TRADES,
     RECENT_STREAK_LOSS_MODIFIER_CAP,
     RECENT_STREAK_WIN_MODIFIER_CAP,
     RECOMMENDATION_MIN_SAMPLE_SIZE,
+    STRATEGY_PROFILES,
 )
 from src.db import models
 from src.features.feature_engine import compute_multi_timeframe_features
 from src.features.opportunity_scorer import (
-    PRIMARY_TIMEFRAME,
+    primary_timeframe,
     score_opportunity,
     select_top_candidates,
 )
@@ -117,15 +116,17 @@ def _bucket_modifier(bucket_stats_by_value: dict, value: str | None, overall_win
     return max(-BUCKET_MODIFIER_CAP, min(BUCKET_MODIFIER_CAP, raw))
 
 
-def _recent_performance_modifier(mode: str) -> float | None:
+def _recent_performance_modifier(mode: str, strategy_type: str) -> float | None:
     """Adaptive confidence chain (Step 7): current win/loss streak over
     the last RECENT_PERFORMANCE_LOOKBACK_TRADES closed trades, scaled to
     the streak length and capped — deliberately asymmetric (a losing
     streak can suppress confidence more than a winning streak inflates
-    it). Computed once per cycle, not per candidate."""
+    it). Computed once per cycle, not per candidate. Scoped to this
+    strategy_type's own trades — a swing streak shouldn't move default's
+    confidence or vice versa."""
     since = datetime.now(timezone.utc) - timedelta(hours=LEARNING_CATCHUP_LOOKBACK_HOURS)
     recent = sorted(
-        (t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None),
+        (t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None),
         key=lambda t: t["closed_at"],
     )[-RECENT_PERFORMANCE_LOOKBACK_TRADES:]
     if not recent:
@@ -185,6 +186,7 @@ def _avg_correlation_with_book(symbol: str, open_trades: list[dict], price_histo
 
 def _sweep_stop_loss_take_profit(
     mode: str,
+    strategy_type: str,
     capital_config: dict,
     version: dict,
     open_trades: list[dict],
@@ -215,7 +217,9 @@ def _sweep_stop_loss_take_profit(
             continue
 
         fill = execution_agent.place_order(trade["symbol"], "sell", trade["qty"], price)
-        _, daily_pnl = _record_close(mode, capital_config, trade, fill, daily_pnl, exit_reason_value=reason)
+        _, daily_pnl = _record_close(
+            mode, strategy_type, capital_config, trade, fill, daily_pnl, exit_reason_value=reason
+        )
         models.log_agent_event("orchestrator", "info", f"{reason} exit {trade['symbol']}")
         closed.append(trade)
         open_trades.remove(trade)
@@ -224,11 +228,16 @@ def _sweep_stop_loss_take_profit(
     return closed, daily_pnl
 
 
-def _opportunity_summary(record: dict, held: dict | None = None, historical_context: dict | None = None) -> dict:
+def _opportunity_summary(
+    record: dict,
+    held: dict | None = None,
+    historical_context: dict | None = None,
+    timeframe_weights: dict[str, float] | None = None,
+) -> dict:
     """Curated digest for the LLM — never the raw multi-timeframe feature
     dump (160+ floats), which would strain the token budget for no gain
     over what a human/LLM actually needs to judge the call."""
-    primary = record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}
+    primary = record["features_by_tf"].get(primary_timeframe(timeframe_weights)) or {}
     summary = {
         "symbol": record["symbol"],
         "last_price": record["market"]["last_price"],
@@ -269,7 +278,13 @@ def _opportunity_summary(record: dict, held: dict | None = None, historical_cont
 
 
 def _record_close(
-    mode: str, capital_config: dict, trade: dict, fill: dict, daily_pnl: dict, exit_reason_value: str | None = None
+    mode: str,
+    strategy_type: str,
+    capital_config: dict,
+    trade: dict,
+    fill: dict,
+    daily_pnl: dict,
+    exit_reason_value: str | None = None,
 ):
     pnl = (fill["fill_price"] - trade["entry_price"]) * trade["qty"] - fill["fees"] - trade["fees"]
     models.close_trade(trade["id"], fill["fill_price"], pnl, exit_reason=exit_reason_value)
@@ -287,12 +302,93 @@ def _record_close(
         trades_count=updated["trades_count"],
         target_hit=target_hit(updated, capital_config),
         circuit_breaker_triggered=updated["circuit_breaker_triggered"],
+        strategy_type=strategy_type,
     )
     return pnl, updated
 
 
 def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> dict:
-    capital_config = models.get_capital_config(mode)
+    """Loops every strategy_type with a seeded capital_config row for this
+    mode (STRATEGY_PROFILES intersected with models.get_active_strategy_types
+    — a type with no capital_config never runs, the "ships dormant" activation
+    gate), running each one's own independent scoring/entry/exit pass. The
+    market snapshot (candle fetch) and per-symbol feature computation are
+    fetched/computed ONCE and shared across every active type's scoring pass
+    — only the weighting/thresholds differ per type, not the raw candles."""
+    if execution_agent is None:
+        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
+
+    active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+    if not active_types:
+        if mode != "real":
+            # Real mode legitimately sits unconfigured for a long time
+            # (below); paper mode with NO strategy_type configured at all
+            # means seed_config.py never ran — a real setup error, still
+            # worth a loud crash rather than a silent no-op forever.
+            raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
+        return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
+
+    # Phase 1: per-type preflight (capital_config/paused/version/daily_pnl,
+    # circuit breaker, and the stop-loss/take-profit sweep) — none of this
+    # needs the market snapshot. A type that's paused/unconfigured/tripped
+    # is fully resolved here without ever fetching candles for it.
+    results = {"opened": [], "closed": [], "circuit_breaker": False, "by_strategy_type": {}}
+    ready_states: dict[str, dict] = {}
+    for strategy_type in active_types:
+        try:
+            outcome = _preflight_strategy_type(mode, strategy_type, execution_agent)
+        except Exception as e:
+            # Same per-unit fault isolation as _process_candidate below,
+            # one level up: one strategy_type's setup error must not take
+            # down every other active type's cycle.
+            models.log_agent_event(
+                "orchestrator", "error", f"strategy_type={strategy_type}: {type(e).__name__}: {e}"
+            )
+            continue
+        if outcome.get("_ready"):
+            ready_states[strategy_type] = outcome
+            continue
+        results["by_strategy_type"][strategy_type] = outcome
+        results["opened"].extend(outcome["opened"])
+        results["closed"].extend(outcome["closed"])
+        results["circuit_breaker"] = results["circuit_breaker"] or outcome["circuit_breaker"]
+
+    # Phase 2: only fetched/computed if at least one type actually needs it —
+    # every type paused/unconfigured/already-tripped this cycle means zero
+    # wasted API calls, same as the original single-strategy behavior.
+    if ready_states:
+        with track("data_agent", "market_snapshot"):
+            snapshot = get_market_snapshot(n_symbols)
+        features_by_symbol = {
+            market["symbol"]: (market, compute_multi_timeframe_features(market["candles_by_timeframe"]))
+            for market in snapshot
+        }
+        for strategy_type, state in ready_states.items():
+            try:
+                r = _score_and_process_strategy_type(mode, strategy_type, execution_agent, features_by_symbol, state)
+            except Exception as e:
+                models.log_agent_event(
+                    "orchestrator", "error", f"strategy_type={strategy_type}: {type(e).__name__}: {e}"
+                )
+                continue
+            results["by_strategy_type"][strategy_type] = r
+            results["opened"].extend(r["opened"])
+            results["closed"].extend(r["closed"])
+            results["circuit_breaker"] = results["circuit_breaker"] or r["circuit_breaker"]
+
+    log_resource_snapshot("orchestrator")
+    return results
+
+
+def _preflight_strategy_type(mode: str, strategy_type: str, execution_agent) -> dict:
+    """Everything about a strategy_type's cycle that doesn't need the
+    market snapshot: capital_config/pause/version resolution, daily_pnl,
+    the circuit breaker, and the stop-loss/take-profit sweep. Returns a
+    terminal result dict (opened/closed/circuit_breaker, cycle already
+    fully handled for this type) OR a `{"_ready": True, ...}` state dict
+    for run_cycle to hand to _score_and_process_strategy_type once the
+    shared snapshot is fetched."""
+    capital_config = models.get_capital_config(mode, strategy_type)
 
     if mode == "real":
         # Real mode is expected to sit unconfigured for a long time (no
@@ -308,81 +404,119 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         # real only ever trades the version that's actually been promoted —
         # NOT just the newest strategy_versions row, since evolution keeps
         # minting new (unvetted) paper versions after a promotion too.
-        version = models.get_latest_promoted_version()
+        version = models.get_latest_promoted_version(strategy_type)
         if version is None:
             models.log_agent_event(
-                "orchestrator", "info", "real mode: no promoted strategy version yet, skipping"
+                "orchestrator", "info",
+                f"real mode ({strategy_type}): no promoted strategy version yet, skipping",
             )
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_promoted_version"}
     else:
         if capital_config is None:
-            raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
+            raise RuntimeError(f"no capital_config row for mode={mode!r} strategy_type={strategy_type!r}")
         if capital_config.get("paused"):
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
-        version = models.get_latest_version()
+        version = models.get_latest_version(strategy_type)
         if version is None:
             # Two different situations share "no active version": never
-            # bootstrapped at all (seed_config.py never ran — a real setup
-            # error, still worth a loud crash) vs. every existing version
-            # is suspended (Strategy Health Engine, PROJECT_SPEC.md §3d —
-            # a legitimate, reversible outcome that must no-op, not
-            # crash-loop the cron every 10 minutes).
+            # bootstrapped at all for this strategy_type (seed_config.py
+            # never ran — a real setup error, still worth a loud crash) vs.
+            # every existing version is suspended (Strategy Health Engine,
+            # PROJECT_SPEC.md §3d — a legitimate, reversible outcome that
+            # must no-op, not crash-loop the cron every 10 minutes).
             if not models.get_all_strategy_versions():
                 raise RuntimeError("no strategy_versions row — create one first")
             models.log_agent_event(
-                "orchestrator", "info", "paper mode: every strategy version is suspended, skipping"
+                "orchestrator", "info",
+                f"paper mode ({strategy_type}): every strategy version is suspended, skipping",
             )
             return {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_active_version"}
 
-    if execution_agent is None:
-        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
-
-    daily_pnl = models.get_daily_pnl(today_ist(), mode) or _empty_daily_pnl()
+    daily_pnl = models.get_daily_pnl(today_ist(), mode, strategy_type) or _empty_daily_pnl()
 
     if circuit_breaker_triggered(daily_pnl, capital_config):
-        execution_agent.flatten_all(mode)
+        execution_agent.flatten_all(mode, strategy_type)
         return {"opened": [], "closed": [], "circuit_breaker": True}
 
-    open_trades = models.get_open_trades(mode)
+    open_trades = models.get_open_trades(mode, strategy_type)
     open_by_symbol = {t["symbol"]: t for t in open_trades}
 
     opened, closed = [], []
     stopped, daily_pnl = _sweep_stop_loss_take_profit(
-        mode, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
+        mode, strategy_type, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
     )
     closed.extend(stopped)
 
     if circuit_breaker_triggered(daily_pnl, capital_config):
-        execution_agent.flatten_all(mode)
+        execution_agent.flatten_all(mode, strategy_type)
         return {"opened": opened, "closed": closed, "circuit_breaker": True}
 
-    with track("data_agent", "market_snapshot"):
-        snapshot = get_market_snapshot(n_symbols)
+    return {
+        "_ready": True,
+        "capital_config": capital_config,
+        "version": version,
+        "daily_pnl": daily_pnl,
+        "open_trades": open_trades,
+        "open_by_symbol": open_by_symbol,
+        "opened": opened,
+        "closed": closed,
+    }
 
-    # Pass 1: pure, no LLM, no side effects — score every scanned symbol.
+
+def _score_and_process_strategy_type(
+    mode: str, strategy_type: str, execution_agent, features_by_symbol: dict, state: dict
+) -> dict:
+    profile = STRATEGY_PROFILES[strategy_type]
+    capital_config = state["capital_config"]
+    version = state["version"]
+    daily_pnl = state["daily_pnl"]
+    open_trades = state["open_trades"]
+    open_by_symbol = state["open_by_symbol"]
+    opened = state["opened"]
+    closed = state["closed"]
+
+    # Pass 1: pure, no LLM, no side effects — score every scanned symbol
+    # with THIS strategy_type's own weight/timeframe profile. Candles and
+    # per-timeframe features (features_by_symbol) were already fetched/
+    # computed once, shared across every active type this cycle — only
+    # the weighting pass below is per-type.
     scored = []
-    for market in snapshot:
-        features_by_tf = compute_multi_timeframe_features(market["candles_by_timeframe"])
-        scores = score_opportunity(features_by_tf)
-        scored.append(
-            {"symbol": market["symbol"], "market": market, "features_by_tf": features_by_tf, **scores}
-        )
+    for symbol, (market, features_by_tf) in features_by_symbol.items():
+        scores = score_opportunity(features_by_tf, profile["opportunity_weights"], profile["timeframe_weights"])
+        scored.append({"symbol": symbol, "market": market, "features_by_tf": features_by_tf, **scores})
 
     not_held = [r for r in scored if r["symbol"] not in open_by_symbol]
-    candidate_symbols = {r["symbol"] for r in select_top_candidates(not_held)}
+    candidate_symbols = {
+        r["symbol"]
+        for r in select_top_candidates(
+            not_held, top_n=profile["top_n_candidates"], min_score=profile["min_opportunity_score"]
+        )
+    }
 
     # Adaptive confidence chain (Step 7) inputs — fetched once per cycle,
     # not once per candidate (Step 13: cached/batched, not redundant
     # per-candidate queries). overall_win_rate uses the active version's
     # own learning_statistics bucket (already computed, already cached)
     # as the baseline regime/symbol win rates are compared against,
-    # rather than a fresh full-trades scan every cycle.
-    regime_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="market_regime")}
-    symbol_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="symbol")}
-    version_stats = {r["dimension_value"]: r for r in models.get_learning_statistics(mode, dimension_type="strategy_version")}
+    # rather than a fresh full-trades scan every cycle. Scoped to this
+    # strategy_type so its stats never blend with another type's.
+    regime_stats = {
+        r["dimension_value"]: r
+        for r in models.get_learning_statistics(mode, dimension_type="market_regime", strategy_type=strategy_type)
+    }
+    symbol_stats = {
+        r["dimension_value"]: r
+        for r in models.get_learning_statistics(mode, dimension_type="symbol", strategy_type=strategy_type)
+    }
+    version_stats = {
+        r["dimension_value"]: r
+        for r in models.get_learning_statistics(
+            mode, dimension_type="strategy_version", strategy_type=strategy_type
+        )
+    }
     overall_row = version_stats.get(str(version["id"]))
     overall_win_rate = overall_row.get("win_rate") if overall_row else None
-    recent_performance_modifier = _recent_performance_modifier(mode)
+    recent_performance_modifier = _recent_performance_modifier(mode, strategy_type)
 
     # Portfolio Intelligence + Capital Allocation inputs (PROJECT_SPEC.md
     # §3d) — built once per cycle from data already fetched this cycle
@@ -416,14 +550,18 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
         calibration_to_log = None
 
         if held is None and symbol in candidate_symbols:
-            similar = find_similar_trades(record, market_regime=record["market_regime"], mode=mode)
-            summary = _opportunity_summary(record, historical_context=similar)
+            similar = find_similar_trades(
+                record, market_regime=record["market_regime"], mode=mode, strategy_type=strategy_type
+            )
+            summary = _opportunity_summary(
+                record, historical_context=similar, timeframe_weights=profile["timeframe_weights"]
+            )
             # Reaching this branch already means the quant scorer accepted
-            # the candidate (MIN_OPPORTUNITY_SCORE/TOP_N_CANDIDATES) — no
-            # separate validation step, no LLM call.
+            # the candidate (this profile's min_opportunity_score/top_n) —
+            # no separate validation step, no LLM call.
             llm_decision = "accept"
             llm_reasoning = (
-                f"quant score {opportunity_score:.1f} >= {MIN_OPPORTUNITY_SCORE} "
+                f"quant score {opportunity_score:.1f} >= {profile['min_opportunity_score']} "
                 f"(trend={record['trend_score']:.0f} momentum={record['momentum_score']:.0f} "
                 f"volume={record['volume_score']:.0f} volatility={record['volatility_score']:.0f} "
                 f"resistance_headroom={record['risk_score']:.0f}, regime={record['market_regime']})"
@@ -469,9 +607,18 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 # spread/slippage this trade would actually incur decide
                 # whether it's worth taking — opportunity_score/confidence
                 # clearing their own gates is necessary but not sufficient.
-                atr_pct = (record["features_by_tf"].get(PRIMARY_TIMEFRAME) or {}).get("atr_pct")
+                atr_pct = (
+                    record["features_by_tf"].get(primary_timeframe(profile["timeframe_weights"])) or {}
+                ).get("atr_pct")
                 params_json = version.get("params_json") or {}
-                stop_loss_pct, take_profit_pct = resolve_exit_params(params_json, atr_pct)
+                stop_loss_pct, take_profit_pct = resolve_exit_params(
+                    params_json,
+                    atr_pct,
+                    profile["stop_loss_atr_multiplier"],
+                    profile["take_profit_atr_multiplier"],
+                    profile["exit_param_sweep_min_pct"],
+                    profile["exit_param_sweep_max_pct"],
+                )
                 win_probability_pct = (
                     calibrated["final_confidence"]
                     if calibrated["final_confidence"] is not None
@@ -515,6 +662,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                         price_history=price_history,
                         sizing_context=sizing_context,
                         stop_loss_pct=stop_loss_pct,
+                        risk_per_trade_pct=profile["risk_per_trade_pct"],
                     )
                     risk_manager_result = decision.action
                     if decision.action == "size":
@@ -547,15 +695,22 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
             else:
                 reason = f"confidence gated: {calibrated['final_confidence']:.1f} < {MIN_FINAL_CONFIDENCE}"
 
-        elif held is not None and opportunity_score is not None and opportunity_score < EXIT_SCORE_THRESHOLD:
-            # Score dropping below EXIT_SCORE_THRESHOLD is itself the exit
-            # decision — no separate validation step, no LLM call.
+        elif (
+            held is not None
+            and opportunity_score is not None
+            and opportunity_score < profile["exit_score_threshold"]
+        ):
+            # Score dropping below this profile's exit_score_threshold is
+            # itself the exit decision — no separate validation step, no
+            # LLM call.
             llm_decision = "accept"
-            llm_reasoning = f"quant score {opportunity_score:.1f} < {EXIT_SCORE_THRESHOLD} exit threshold"
+            llm_reasoning = f"quant score {opportunity_score:.1f} < {profile['exit_score_threshold']} exit threshold"
             llm_raw_response = None
 
             fill = execution_agent.place_order(symbol, "sell", held["qty"], market["last_price"])
-            _, daily_pnl = _record_close(mode, capital_config, held, fill, daily_pnl, exit_reason_value="ai_exit")
+            _, daily_pnl = _record_close(
+                mode, strategy_type, capital_config, held, fill, daily_pnl, exit_reason_value="ai_exit"
+            )
             closed.append(held)
             open_trades.remove(held)
             del open_by_symbol[symbol]
@@ -591,7 +746,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
     for record in scored:
         if circuit_breaker_triggered(daily_pnl, capital_config):
-            execution_agent.flatten_all(mode)
+            execution_agent.flatten_all(mode, strategy_type)
             break
         try:
             _process_candidate(record)
@@ -600,8 +755,7 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
                 "orchestrator", "error", f"{record['symbol']}: {type(e).__name__}: {e}"
             )
 
-    process_closed_trades(mode)
-    log_resource_snapshot("orchestrator")
+    process_closed_trades(mode, strategy_type)
 
     return {
         "opened": opened,
@@ -612,32 +766,49 @@ def run_cycle(mode: str = MODE, execution_agent=None, n_symbols: int = 10) -> di
 
 def run_risk_check(mode: str = MODE, execution_agent=None) -> dict:
     """No LLM calls, no market snapshot — just the circuit breaker and
-    the stop-loss/take-profit sweep. Meant to run on a tighter cron than
-    run_cycle (which is throttled by LLM budget), so a bad move gets cut
-    off sooner than a full 10-minute wait."""
-    capital_config = models.get_capital_config(mode)
+    the stop-loss/take-profit sweep, per active strategy_type. Meant to
+    run on a tighter cron than run_cycle (which is throttled by LLM
+    budget), so a bad move gets cut off sooner than a full 10-minute
+    wait."""
+    if execution_agent is None:
+        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
+
+    active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+    if not active_types:
+        return {"closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
+
+    results = {"closed": [], "circuit_breaker": False, "by_strategy_type": {}}
+    for strategy_type in active_types:
+        r = _run_risk_check_for_strategy_type(mode, strategy_type, execution_agent)
+        results["by_strategy_type"][strategy_type] = r
+        results["closed"].extend(r["closed"])
+        results["circuit_breaker"] = results["circuit_breaker"] or r["circuit_breaker"]
+    return results
+
+
+def _run_risk_check_for_strategy_type(mode: str, strategy_type: str, execution_agent) -> dict:
+    capital_config = models.get_capital_config(mode, strategy_type)
     if capital_config is None or capital_config.get("paused"):
         return {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}
 
     version = (
-        models.get_latest_promoted_version() if mode == "real" else models.get_latest_version()
+        models.get_latest_promoted_version(strategy_type)
+        if mode == "real"
+        else models.get_latest_version(strategy_type)
     )
     if version is None:
         return {"closed": [], "circuit_breaker": False, "skipped": "no_version"}
 
-    if execution_agent is None:
-        execution_agent = PaperExecutionAgent() if mode == "paper" else RealExecutionAgent()
-
-    daily_pnl = models.get_daily_pnl(today_ist(), mode) or _empty_daily_pnl()
+    daily_pnl = models.get_daily_pnl(today_ist(), mode, strategy_type) or _empty_daily_pnl()
 
     if circuit_breaker_triggered(daily_pnl, capital_config):
-        execution_agent.flatten_all(mode)
+        execution_agent.flatten_all(mode, strategy_type)
         return {"closed": [], "circuit_breaker": True}
 
-    open_trades = models.get_open_trades(mode)
+    open_trades = models.get_open_trades(mode, strategy_type)
     open_by_symbol = {t["symbol"]: t for t in open_trades}
     closed, daily_pnl = _sweep_stop_loss_take_profit(
-        mode, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
+        mode, strategy_type, capital_config, version, open_trades, open_by_symbol, daily_pnl, execution_agent
     )
 
     return {"closed": closed, "circuit_breaker": circuit_breaker_triggered(daily_pnl, capital_config)}

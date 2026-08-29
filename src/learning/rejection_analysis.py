@@ -19,11 +19,11 @@ def _rejection_label(row: dict) -> str:
     return row.get("risk_manager_result") or row.get("reason") or "unknown"
 
 
-def rejection_breakdown(mode: str, since: datetime | None = None) -> list[dict]:
+def rejection_breakdown(mode: str, since: datetime | None = None, strategy_type: str | None = None) -> list[dict]:
     """Ranked [{"reason", "count", "pct_of_rejections"}, ...], descending
     by count — the "Volume Filter 38%, Momentum Filter 24%..." ask."""
     since = since or (datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS))
-    rows = models.get_hold_evaluations_since(mode, since)
+    rows = models.get_hold_evaluations_since(mode, since, strategy_type)
     if not rows:
         return []
 

@@ -52,7 +52,7 @@ def _distance(a: dict, b: dict, weights: dict[str, float] | None = None) -> floa
     return math.sqrt(total) if used else None
 
 
-def _feature_importance_weights(mode: str) -> dict[str, float] | None:
+def _feature_importance_weights(mode: str, strategy_type: str = "default") -> dict[str, float] | None:
     """Reads the nightly-cached sub-score correlation weights (written by
     feature_importance.compute_subscore_correlation_weights, keyed by
     feature_name=trend_score/momentum_score/... at timeframe="blended") —
@@ -60,7 +60,7 @@ def _feature_importance_weights(mode: str) -> dict[str, float] | None:
     exists. Positive correlations only, normalized to sum 1.0; None if
     nothing's cached yet or every correlation is <= 0, in which case
     _distance() falls back to its own equal-weight default."""
-    rows = models.get_feature_importance(mode, timeframe=BLENDED_TIMEFRAME)
+    rows = models.get_feature_importance(mode, timeframe=BLENDED_TIMEFRAME, strategy_type=strategy_type)
     correlations = {
         r["feature_name"]: r["correlation_score"]
         for r in rows
@@ -77,15 +77,16 @@ def find_similar_trades(
     mode: str,
     symbol: str | None = None,
     top_n: int = SIMILARITY_TOP_N,
+    strategy_type: str = "default",
 ) -> dict:
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-    evaluations = models.get_entry_evaluations_since(mode, since)[:MAX_SIMILAR_TRADES_SCANNED]
+    evaluations = models.get_entry_evaluations_since(mode, since, strategy_type)[:MAX_SIMILAR_TRADES_SCANNED]
     if not evaluations:
         return dict(_EMPTY_RESULT)
 
     trade_ids = [e["trade_id"] for e in evaluations if e.get("trade_id")]
     trades_by_id = {t["id"]: t for t in models.get_trades_by_ids(trade_ids)}
-    weights = _feature_importance_weights(mode)
+    weights = _feature_importance_weights(mode, strategy_type)
 
     ranked = []
     for ev in evaluations:
@@ -107,7 +108,7 @@ def find_similar_trades(
     ranked.sort(key=lambda pair: pair[0])
     top = [trade for _, trade in ranked[:top_n]]
 
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else None
 
     wins = [t["pnl"] for t in top if t["pnl"] > 0]

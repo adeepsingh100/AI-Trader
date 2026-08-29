@@ -98,9 +98,9 @@ class RealExecutionAgent(ExecutionAgent):
             fees += sell_tds(fill_price * qty)
         return {"fill_price": fill_price, "fees": fees}
 
-    def flatten_all(self, mode: str) -> list[dict]:
+    def flatten_all(self, mode: str, strategy_type: str | None = None) -> list[dict]:
         closed = []
-        for trade in models.get_open_trades(mode):
+        for trade in models.get_open_trades(mode, strategy_type):
             fill = self.place_order(trade["symbol"], "sell", trade["qty"], price=trade["entry_price"])
             pnl = (fill["fill_price"] - trade["entry_price"]) * trade["qty"] - fill[
                 "fees"

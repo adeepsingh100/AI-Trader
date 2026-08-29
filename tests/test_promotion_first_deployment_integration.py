@@ -96,6 +96,7 @@ def _run(mock_evolution_models, mock_gate_models, trades, evidence, version=None
     own `from src.db import models`); build_symbol_to_pair and
     _backtest_evidence are the only other boundaries stubbed."""
     mock_evolution_models.get_capital_config.return_value = {"capital_to_use": 10000}
+    mock_evolution_models.get_active_strategy_types.return_value = ["default"]
     mock_evolution_models.get_latest_version.return_value = version or _version()
     mock_evolution_models.get_closed_trades.return_value = trades
     mock_evolution_models.get_latest_promoted_version.return_value = None  # no champion
@@ -116,7 +117,10 @@ def _run(mock_evolution_models, mock_gate_models, trades, evidence, version=None
     with ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
-        return run_evolution(mode="paper")
+        # run_evolution now returns {strategy_type: {...}} — unwrap to the
+        # single "default" type's result so every existing assertion in
+        # this file (result["promoted"], etc.) keeps working unchanged.
+        return run_evolution(mode="paper")["default"]
 
 
 # --- Phase 1: positive first-ever-promotion end-to-end ---

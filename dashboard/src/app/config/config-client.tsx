@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeToggle";
 import { STATUS } from "@/lib/palette";
 import type { CapitalConfig } from "@/lib/types";
 
@@ -110,6 +111,7 @@ const FIELDS: { key: keyof CapitalConfig; label: string }[] = [
 
 function ConfigForm() {
   const mode = useMode();
+  const strategyType = useStrategyType();
   const [config, setConfig] = useState<CapitalConfig | null | undefined>(undefined);
   const [form, setForm] = useState<Record<string, number>>({});
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -120,7 +122,7 @@ function ConfigForm() {
   useEffect(() => {
     setConfig(undefined);
     setLoadError(null);
-    fetchJson<CapitalConfig | null>(`/api/config?mode=${mode}`)
+    fetchJson<CapitalConfig | null>(`/api/config?mode=${mode}&strategy_type=${strategyType}`)
       .then((data) => {
         setConfig(data);
         if (data) {
@@ -133,13 +135,13 @@ function ConfigForm() {
         setLoadError(e instanceof Error ? e.message : String(e));
         setConfig(undefined);
       });
-  }, [mode]);
+  }, [mode, strategyType]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setStatus("saving");
     try {
-      await fetchJson(`/api/config?mode=${mode}`, {
+      await fetchJson(`/api/config?mode=${mode}&strategy_type=${strategyType}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
@@ -156,7 +158,7 @@ function ConfigForm() {
     setPauseSaving(true);
     setPauseError(null);
     try {
-      await fetchJson(`/api/config?mode=${mode}`, {
+      await fetchJson(`/api/config?mode=${mode}&strategy_type=${strategyType}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ paused: next }),
@@ -171,7 +173,10 @@ function ConfigForm() {
 
   return (
     <div className="space-y-4">
-      <ModeToggle />
+      <div className="flex items-center gap-2">
+        <StrategyTypeToggle />
+        <ModeToggle />
+      </div>
 
       {loadError && (
         <p className="text-sm rounded-lg p-3" style={{ background: "#fdecea", color: "var(--status-critical)" }}>
@@ -180,7 +185,10 @@ function ConfigForm() {
       )}
       {!loadError && config === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
       {!loadError && config === null && (
-        <p style={{ color: "var(--text-muted)" }}>No capital_config row for {mode} yet.</p>
+        <p style={{ color: "var(--text-muted)" }}>
+          No capital_config row for {mode}/{strategyType} yet
+          {strategyType !== "default" ? " — activate it with python3 -m src.seed_config" : "."}
+        </p>
       )}
 
       {config && (

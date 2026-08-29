@@ -335,10 +335,12 @@ def _evaluate_trade(trade: dict) -> dict:
     }
 
 
-def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], capital_to_use: float) -> None:
+def _update_statistics_buckets(
+    mode: str, strategy_type: str, bucket_keys: set[tuple[str, str]], capital_to_use: float
+) -> None:
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
     for dimension_type, dimension_value in bucket_keys:
-        all_recent = models.get_recently_closed_trades(mode, since)
+        all_recent = models.get_recently_closed_trades(mode, since, strategy_type)
         if dimension_type == "symbol":
             bucket_trades = [t for t in all_recent if t["symbol"] == dimension_value]
         elif dimension_type == "market_regime":
@@ -372,16 +374,19 @@ def _update_statistics_buckets(mode: str, bucket_keys: set[tuple[str, str]], cap
                     bucket_trades.append(t)
 
         stats = compute_bucket_statistics(bucket_trades, capital_to_use)
-        models.upsert_learning_statistics(mode, dimension_type, dimension_value, stats)
+        models.upsert_learning_statistics(mode, dimension_type, dimension_value, stats, strategy_type=strategy_type)
 
 
-def process_closed_trades(mode: str) -> list[dict]:
+def process_closed_trades(mode: str, strategy_type: str = "default") -> list[dict]:
     """Path-independent catch-up: finds closed trades not yet
     self-evaluated (regardless of whether they closed via the SL/TP
     sweep, an LLM-validated exit, or a circuit-breaker flatten) and
-    processes exactly those. Called once at the end of run_cycle()."""
+    processes exactly those. Called once per strategy_type at the end of
+    run_cycle()'s per-type pass — scoped so one type's stats bucket never
+    overwrites another's (learning_statistics is now keyed by
+    (mode, strategy_type, dimension_type, dimension_value))."""
     since = datetime.now(timezone.utc) - timedelta(hours=LEARNING_CATCHUP_LOOKBACK_HOURS)
-    recent = models.get_recently_closed_trades(mode, since)
+    recent = models.get_recently_closed_trades(mode, since, strategy_type)
     if not recent:
         return []
 
@@ -390,7 +395,7 @@ def process_closed_trades(mode: str) -> list[dict]:
     if not new_trades:
         return []
 
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
     touched_buckets: set[tuple[str, str]] = set()
@@ -401,7 +406,7 @@ def process_closed_trades(mode: str) -> list[dict]:
         )
         touched_buckets.update(memberships.items())
 
-    _update_statistics_buckets(mode, touched_buckets, capital_to_use)
+    _update_statistics_buckets(mode, strategy_type, touched_buckets, capital_to_use)
     return new_trades
 
 

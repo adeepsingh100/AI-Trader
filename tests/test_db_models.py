@@ -43,10 +43,11 @@ def test_upsert_daily_pnl_conflict_key(monkeypatch):
     models.upsert_daily_pnl(datetime.date(2026, 8, 15), "paper", 100.0, 3, True, False)
 
     sql, params = _last_execute(cur)
-    assert "ON CONFLICT (date, mode)" in sql
+    assert "ON CONFLICT (date, mode, strategy_type)" in sql
     row = _inserted_row(cur)
     assert row["date"] == "2026-08-15"
     assert row["mode"] == "paper"
+    assert row["strategy_type"] == "default"
 
 
 def test_log_model_usage_batches_rows(monkeypatch):
@@ -203,10 +204,11 @@ def test_upsert_learning_statistics_conflict_key(monkeypatch):
     models.upsert_learning_statistics("paper", "symbol", "BTCINR", {"win_rate": 0.5, "trades_count": 10})
 
     sql, params = _last_execute(cur)
-    assert "ON CONFLICT (mode, dimension_type, dimension_value)" in sql
+    assert "ON CONFLICT (mode, strategy_type, dimension_type, dimension_value)" in sql
     row = _inserted_row(cur)
     assert row["dimension_type"] == "symbol"
     assert row["win_rate"] == 0.5
+    assert row["strategy_type"] == "default"
 
 
 def test_get_learning_statistics_filters_by_dimension_type(monkeypatch):
@@ -231,9 +233,10 @@ def test_upsert_feature_importance_conflict_key(monkeypatch):
     models.upsert_feature_importance("paper", "rsi", 0.42, 30, "1h")
 
     sql, _ = _last_execute(cur)
-    assert "ON CONFLICT (mode, feature_name, timeframe)" in sql
+    assert "ON CONFLICT (mode, strategy_type, feature_name, timeframe)" in sql
     row = _inserted_row(cur)
     assert row["timeframe"] == "1h"
+    assert row["strategy_type"] == "default"
 
 
 def test_get_feature_importance_filters_by_timeframe(monkeypatch):
@@ -408,7 +411,7 @@ def test_get_latest_promotion_audit_filters_by_mode_and_event_type(monkeypatch):
 
     sql, params = _last_execute(cur)
     assert "mode = %s" in sql and "event_type = %s" in sql
-    assert params == ("paper", "promotion")
+    assert params == ("paper", "default", "promotion")
     assert result == {"id": 7, "decision": "PROMOTE"}
 
 
@@ -417,3 +420,56 @@ def test_get_latest_promotion_audit_returns_none_when_empty(monkeypatch):
     monkeypatch.setattr(models, "get_client", lambda: conn)
 
     assert models.get_latest_promotion_audit("paper") is None
+
+
+# --- multi-strategy-type: strategy_type=None keeps the old mode-wide
+# query byte-identical; passing a real value switches to the join-through-
+# version_id-to-strategy_versions pattern, never both at once. ---
+
+
+def test_get_open_trades_without_strategy_type_is_unchanged_mode_wide_query(monkeypatch):
+    conn, cur = _fake_connection(rows=[{"id": 1}])
+    monkeypatch.setattr(models, "get_client", lambda: conn)
+
+    models.get_open_trades("paper")
+
+    sql, params = _last_execute(cur)
+    assert "JOIN" not in sql
+    assert "trades WHERE mode = %s AND status = 'open'" in sql
+    assert params == ("paper",)
+
+
+def test_get_open_trades_with_strategy_type_joins_strategy_versions(monkeypatch):
+    conn, cur = _fake_connection(rows=[{"id": 1}])
+    monkeypatch.setattr(models, "get_client", lambda: conn)
+
+    models.get_open_trades("paper", "swing")
+
+    sql, params = _last_execute(cur)
+    assert "JOIN strategy_versions sv ON t.version_id = sv.id" in sql
+    assert "sv.strategy_type = %s" in sql
+    assert params == ("paper", "swing")
+
+
+def test_get_capital_config_filters_by_mode_and_strategy_type(monkeypatch):
+    conn, cur = _fake_connection(rows=[{"mode": "paper", "strategy_type": "swing"}])
+    monkeypatch.setattr(models, "get_client", lambda: conn)
+
+    result = models.get_capital_config("paper", "swing")
+
+    sql, params = _last_execute(cur)
+    assert "mode = %s AND strategy_type = %s" in sql
+    assert params == ("paper", "swing")
+    assert result == {"mode": "paper", "strategy_type": "swing"}
+
+
+def test_upsert_capital_config_conflict_key_is_mode_and_strategy_type(monkeypatch):
+    conn, cur = _fake_connection(rows=[])
+    monkeypatch.setattr(models, "get_client", lambda: conn)
+
+    models.upsert_capital_config("paper", 1000, 1000, 50, 100, strategy_type="swing")
+
+    sql, _ = _last_execute(cur)
+    assert "ON CONFLICT (mode, strategy_type)" in sql
+    row = _inserted_row(cur)
+    assert row["strategy_type"] == "swing"

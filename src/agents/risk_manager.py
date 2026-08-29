@@ -100,24 +100,38 @@ def exit_reason(
     return None
 
 
-def resolve_exit_params(params_json: dict, atr_pct: float | None) -> tuple[float | None, float | None]:
+def resolve_exit_params(
+    params_json: dict,
+    atr_pct: float | None,
+    stop_mult: float | None = None,
+    target_mult: float | None = None,
+    min_pct: float | None = None,
+    max_pct: float | None = None,
+) -> tuple[float | None, float | None]:
     """stop_loss_pct/take_profit_pct, preferring params_json's
     evidence-validated value (already cleared the walk-forward/bootstrap/
     fitness gate in src/learning/simulation.py — primary, unchanged) and
     falling back to an ATR-derived value ONLY for a leg params_json doesn't
     configure. None for a leg with neither a configured value nor an
     atr_pct to derive one from — same "None, not a fabricated number"
-    convention as feature_engine/opportunity_scorer throughout."""
+    convention as feature_engine/opportunity_scorer throughout.
+
+    stop_mult/target_mult/min_pct/max_pct are optional (a strategy_type's
+    STRATEGY_PROFILES entry, src/config.py) — resolved to the module
+    globals INSIDE the body, not as signature defaults, so
+    @patch(".STOP_LOSS_ATR_MULTIPLIER", ...) in existing tests keeps
+    working for the no-arg call exactly as before."""
+    stop_mult = stop_mult if stop_mult is not None else STOP_LOSS_ATR_MULTIPLIER
+    target_mult = target_mult if target_mult is not None else TAKE_PROFIT_ATR_MULTIPLIER
+    min_pct = min_pct if min_pct is not None else EXIT_PARAM_SWEEP_MIN_PCT
+    max_pct = max_pct if max_pct is not None else EXIT_PARAM_SWEEP_MAX_PCT
+
     stop_loss_pct, take_profit_pct = params_json.get("stop_loss_pct"), params_json.get("take_profit_pct")
 
     if not stop_loss_pct and atr_pct is not None:
-        stop_loss_pct = clamp(
-            atr_pct / 100 * STOP_LOSS_ATR_MULTIPLIER, EXIT_PARAM_SWEEP_MIN_PCT, EXIT_PARAM_SWEEP_MAX_PCT
-        )
+        stop_loss_pct = clamp(atr_pct / 100 * stop_mult, min_pct, max_pct)
     if not take_profit_pct and atr_pct is not None:
-        take_profit_pct = clamp(
-            atr_pct / 100 * TAKE_PROFIT_ATR_MULTIPLIER, EXIT_PARAM_SWEEP_MIN_PCT, EXIT_PARAM_SWEEP_MAX_PCT
-        )
+        take_profit_pct = clamp(atr_pct / 100 * target_mult, min_pct, max_pct)
 
     return stop_loss_pct, take_profit_pct
 
@@ -179,21 +193,26 @@ def evaluate(
     price_history: dict | None = None,
     sizing_context: dict | None = None,
     stop_loss_pct: float | None = None,
+    risk_per_trade_pct: float | None = None,
 ) -> RiskDecision:
     """symbol/portfolio_positions/price_history/sizing_context/
-    stop_loss_pct are new, additive, optional kwargs (Portfolio
-    Intelligence + Capital Allocation + risk-based sizing) — omitted
-    (every existing call site, every existing test), this function is
-    byte-identical to before. Supplied, three independent things can
-    happen: capital_config['sizing_mode'] == 'dynamic' switches the sizing
-    formula (still gated by the exact same committed_capital ceiling
-    below, never bypassing it); symbol + portfolio_positions +
-    price_history together additionally run a concentration cap check via
-    Portfolio Intelligence; stop_loss_pct additionally caps qty so no
-    single trade risks more than RISK_PER_TRADE_PCT of capital_to_use if
-    its stop is hit — a strict ADDITIONAL cap on top of whatever the
-    flat/dynamic formula already computed, so it can only shrink qty,
-    never grow it."""
+    stop_loss_pct/risk_per_trade_pct are new, additive, optional kwargs
+    (Portfolio Intelligence + Capital Allocation + risk-based sizing) —
+    omitted (every existing call site, every existing test), this
+    function is byte-identical to before. Supplied, three independent
+    things can happen: capital_config['sizing_mode'] == 'dynamic'
+    switches the sizing formula (still gated by the exact same
+    committed_capital ceiling below, never bypassing it); symbol +
+    portfolio_positions + price_history together additionally run a
+    concentration cap check via Portfolio Intelligence; stop_loss_pct
+    additionally caps qty so no single trade risks more than
+    risk_per_trade_pct (defaults to the module's RISK_PER_TRADE_PCT
+    global, resolved here rather than as a signature default so
+    existing @patch(...RISK_PER_TRADE_PCT...) tests keep working) of
+    capital_to_use if its stop is hit — a strict ADDITIONAL cap on top
+    of whatever the flat/dynamic formula already computed, so it can
+    only shrink qty, never grow it."""
+    risk_per_trade_pct = risk_per_trade_pct if risk_per_trade_pct is not None else RISK_PER_TRADE_PCT
     if circuit_breaker_triggered(daily_pnl, capital_config):
         return RiskDecision(action="block_circuit_breaker")
 
@@ -218,7 +237,7 @@ def evaluate(
     qty = trade_capital / last_price
 
     if stop_loss_pct:
-        max_risk_amount = capital_config["capital_to_use"] * (RISK_PER_TRADE_PCT / 100)
+        max_risk_amount = capital_config["capital_to_use"] * (risk_per_trade_pct / 100)
         max_qty_by_risk = max_risk_amount / (stop_loss_pct * last_price)
         qty = min(qty, max_qty_by_risk)
 

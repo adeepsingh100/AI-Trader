@@ -98,6 +98,7 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
     mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -127,7 +128,7 @@ def test_run_cycle_opens_trade_on_accepted_entry_candidate(
     assert eval_kwargs["trade_id"] == 99
     mock_models.log_confidence_calibration.assert_called_once()
     assert mock_models.log_confidence_calibration.call_args.kwargs["opportunity_evaluation_id"] == 501
-    mock_process.assert_called_once_with("paper")
+    mock_process.assert_called_once_with("paper", "default")
 
 
 @patch("src.orchestrator.PAPER_TRADES_ON_NEGATIVE_EXPECTANCY", False)
@@ -147,6 +148,7 @@ def test_run_cycle_net_expectancy_gate_blocks_entry_despite_high_score(
     # spread/slippage — net expectancy is negative regardless of win
     # probability, so no order should ever be placed.
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version()
     version["params_json"] = {"stop_loss_pct": 0.10, "take_profit_pct": 0.01}
     mock_models.get_latest_version.return_value = version
@@ -184,6 +186,7 @@ def test_run_cycle_paper_mode_trades_through_negative_expectancy_by_default(
     # at its true default — paper mode still opens the trade so it can
     # accumulate the evidence real mode's stricter gate never lets through.
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version()
     version["params_json"] = {"stop_loss_pct": 0.10, "take_profit_pct": 0.01}
     mock_models.get_latest_version.return_value = version
@@ -218,6 +221,7 @@ def test_run_cycle_skips_symbol_not_in_candidate_set(
     mock_snapshot, mock_models, mock_score, mock_select, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -253,6 +257,7 @@ def test_run_cycle_llm_accepts_but_risk_manager_blocks_max_positions(
     # max_positions block on a NEW entry candidate, not the sweep.
     mock_ticker.return_value = [{"market": "ETHINR", "last_price": 10}, {"market": "SOLINR", "last_price": 10}]
     mock_models.get_capital_config.return_value = _capital_config(max_concurrent_positions=2)
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [
@@ -286,6 +291,7 @@ def test_run_cycle_confidence_gate_blocks_despite_llm_accept(
     mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -329,6 +335,7 @@ def test_run_cycle_closes_held_position_when_score_drops_below_exit_threshold(
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [held]
@@ -363,6 +370,7 @@ def test_run_cycle_no_exit_when_score_above_threshold(
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [held]
@@ -392,6 +400,7 @@ def test_run_cycle_no_exit_when_score_unavailable(
     mock_ticker.return_value = []
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 990_000, "fees": 1.0}
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [held]
@@ -420,6 +429,7 @@ def test_run_cycle_stop_loss_sweep_closes_before_scoring_pass_considers_it(
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 1_000_000, "fees": 0}
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 970_000}]
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version()
     version["params_json"] = {"stop_loss_pct": 0.02}
     mock_models.get_latest_version.return_value = version
@@ -454,6 +464,7 @@ def test_run_cycle_sweep_leaves_position_alone_when_no_leg_hit(
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 1_000_000, "fees": 0}
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 995_000}]  # -0.5%, under 2% SL
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version()
     version["params_json"] = {"stop_loss_pct": 0.02}
     mock_models.get_latest_version.return_value = version
@@ -481,6 +492,7 @@ def test_run_cycle_flattens_and_skips_when_breaker_already_triggered(
     mock_snapshot, mock_models, mock_score, mock_select
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = {
         "realized_pnl": -2000,
@@ -491,9 +503,14 @@ def test_run_cycle_flattens_and_skips_when_breaker_already_triggered(
     execution_agent = Mock()
     result = run_cycle(execution_agent=execution_agent)
 
-    execution_agent.flatten_all.assert_called_once_with("paper")
+    execution_agent.flatten_all.assert_called_once_with("paper", "default")
     mock_snapshot.assert_not_called()
-    assert result == {"opened": [], "closed": [], "circuit_breaker": True}
+    assert result == {
+        "opened": [],
+        "closed": [],
+        "circuit_breaker": True,
+        "by_strategy_type": {"default": {"opened": [], "closed": [], "circuit_breaker": True}},
+    }
 
 
 @patch("src.orchestrator.process_closed_trades")
@@ -509,6 +526,7 @@ def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
     held = {"id": 5, "symbol": "ETHINR", "qty": 1, "entry_price": 200_000, "fees": 0}
     cfg = _capital_config(max_daily_loss=100)
     mock_models.get_capital_config.return_value = cfg
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [held]
@@ -529,7 +547,7 @@ def test_run_cycle_trips_breaker_mid_cycle_and_stops_further_processing(
     assert result["circuit_breaker"] is True
     assert result["closed"] == [held]
     assert result["opened"] == []
-    execution_agent.flatten_all.assert_called_once_with("paper")
+    execution_agent.flatten_all.assert_called_once_with("paper", "default")
     # BTCINR's entry must never have been attempted — only ETHINR got processed
     assert mock_models.log_opportunity_evaluation.call_count == 1
     buy_calls = [c for c in execution_agent.place_order.call_args_list if c.args[1] == "buy"]
@@ -548,6 +566,7 @@ def test_run_cycle_logs_every_scanned_symbol(
     mock_snapshot, mock_models, mock_score, mock_select, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -559,7 +578,7 @@ def test_run_cycle_logs_every_scanned_symbol(
     run_cycle(execution_agent=execution_agent)
 
     assert mock_models.log_opportunity_evaluation.call_count == 2
-    mock_process.assert_called_once_with("paper")
+    mock_process.assert_called_once_with("paper", "default")
 
 
 # --- per-symbol fault isolation (Resilience, PROJECT_SPEC.md §3d) ---
@@ -580,6 +599,7 @@ def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
     processed even though the cycle is otherwise safe to retry from a
     clean DB-read state."""
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -606,7 +626,7 @@ def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
     )
     # process_closed_trades still runs at the end — the cycle completed,
     # it didn't abort.
-    mock_process.assert_called_once_with("paper")
+    mock_process.assert_called_once_with("paper", "default")
 
 
 # --- real mode / paused / promoted-version routing (unaffected by scoring) ---
@@ -615,6 +635,7 @@ def test_run_cycle_one_symbol_exception_does_not_abort_remaining_symbols(
 @patch("src.orchestrator.models")
 def test_run_cycle_defaults_to_real_execution_agent_when_promoted(mock_models):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_promoted_version.return_value = {
         "id": 9,
         "version_number": 5,
@@ -630,13 +651,14 @@ def test_run_cycle_defaults_to_real_execution_agent_when_promoted(mock_models):
         result = run_cycle(mode="real")
 
     mock_real_agent_cls.assert_called_once_with()
-    mock_real_agent_cls.return_value.flatten_all.assert_called_once_with("real")
+    mock_real_agent_cls.return_value.flatten_all.assert_called_once_with("real", "default")
     assert result["circuit_breaker"] is True
 
 
 @patch("src.orchestrator.models")
 def test_run_cycle_real_mode_noop_when_nothing_promoted(mock_models):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_promoted_version.return_value = None
 
     result = run_cycle(mode="real")
@@ -645,7 +667,9 @@ def test_run_cycle_real_mode_noop_when_nothing_promoted(mock_models):
         "opened": [],
         "closed": [],
         "circuit_breaker": False,
-        "skipped": "no_promoted_version",
+        "by_strategy_type": {
+            "default": {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_promoted_version"}
+        },
     }
     mock_models.log_agent_event.assert_called_once()
 
@@ -653,6 +677,7 @@ def test_run_cycle_real_mode_noop_when_nothing_promoted(mock_models):
 @patch("src.orchestrator.models")
 def test_run_cycle_real_mode_noop_when_no_capital_config(mock_models):
     mock_models.get_capital_config.return_value = None
+    mock_models.get_active_strategy_types.return_value = ["default"]
 
     result = run_cycle(mode="real")
 
@@ -660,7 +685,9 @@ def test_run_cycle_real_mode_noop_when_no_capital_config(mock_models):
         "opened": [],
         "closed": [],
         "circuit_breaker": False,
-        "skipped": "no_capital_config",
+        "by_strategy_type": {
+            "default": {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "no_capital_config"}
+        },
     }
     mock_models.get_latest_promoted_version.assert_not_called()
 
@@ -671,10 +698,16 @@ def test_run_cycle_paper_paused_skips_without_touching_scoring(
     mock_models, mock_snapshot
 ):
     mock_models.get_capital_config.return_value = _capital_config(paused=True)
+    mock_models.get_active_strategy_types.return_value = ["default"]
 
     result = run_cycle(mode="paper")
 
-    assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
+    assert result == {
+        "opened": [],
+        "closed": [],
+        "circuit_breaker": False,
+        "by_strategy_type": {"default": {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}},
+    }
     mock_models.get_latest_version.assert_not_called()
     mock_snapshot.assert_not_called()
 
@@ -685,10 +718,16 @@ def test_run_cycle_real_paused_skips_without_touching_scoring(
     mock_models, mock_snapshot
 ):
     mock_models.get_capital_config.return_value = _capital_config(paused=True)
+    mock_models.get_active_strategy_types.return_value = ["default"]
 
     result = run_cycle(mode="real")
 
-    assert result == {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}
+    assert result == {
+        "opened": [],
+        "closed": [],
+        "circuit_breaker": False,
+        "by_strategy_type": {"default": {"opened": [], "closed": [], "circuit_breaker": False, "skipped": "paused"}},
+    }
     mock_models.get_latest_promoted_version.assert_not_called()
     mock_snapshot.assert_not_called()
 
@@ -712,6 +751,7 @@ def test_run_cycle_real_mode_uses_promoted_version_not_latest(
         "params_json": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04},
     }
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_promoted_version.return_value = promoted_version
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -729,7 +769,7 @@ def test_run_cycle_real_mode_uses_promoted_version_not_latest(
 
     assert mock_models.open_trade.call_args.kwargs["version_id"] == 3
     mock_models.get_latest_version.assert_not_called()
-    mock_process.assert_called_once_with("real")
+    mock_process.assert_called_once_with("real", "default")
 
 
 # --- run_risk_check: unaffected by this refactor (no LLM, no scoring at all) ---
@@ -741,6 +781,7 @@ def test_run_risk_check_closes_stop_loss_hit_without_touching_llm(mock_models, m
     held = {"id": 5, "symbol": "BTCINR", "qty": 0.001, "entry_price": 1_000_000, "fees": 0}
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 970_000}]
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     version = _version()
     version["params_json"] = {"stop_loss_pct": 0.02}
     mock_models.get_latest_version.return_value = version
@@ -759,17 +800,28 @@ def test_run_risk_check_closes_stop_loss_hit_without_touching_llm(mock_models, m
 @patch("src.orchestrator.models")
 def test_run_risk_check_skips_when_paused_or_unconfigured(mock_models):
     mock_models.get_capital_config.return_value = None
+    mock_models.get_active_strategy_types.return_value = ["default"]
     result = run_risk_check()
-    assert result == {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}
+    assert result == {
+        "closed": [],
+        "circuit_breaker": False,
+        "by_strategy_type": {"default": {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}},
+    }
 
     mock_models.get_capital_config.return_value = _capital_config(paused=True)
+    mock_models.get_active_strategy_types.return_value = ["default"]
     result = run_risk_check()
-    assert result == {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}
+    assert result == {
+        "closed": [],
+        "circuit_breaker": False,
+        "by_strategy_type": {"default": {"closed": [], "circuit_breaker": False, "skipped": "not_configured_or_paused"}},
+    }
 
 
 @patch("src.orchestrator.models")
 def test_run_risk_check_flattens_when_breaker_already_tripped(mock_models):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = {
         "realized_pnl": -2000,
@@ -780,8 +832,12 @@ def test_run_risk_check_flattens_when_breaker_already_tripped(mock_models):
     execution_agent = Mock()
     result = run_risk_check(execution_agent=execution_agent)
 
-    execution_agent.flatten_all.assert_called_once_with("paper")
-    assert result == {"closed": [], "circuit_breaker": True}
+    execution_agent.flatten_all.assert_called_once_with("paper", "default")
+    assert result == {
+        "closed": [],
+        "circuit_breaker": True,
+        "by_strategy_type": {"default": {"closed": [], "circuit_breaker": True}},
+    }
 
 
 # --- MFE/MAE excursion tracking (via the shared sweep, both cadences) ---
@@ -796,6 +852,7 @@ def test_run_risk_check_updates_excursion_for_open_trades(mock_models, mock_tick
     }
     mock_ticker.return_value = [{"market": "BTCINR", "last_price": 1_010_000}]  # +1% favorable
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = [held]
@@ -845,7 +902,7 @@ def test_recent_performance_modifier_full_winning_streak_hits_cap(mock_models):
         {"pnl": 10, "closed_at": f"2026-01-0{i}T00:00:00Z"} for i in range(1, 5)
     ]
     mock_models.get_recently_closed_trades.return_value = trades
-    assert _recent_performance_modifier("paper") == pytest.approx(8.0)
+    assert _recent_performance_modifier("paper", "default") == pytest.approx(8.0)
 
 
 @patch("src.orchestrator.RECENT_STREAK_WIN_MODIFIER_CAP", 8)
@@ -861,13 +918,13 @@ def test_recent_performance_modifier_partial_losing_streak_scales_below_cap(mock
     ]
     mock_models.get_recently_closed_trades.return_value = trades
     # current streak = 2 losses out of a 4-trade lookback -> half the cap
-    assert _recent_performance_modifier("paper") == pytest.approx(-8.0)
+    assert _recent_performance_modifier("paper", "default") == pytest.approx(-8.0)
 
 
 @patch("src.orchestrator.models")
 def test_recent_performance_modifier_none_when_no_recent_trades(mock_models):
     mock_models.get_recently_closed_trades.return_value = []
-    assert _recent_performance_modifier("paper") is None
+    assert _recent_performance_modifier("paper", "default") is None
 
 
 @patch("src.orchestrator.process_closed_trades")
@@ -881,6 +938,7 @@ def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
     mock_snapshot, mock_models, mock_score, mock_select, mock_similar, mock_calibrate, mock_process
 ):
     mock_models.get_capital_config.return_value = _capital_config()
+    mock_models.get_active_strategy_types.return_value = ["default"]
     mock_models.get_latest_version.return_value = _version()
     mock_models.get_daily_pnl.return_value = None
     mock_models.get_open_trades.return_value = []
@@ -892,7 +950,7 @@ def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
     mock_similar.return_value = _empty_similar()
     mock_calibrate.return_value = _permissive_calibration()
 
-    def _learning_stats(mode, dimension_type=None):
+    def _learning_stats(mode, dimension_type=None, strategy_type=None):
         if dimension_type == "market_regime":
             return [{"dimension_value": "strong_bull", "win_rate": 0.8, "trades_count": 50}]
         if dimension_type == "symbol":
@@ -913,3 +971,36 @@ def test_run_cycle_passes_regime_and_symbol_modifiers_into_calibration(
     # default BUCKET_MODIFIER_SENSITIVITY=20 -> (0.8-0.5)*20=6.0, (0.7-0.5)*20=4.0
     assert calibrate_kwargs["regime_modifier"] == pytest.approx(6.0)
     assert calibrate_kwargs["symbol_modifier"] == pytest.approx(4.0)
+
+
+# --- multi-strategy-type: two active types share one market snapshot ---
+
+
+@patch("src.orchestrator.process_closed_trades")
+@patch("src.orchestrator.select_top_candidates")
+@patch("src.orchestrator.score_opportunity")
+@patch("src.orchestrator.models")
+@patch("src.orchestrator.get_market_snapshot")
+def test_run_cycle_two_active_strategy_types_share_one_market_snapshot_fetch(
+    mock_snapshot, mock_models, mock_score, mock_select, mock_process
+):
+    mock_models.get_active_strategy_types.return_value = ["default", "swing"]
+    mock_models.get_capital_config.side_effect = lambda mode, strategy_type: _capital_config()
+    mock_models.get_latest_version.side_effect = lambda strategy_type: _version(id=1 if strategy_type == "default" else 2)
+    mock_models.get_daily_pnl.return_value = None
+    mock_models.get_open_trades.return_value = []
+    mock_models.get_learning_statistics.return_value = []
+    mock_models.get_recently_closed_trades.return_value = []
+    mock_snapshot.return_value = [_market()]
+    mock_score.return_value = _scores(85)
+    mock_select.return_value = []  # no candidates -> every symbol just logs "not_a_candidate"
+
+    result = run_cycle()
+
+    mock_snapshot.assert_called_once()
+    assert set(result["by_strategy_type"].keys()) == {"default", "swing"}
+    # Each type's own version_id ends up on its own opportunity_evaluation rows.
+    version_ids_logged = {
+        call.kwargs["version_id"] for call in mock_models.log_opportunity_evaluation.call_args_list
+    }
+    assert version_ids_logged == {1, 2}

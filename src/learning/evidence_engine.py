@@ -57,12 +57,14 @@ class EvidenceEngine:
     """Never executes a trade, never modifies a strategy or config — a
     pure measurement pass over what's already been observed."""
 
-    def collect(self, mode: str) -> dict:
+    def collect(self, mode: str, strategy_type: str = "default") -> dict:
         since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-        closed = [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
-        evaluations = models.get_opportunity_evaluations_for_trail(mode, since=since)
-        feature_rows = models.get_feature_importance(mode)
-        stats_rows = models.get_learning_statistics(mode)
+        closed = [
+            t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None
+        ]
+        evaluations = models.get_opportunity_evaluations_for_trail(mode, since=since, strategy_type=strategy_type)
+        feature_rows = models.get_feature_importance(mode, strategy_type=strategy_type)
+        stats_rows = models.get_learning_statistics(mode, strategy_type=strategy_type)
 
         winning = sum(1 for t in closed if t["pnl"] > 0)
         exit_reasons_seen = {t["exit_reason"] for t in closed if t.get("exit_reason")}

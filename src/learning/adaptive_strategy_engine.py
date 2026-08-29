@@ -41,7 +41,7 @@ either way, just without a simulated adaptive_strategy_versions candidate."""
 
 from __future__ import annotations
 
-from src.config import FEATURE_TIMEFRAMES
+from src.config import FEATURE_TIMEFRAMES, STRATEGY_PROFILES
 from src.db import models
 from src.learning.feature_importance import compute_feature_importance
 from src.learning.recommendations import (
@@ -63,7 +63,7 @@ from src.learning.simulation import (
 from src.learning.weakness_detection import identify_weaknesses
 
 
-def _build_symbol_to_pair(mode: str) -> dict[str, str] | None:
+def _build_symbol_to_pair(mode: str, strategy_type: str = "default") -> dict[str, str] | None:
     """Best-effort mapping for simulate_exit_params_recommendation's
     optional backtest-replay validation — the one thing in this otherwise
     pure-statistics module that touches the network. Fails open (None) on
@@ -75,7 +75,7 @@ def _build_symbol_to_pair(mode: str) -> dict[str, str] | None:
 
     try:
         since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-        trades = models.get_recently_closed_trades(mode, since)
+        trades = models.get_recently_closed_trades(mode, since, strategy_type)
         symbols = sorted({t["symbol"] for t in trades if t.get("symbol")})
         if not symbols:
             return None
@@ -94,36 +94,51 @@ class AdaptiveStrategyEngine:
     for the full invariant statement."""
 
     def analyze(self, mode: str = "paper") -> dict:
+        """Loops every strategy_type with a seeded capital_config row for
+        this mode (same "ships dormant" activation gate as orchestrator/
+        evolution_agent) — returns {strategy_type: {...}}."""
+        active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+        return {strategy_type: self._analyze_for_strategy_type(mode, strategy_type) for strategy_type in active_types}
+
+    def _analyze_for_strategy_type(self, mode: str, strategy_type: str) -> dict:
         # Computed once, threaded into every generator/simulator below —
         # each accepts status=None and would compute its own otherwise,
         # but that would mean 8 redundant EvidenceEngine passes per run.
-        status = compute_learning_status(mode)
-        weaknesses = identify_weaknesses(mode)
-        rejections = rejection_breakdown(mode)
+        status = compute_learning_status(mode, strategy_type)
+        weaknesses = identify_weaknesses(mode, strategy_type)
+        rejections = rejection_breakdown(mode, strategy_type=strategy_type)
 
-        weight_recs = generate_weight_recommendations(mode, status=status)
-        regime_recs = generate_regime_recommendations(mode, status=status)
-        symbol_recs = generate_symbol_recommendations(mode, status=status)
-        indicator_recs = generate_indicator_bucket_recommendations(mode, status=status)
-        threshold_recs = generate_recommendations(mode, weakness_context=weaknesses, status=status)
-        exit_params_recs = generate_exit_params_recommendations(mode, status=status)
-        ai_exit_params_recs = generate_ai_exit_params_recommendations(mode, status=status)
-        timeframe_importance = compute_feature_importance(mode, timeframes=FEATURE_TIMEFRAMES)
+        weight_recs = generate_weight_recommendations(mode, status=status, strategy_type=strategy_type)
+        regime_recs = generate_regime_recommendations(mode, status=status, strategy_type=strategy_type)
+        symbol_recs = generate_symbol_recommendations(mode, status=status, strategy_type=strategy_type)
+        indicator_recs = generate_indicator_bucket_recommendations(mode, status=status, strategy_type=strategy_type)
+        threshold_recs = generate_recommendations(
+            mode, weakness_context=weaknesses, status=status, strategy_type=strategy_type
+        )
+        exit_params_recs = generate_exit_params_recommendations(mode, status=status, strategy_type=strategy_type)
+        ai_exit_params_recs = generate_ai_exit_params_recommendations(
+            mode, status=status, strategy_type=strategy_type
+        )
+        timeframe_importance = compute_feature_importance(
+            mode, timeframes=FEATURE_TIMEFRAMES, strategy_type=strategy_type
+        )
 
         simulations = []
         if weight_recs:
             batch_id = weight_recs[0].get("batch_id")
-            weight_simulation = simulate_weight_recommendation(mode, batch_id, status=status)
+            weight_simulation = simulate_weight_recommendation(mode, batch_id, status=status, strategy_type=strategy_type)
             if weight_simulation is not None:
                 simulations.append(weight_simulation)
         if threshold_recs:
-            threshold_simulation = simulate_threshold_recommendation(mode, status=status)
+            threshold_simulation = simulate_threshold_recommendation(mode, status=status, strategy_type=strategy_type)
             if threshold_simulation is not None:
                 simulations.append(threshold_simulation)
         if exit_params_recs or ai_exit_params_recs:
-            symbol_to_pair = _build_symbol_to_pair(mode)
+            symbol_to_pair = _build_symbol_to_pair(mode, strategy_type)
             simulations.extend(
-                simulate_exit_params_recommendation(mode, symbol_to_pair=symbol_to_pair, status=status)
+                simulate_exit_params_recommendation(
+                    mode, symbol_to_pair=symbol_to_pair, status=status, strategy_type=strategy_type
+                )
             )
 
         candidates_created = sum(1 for s in simulations if s.get("passed"))
@@ -131,7 +146,7 @@ class AdaptiveStrategyEngine:
         models.log_agent_event(
             "adaptive_strategy_engine",
             "info",
-            f"stage={status.stage} trades_collected={status.trades_collected} "
+            f"strategy_type={strategy_type} stage={status.stage} trades_collected={status.trades_collected} "
             f"evidence_readiness={status.evidence_readiness_pct:.0f}% "
             f"weight_recs={len(weight_recs)} regime_recs={len(regime_recs)} "
             f"symbol_recs={len(symbol_recs)} indicator_recs={len(indicator_recs)} "

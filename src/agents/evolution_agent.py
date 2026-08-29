@@ -36,6 +36,7 @@ from src.config import (
     PROMOTION_MAX_DRAWDOWN_PCT,
     PROMOTION_MIN_CUMULATIVE_PNL,
     PROMOTION_MIN_PAPER_DAYS,
+    STRATEGY_PROFILES,
 )
 from src.db import models
 from src.resilience import log_fail_open
@@ -86,25 +87,69 @@ def promotion_ready(version: dict, metrics: dict) -> bool:
 
 
 def run_evolution(mode: str = "paper") -> dict:
-    """Promotion monitor for the one live strategy_versions row — no LLM
-    call, no new version creation (that's adaptive_strategy_engine.py's
-    candidate pipeline). Delegates the actual decision to
-    src/learning/promotion_gate.py::evaluate_promotion — PROMOTE auto-
-    flips promoted_to_real, no human click, but only once every gate
-    there (sample sizes, risk/statistical/Monte-Carlo, regime/symbol
-    robustness, champion improvement) clears; REJECT/EXTEND_VALIDATION
+    """Promotion monitor, looped over every strategy_type with a seeded
+    capital_config row for this mode (same "ships dormant" activation gate
+    as orchestrator.run_cycle — a type with no capital_config never runs).
+    Data Retention is global (not per-strategy_type — it's disk management,
+    not a learning concern) and runs once regardless of how many types are
+    active. Returns {strategy_type: {...}} — see _run_evolution_for_strategy_type
+    for what each entry contains."""
+    active_types = [t for t in models.get_active_strategy_types(mode) if t in STRATEGY_PROFILES]
+    if not active_types:
+        raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
+
+    results = {}
+    for strategy_type in active_types:
+        results[strategy_type] = _run_evolution_for_strategy_type(mode, strategy_type)
+
+    # Data Retention (runs hourly, piggybacked on this already-scheduled
+    # step rather than a new cron job — see src/db/models.py::purge_old_data
+    # and src/config.py's Data Retention section). Fails open: a purge
+    # error must never block the promotion-monitor logic above it. Global,
+    # not per-strategy_type -- these tables aren't strategy-scoped filters,
+    # they're disk-management cutoffs across the whole table.
+    try:
+        now = datetime.now(timezone.utc)
+        learning_cutoff = now - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
+        operational_cutoff = now - timedelta(days=OPERATIONAL_LOG_RETENTION_DAYS)
+        purged = models.purge_old_data(
+            {
+                "opportunity_evaluations": learning_cutoff,
+                "confidence_calibration": learning_cutoff,
+                "agent_logs": operational_cutoff,
+                "model_usage": operational_cutoff,
+                "system_metrics": operational_cutoff,
+                "data_quality_log": operational_cutoff,
+            }
+        )
+        if any(purged.values()):
+            models.log_agent_event("evolution_agent", "info", f"data retention purge: {purged}")
+    except Exception as e:
+        log_fail_open("evolution_agent.purge_old_data", e)
+
+    return results
+
+
+def _run_evolution_for_strategy_type(mode: str, strategy_type: str) -> dict:
+    """Promotion monitor for the one live strategy_versions row of this
+    strategy_type — no LLM call, no new version creation (that's
+    adaptive_strategy_engine.py's candidate pipeline). Delegates the
+    actual decision to src/learning/promotion_gate.py::evaluate_promotion —
+    PROMOTE auto-flips promoted_to_real, no human click, but only once
+    every gate there (sample sizes, risk/statistical/Monte-Carlo, regime/
+    symbol robustness, champion improvement) clears; REJECT/EXTEND_VALIDATION
     leave the version exactly as it was. Every evaluation (not just a
     promotion) is written to promotion_audit — see that function's
     docstring for the full gate list. trades are scoped to this specific
     version's own history, so a freshly created version always starts its
     own PROMOTION_MIN_PAPER_DAYS clock at zero regardless."""
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     if capital_config is None:
-        raise RuntimeError(f"no capital_config row for mode={mode!r} — insert one first")
+        raise RuntimeError(f"no capital_config row for mode={mode!r} strategy_type={strategy_type!r}")
 
-    version = models.get_latest_version()
+    version = models.get_latest_version(strategy_type)
     if version is None:
-        raise RuntimeError("no strategy_versions row — create one first")
+        raise RuntimeError(f"no strategy_versions row for strategy_type={strategy_type!r} — create one first")
 
     trades = models.get_closed_trades(mode, version["id"])
     metrics = compute_metrics(trades, capital_config["capital_to_use"])
@@ -125,10 +170,16 @@ def run_evolution(mode: str = "paper") -> dict:
     promoted = False
     decision = None
     if mode == "paper" and not version["promoted_to_real"]:
-        champion = models.get_latest_promoted_version()
-        symbol_to_pair = build_symbol_to_pair(mode)
+        champion = models.get_latest_promoted_version(strategy_type)
+        symbol_to_pair = build_symbol_to_pair(mode, strategy_type)
         decision = evaluate_promotion(
-            mode, version, trades, capital_config["capital_to_use"], champion=champion, symbol_to_pair=symbol_to_pair
+            mode,
+            version,
+            trades,
+            capital_config["capital_to_use"],
+            champion=champion,
+            symbol_to_pair=symbol_to_pair,
+            strategy_type=strategy_type,
         )
         eligible = decision.decision == "PROMOTE"
         if eligible != version.get("promotion_eligible"):
@@ -147,37 +198,16 @@ def run_evolution(mode: str = "paper") -> dict:
             gates=decision.gates,
             breakdown=decision.breakdown,
             reasons=decision.reasons,
+            strategy_type=strategy_type,
         )
 
-    learning_status = compute_learning_status(mode)
-
-    # Data Retention (runs hourly, piggybacked on this already-scheduled
-    # step rather than a new cron job — see src/db/models.py::purge_old_data
-    # and src/config.py's Data Retention section). Fails open: a purge
-    # error must never block the promotion-monitor logic above it.
-    try:
-        now = datetime.now(timezone.utc)
-        learning_cutoff = now - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-        operational_cutoff = now - timedelta(days=OPERATIONAL_LOG_RETENTION_DAYS)
-        purged = models.purge_old_data(
-            {
-                "opportunity_evaluations": learning_cutoff,
-                "confidence_calibration": learning_cutoff,
-                "agent_logs": operational_cutoff,
-                "model_usage": operational_cutoff,
-                "system_metrics": operational_cutoff,
-                "data_quality_log": operational_cutoff,
-            }
-        )
-        if any(purged.values()):
-            models.log_agent_event("evolution_agent", "info", f"data retention purge: {purged}")
-    except Exception as e:
-        log_fail_open("evolution_agent.purge_old_data", e)
+    learning_status = compute_learning_status(mode, strategy_type)
 
     models.log_agent_event(
         "evolution_agent",
         "info",
-        f"stage={learning_status.stage} trades_collected={learning_status.trades_collected} "
+        f"strategy_type={strategy_type} stage={learning_status.stage} "
+        f"trades_collected={learning_status.trades_collected} "
         f"evidence_readiness={learning_status.evidence_readiness_pct:.0f}% "
         f"metrics={metrics} fitness_score={fitness['fitness_score']} "
         f"promotion_decision={decision.decision if decision else 'n/a'} promotion_eligible={eligible}"

@@ -217,7 +217,7 @@ def test_simulate_exit_params_recommendation_skips_leg_with_no_pending_recommend
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_models, mock_bootstrap):
-    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name, strategy_type=None: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
         else None
@@ -269,7 +269,7 @@ def test_simulate_exit_params_recommendation_passes_and_creates_candidate(mock_m
 @patch("src.learning.simulation.RECOMMENDATION_MIN_SAMPLE_SIZE", 2)
 @patch("src.learning.simulation.models")
 def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_zero(mock_models, mock_bootstrap):
-    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name, strategy_type=None: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
         else None
@@ -305,7 +305,7 @@ def test_simulate_exit_params_recommendation_rejected_when_bootstrap_ci_crosses_
 def test_simulate_exit_params_recommendation_skips_backtest_replay_without_candle_data(
     mock_models, mock_bootstrap, mock_has_candles
 ):
-    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name, strategy_type=None: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
         else None
@@ -350,7 +350,7 @@ def test_simulate_exit_params_recommendation_defers_candidate_below_validation_s
     below 500) — the strategy_simulations row still honestly records
     passed=True, but no adaptive_strategy_versions candidate is created,
     and the research note explains why."""
-    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name, strategy_type=None: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
         else None
@@ -387,7 +387,7 @@ def test_simulate_exit_params_recommendation_defers_candidate_below_validation_s
 def test_simulate_exit_params_recommendation_backtest_replay_rejects_when_baseline_wins(
     mock_models, mock_bootstrap, mock_has_candles, mock_replay
 ):
-    mock_models.get_latest_recommendation.side_effect = lambda mode, name: (
+    mock_models.get_latest_recommendation.side_effect = lambda mode, name, strategy_type=None: (
         {"recommended_value": 0.02, "status": "pending", "batch_id": None, "rationale": "tight stop hypothesis"}
         if name == "stop_loss_pct"
         else None
@@ -434,6 +434,7 @@ def test_activate_exit_params_candidate_merges_onto_current_params(mock_models):
         prompt_text="current prompt",
         params_json={"take_profit_pct": 0.05, "stop_loss_pct": 0.02},
         notes="Auto-activated from adaptive_strategy_versions candidate 42 (fitness=70.0).",
+        strategy_type="default",
     )
     mock_models.log_agent_event.assert_called_once()
 

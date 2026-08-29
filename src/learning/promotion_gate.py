@@ -259,7 +259,7 @@ class PromotionDecision:
     breakdown: dict = field(default_factory=dict)
 
 
-def build_symbol_to_pair(mode: str) -> dict[str, str] | None:
+def build_symbol_to_pair(mode: str, strategy_type: str | None = None) -> dict[str, str] | None:
     """Best-effort mapping for the backtest-replay-based gates below — the
     one thing in this otherwise pure-statistics module that touches the
     network. Fails open (None) on any error (CoinDCX outage, unknown
@@ -270,7 +270,7 @@ def build_symbol_to_pair(mode: str) -> dict[str, str] | None:
     a helper back out of it here would point the dependency the wrong way."""
     try:
         since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-        trades = models.get_recently_closed_trades(mode, since)
+        trades = models.get_recently_closed_trades(mode, since, strategy_type)
         symbols = sorted({t["symbol"] for t in trades if t.get("symbol")})
         if not symbols:
             return None
@@ -397,8 +397,8 @@ def _paired_champion_comparison(champion_result: dict, candidate_result: dict) -
     }
 
 
-def _cooldown_gate(mode: str) -> dict:
-    latest = models.get_latest_promotion_audit(mode, event_type="promotion")
+def _cooldown_gate(mode: str, strategy_type: str = "default") -> dict:
+    latest = models.get_latest_promotion_audit(mode, event_type="promotion", strategy_type=strategy_type)
     if latest is None:
         return {"passed": True, "detail": "no prior promotion"}
     last_time = _parse_ts(latest["created_at"])
@@ -879,6 +879,7 @@ def evaluate_promotion(
     capital_to_use: float,
     champion: dict | None = None,
     symbol_to_pair: dict[str, str] | None = None,
+    strategy_type: str = "default",
 ) -> PromotionDecision:
     """The single entry point evolution_agent.py calls. `trades` is the
     candidate's own closed trades (models.get_closed_trades(mode,
@@ -886,8 +887,11 @@ def evaluate_promotion(
     (or None — a bot's first-ever promotion has nothing to beat yet).
     Every gate that CAN run does, regardless of what else fails/is
     pending, so `.gates`/`.breakdown` are a complete audit record even on
-    REJECT/EXTEND_VALIDATION — see promotion_audit (§9 of the plan)."""
-    gates: dict = {"cooldown": _cooldown_gate(mode)}
+    REJECT/EXTEND_VALIDATION — see promotion_audit (§9 of the plan).
+    strategy_type scopes only the cooldown clock (an independent promotion
+    cooldown per strategy_type) — candidate/trades/champion are already
+    the caller's own version_id-scoped values, no further scoping needed."""
+    gates: dict = {"cooldown": _cooldown_gate(mode, strategy_type)}
 
     closed_trades = [t for t in trades if t.get("pnl") is not None]
     metrics = compute_metrics(closed_trades, capital_to_use)

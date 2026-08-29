@@ -12,6 +12,7 @@ import {
 } from "recharts";
 import { fetchJson } from "@/lib/api";
 import { useMode, ModeToggle } from "@/components/ModeToggle";
+import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeToggle";
 import { CHROME, SERIES } from "@/lib/palette";
 import type { DailyPnl, StrategyVersion } from "@/lib/types";
 
@@ -22,6 +23,7 @@ interface EvolutionData {
 
 export default function EvolutionClient() {
   const mode = useMode();
+  const strategyType = useStrategyType();
   const [versions, setVersions] = useState<StrategyVersion[] | null>(null);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -31,7 +33,7 @@ export default function EvolutionClient() {
 
     async function load() {
       try {
-        const data = await fetchJson<EvolutionData>(`/api/evolution?mode=${mode}`);
+        const data = await fetchJson<EvolutionData>(`/api/evolution?mode=${mode}&strategy_type=${strategyType}`);
         if (cancelled) return;
         setError(null);
         setVersions(data.versions);
@@ -48,7 +50,7 @@ export default function EvolutionClient() {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, strategyType]);
 
   const chartData = useMemo(() => {
     let cumulative = 0;
@@ -62,7 +64,10 @@ export default function EvolutionClient() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Evolution</h1>
-        <ModeToggle />
+        <div className="flex items-center gap-2">
+          <StrategyTypeToggle />
+          <ModeToggle />
+        </div>
       </div>
 
       {error && (

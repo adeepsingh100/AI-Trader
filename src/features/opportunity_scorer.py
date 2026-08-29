@@ -125,33 +125,67 @@ def _score_risk_for_timeframe(f: dict) -> float | None:
 
 
 # --- blended across timeframes ------------------------------------------
+#
+# Every function below takes an optional `timeframe_weights` — resolved to
+# the module-global TIMEFRAME_WEIGHTS INSIDE the function body (never as a
+# signature default), so a bare call keeps honoring
+# `@patch("...TIMEFRAME_WEIGHTS", ...)` in existing tests exactly as
+# before, while a caller running a different strategy_type's profile
+# (src.config.STRATEGY_PROFILES) can pass its own weights. A signature
+# default like `def f(x=TIMEFRAME_WEIGHTS)` would bind at import time and
+# silently stop reacting to a patched module attribute — that's the one
+# thing to not do here.
 
 
-def _blend_across_timeframes(per_tf_scores: dict[str, float | None]) -> float | None:
-    return weighted_average(per_tf_scores, TIMEFRAME_WEIGHTS)
+def _blend_across_timeframes(
+    per_tf_scores: dict[str, float | None], timeframe_weights: dict[str, float] | None = None
+) -> float | None:
+    weights = timeframe_weights if timeframe_weights is not None else TIMEFRAME_WEIGHTS
+    return weighted_average(per_tf_scores, weights)
 
 
-def score_trend(features_by_tf: dict[str, dict]) -> float | None:
-    return _blend_across_timeframes({tf: _score_trend_for_timeframe(f) for tf, f in features_by_tf.items()})
+def score_trend(features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None) -> float | None:
+    return _blend_across_timeframes(
+        {tf: _score_trend_for_timeframe(f) for tf, f in features_by_tf.items()}, timeframe_weights
+    )
 
 
-def score_momentum(features_by_tf: dict[str, dict]) -> float | None:
-    return _blend_across_timeframes({tf: _score_momentum_for_timeframe(f) for tf, f in features_by_tf.items()})
+def score_momentum(
+    features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None
+) -> float | None:
+    return _blend_across_timeframes(
+        {tf: _score_momentum_for_timeframe(f) for tf, f in features_by_tf.items()}, timeframe_weights
+    )
 
 
-def score_volume(features_by_tf: dict[str, dict]) -> float | None:
-    return _blend_across_timeframes({tf: _score_volume_for_timeframe(f) for tf, f in features_by_tf.items()})
+def score_volume(features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None) -> float | None:
+    return _blend_across_timeframes(
+        {tf: _score_volume_for_timeframe(f) for tf, f in features_by_tf.items()}, timeframe_weights
+    )
 
 
-def score_volatility(features_by_tf: dict[str, dict]) -> float | None:
-    return _blend_across_timeframes({tf: _score_volatility_for_timeframe(f) for tf, f in features_by_tf.items()})
+def score_volatility(
+    features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None
+) -> float | None:
+    return _blend_across_timeframes(
+        {tf: _score_volatility_for_timeframe(f) for tf, f in features_by_tf.items()}, timeframe_weights
+    )
 
 
-def score_risk(features_by_tf: dict[str, dict]) -> float | None:
-    return _blend_across_timeframes({tf: _score_risk_for_timeframe(f) for tf, f in features_by_tf.items()})
+def score_risk(features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None) -> float | None:
+    return _blend_across_timeframes(
+        {tf: _score_risk_for_timeframe(f) for tf, f in features_by_tf.items()}, timeframe_weights
+    )
 
 
-def classify_market_regime(features_by_tf: dict[str, dict]) -> str | None:
+def primary_timeframe(timeframe_weights: dict[str, float] | None = None) -> str:
+    weights = timeframe_weights if timeframe_weights is not None else TIMEFRAME_WEIGHTS
+    return max(weights, key=weights.get)
+
+
+def classify_market_regime(
+    features_by_tf: dict[str, dict], timeframe_weights: dict[str, float] | None = None
+) -> str | None:
     """Deterministic composite label, reusing score_trend() (already
     computed) plus the primary timeframe's ADX/volatility_regime — not a
     separate indicator pass. None if either input is unavailable (short
@@ -165,8 +199,8 @@ def classify_market_regime(features_by_tf: dict[str, dict]) -> str | None:
     (neutral) by REGIME_STRONG_TREND_SCORE_MIN and its mirror. No separate
     "trending" label — that's what strong_bull/strong_bear already encode.
     """
-    trend = score_trend(features_by_tf)
-    primary = features_by_tf.get(PRIMARY_TIMEFRAME) or {}
+    trend = score_trend(features_by_tf, timeframe_weights)
+    primary = features_by_tf.get(primary_timeframe(timeframe_weights)) or {}
     adx = primary.get("adx")
     if trend is None or adx is None:
         return None
@@ -184,21 +218,29 @@ def classify_market_regime(features_by_tf: dict[str, dict]) -> str | None:
     return "weak_bear"
 
 
-def score_opportunity(features_by_tf: dict[str, dict]) -> dict:
+def score_opportunity(
+    features_by_tf: dict[str, dict],
+    opportunity_weights: dict[str, float] | None = None,
+    timeframe_weights: dict[str, float] | None = None,
+) -> dict:
     sub_scores = {
-        "trend": score_trend(features_by_tf),
-        "momentum": score_momentum(features_by_tf),
-        "volume": score_volume(features_by_tf),
-        "volatility": score_volatility(features_by_tf),
-        "risk": score_risk(features_by_tf),
+        "trend": score_trend(features_by_tf, timeframe_weights),
+        "momentum": score_momentum(features_by_tf, timeframe_weights),
+        "volume": score_volume(features_by_tf, timeframe_weights),
+        "volatility": score_volatility(features_by_tf, timeframe_weights),
+        "risk": score_risk(features_by_tf, timeframe_weights),
     }
-    weights = {
-        "trend": OPPORTUNITY_WEIGHT_TREND,
-        "momentum": OPPORTUNITY_WEIGHT_MOMENTUM,
-        "volume": OPPORTUNITY_WEIGHT_VOLUME,
-        "volatility": OPPORTUNITY_WEIGHT_VOLATILITY,
-        "risk": OPPORTUNITY_WEIGHT_RISK,
-    }
+    weights = (
+        opportunity_weights
+        if opportunity_weights is not None
+        else {
+            "trend": OPPORTUNITY_WEIGHT_TREND,
+            "momentum": OPPORTUNITY_WEIGHT_MOMENTUM,
+            "volume": OPPORTUNITY_WEIGHT_VOLUME,
+            "volatility": OPPORTUNITY_WEIGHT_VOLATILITY,
+            "risk": OPPORTUNITY_WEIGHT_RISK,
+        }
+    )
     return {
         "trend_score": sub_scores["trend"],
         "momentum_score": sub_scores["momentum"],
@@ -206,7 +248,7 @@ def score_opportunity(features_by_tf: dict[str, dict]) -> dict:
         "volatility_score": sub_scores["volatility"],
         "risk_score": sub_scores["risk"],
         "opportunity_score": weighted_average(sub_scores, weights),
-        "market_regime": classify_market_regime(features_by_tf),
+        "market_regime": classify_market_regime(features_by_tf, timeframe_weights),
     }
 
 

@@ -58,9 +58,9 @@ from src.learning.statistics import compute_bucket_statistics, z_test_two_means
 from src.utils import parse_timestamp as _parse_ts
 
 
-def _fetch_trades(mode: str) -> list[dict]:
+def _fetch_trades(mode: str, strategy_type: str = "default") -> list[dict]:
     since = datetime.now(timezone.utc) - timedelta(days=LEARNING_HISTORY_WINDOW_DAYS)
-    return [t for t in models.get_recently_closed_trades(mode, since) if t.get("pnl") is not None]
+    return [t for t in models.get_recently_closed_trades(mode, since, strategy_type) if t.get("pnl") is not None]
 
 
 def _train_test_split(trades: list[dict], split_pct: float = ADAPTIVE_TRAIN_TEST_SPLIT_PCT):
@@ -168,6 +168,7 @@ def _create_candidate_version(
     params_json: dict,
     status: LearningStatus,
     fitness_score: float | None = None,
+    strategy_type: str = "default",
 ) -> dict | None:
     """Progressive Learning Stages, Stage 4: a candidate row is only ever
     created once status.can_create_candidate() clears — a statistically-
@@ -177,7 +178,7 @@ def _create_candidate_version(
     as soon as enough evidence accumulates."""
     if not status.can_create_candidate():
         return None
-    latest = models.get_latest_adaptive_strategy_version(mode)
+    latest = models.get_latest_adaptive_strategy_version(mode, strategy_type=strategy_type)
     next_version_number = (latest["version_number"] + 1) if latest else 1
     return models.insert_adaptive_strategy_version(
         mode=mode,
@@ -187,28 +188,29 @@ def _create_candidate_version(
         source_simulation_id=simulation_id,
         notes="Auto-generated candidate from a passing walk-forward simulation.",
         fitness_score=fitness_score,
+        strategy_type=strategy_type,
     )
 
 
 def simulate_weight_recommendation(
-    mode: str, batch_id: str | None = None, status: LearningStatus | None = None
+    mode: str, batch_id: str | None = None, status: LearningStatus | None = None, strategy_type: str = "default"
 ) -> dict | None:
     """Re-derives a candidate weight set using only the TRAIN window, then
     tests whether it separates winners from losers on the TEST window
     better than the current live weights do on that same out-of-sample
     window. None if there isn't enough trade volume to independently
     clear the sample floor on both halves."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_simulate():
         return None
 
-    all_trades = _fetch_trades(mode)
+    all_trades = _fetch_trades(mode, strategy_type)
 
     train, test = _train_test_split(all_trades)
     if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return None
 
-    candidate_weights = compute_subscore_correlation_weights(mode, trades=train, cache=False)
+    candidate_weights = compute_subscore_correlation_weights(mode, trades=train, cache=False, strategy_type=strategy_type)
     if candidate_weights is None:
         return None
 
@@ -235,15 +237,20 @@ def simulate_weight_recommendation(
         candidate_metrics=candidate_metrics,
         p_value=candidate_metrics["p_value"],
         passed=passed,
+        strategy_type=strategy_type,
     )
 
     if passed:
-        _create_candidate_version(mode, batch_id, simulation_row["id"], candidate_weights, status=status)
+        _create_candidate_version(
+            mode, batch_id, simulation_row["id"], candidate_weights, status=status, strategy_type=strategy_type
+        )
 
     return simulation_row
 
 
-def simulate_threshold_recommendation(mode: str, status: LearningStatus | None = None) -> dict | None:
+def simulate_threshold_recommendation(
+    mode: str, status: LearningStatus | None = None, strategy_type: str = "default"
+) -> dict | None:
     """Walk-forward validation for the MIN_OPPORTUNITY_SCORE threshold
     recommendation specifically — the one threshold metric with a single,
     stable score extractor (opportunity_score). Per-symbol optimal_*
@@ -252,22 +259,22 @@ def simulate_threshold_recommendation(mode: str, status: LearningStatus | None =
     trades per symbol just to be generated once, and a second per-symbol
     train/test split would need that count to roughly double again —
     revisit once real trade volume makes it worth the added complexity."""
-    latest = models.get_latest_recommendation(mode, "MIN_OPPORTUNITY_SCORE")
+    latest = models.get_latest_recommendation(mode, "MIN_OPPORTUNITY_SCORE", strategy_type=strategy_type)
     if latest is None or latest.get("recommended_value") is None or latest.get("status") != "pending":
         return None
 
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_simulate():
         return None
 
-    all_trades = _fetch_trades(mode)
+    all_trades = _fetch_trades(mode, strategy_type)
     train, test = _train_test_split(all_trades)
     if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
         return None
 
     candidate_threshold = latest["recommended_value"]
     batch_id = latest.get("batch_id")
-    capital_config = models.get_capital_config(mode)
+    capital_config = models.get_capital_config(mode, strategy_type)
     capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
     scored_test = []
@@ -347,6 +354,7 @@ def simulate_threshold_recommendation(mode: str, status: LearningStatus | None =
         passed=passed,
         research_note=research_note,
         validation_detail=validation_detail or None,
+        strategy_type=strategy_type,
     )
 
     if candidate_created:
@@ -358,12 +366,13 @@ def simulate_threshold_recommendation(mode: str, status: LearningStatus | None =
             {"MIN_OPPORTUNITY_SCORE": candidate_threshold},
             status=status,
             fitness_score=fitness["fitness_score"],
+            strategy_type=strategy_type,
         )
 
     return simulation_row
 
 
-def _activate_exit_params_candidate(candidate: dict) -> dict | None:
+def _activate_exit_params_candidate(candidate: dict, strategy_type: str = "default") -> dict | None:
     """Auto-promotes an exit-params candidate straight into a new active
     strategy_versions row — the only candidate type auto-activated today
     (weight/regime/symbol candidates target OPPORTUNITY_WEIGHT_*-style env
@@ -374,7 +383,7 @@ def _activate_exit_params_candidate(candidate: dict) -> dict | None:
     paper trade history — get_closed_trades(mode, version["id"]) scopes to
     the new version's id, so its sample-size/paper-days clocks start at
     zero."""
-    current = models.get_latest_version()
+    current = models.get_latest_version(strategy_type)
     if current is None:
         return None
     current_params = current.get("params_json") or {}
@@ -387,6 +396,7 @@ def _activate_exit_params_candidate(candidate: dict) -> dict | None:
             f"Auto-activated from adaptive_strategy_versions candidate "
             f"{candidate['id']} (fitness={candidate.get('fitness_score')})."
         ),
+        strategy_type=strategy_type,
     )
     models.log_agent_event(
         "adaptive_strategy_engine",
@@ -398,7 +408,10 @@ def _activate_exit_params_candidate(candidate: dict) -> dict | None:
 
 
 def simulate_exit_params_recommendation(
-    mode: str, symbol_to_pair: dict[str, str] | None = None, status: LearningStatus | None = None
+    mode: str,
+    symbol_to_pair: dict[str, str] | None = None,
+    status: LearningStatus | None = None,
+    strategy_type: str = "default",
 ) -> list[dict]:
     """Walk-forward validation for stop_loss_pct/take_profit_pct candidates
     (recommendations.generate_exit_params_recommendations) — the new lever
@@ -411,27 +424,27 @@ def simulate_exit_params_recommendation(
     is supplied — the nightly caller builds this from a live markets_details
     fetch, the one thing here that needs network data; test/CLI callers
     that omit it get the always-available check only, never a crash."""
-    status = status or compute_learning_status(mode)
+    status = status or compute_learning_status(mode, strategy_type)
     if not status.can_simulate():
         return []
 
     results = []
     for param_name in ("stop_loss_pct", "take_profit_pct"):
-        latest = models.get_latest_recommendation(mode, param_name)
+        latest = models.get_latest_recommendation(mode, param_name, strategy_type=strategy_type)
         if latest is None or latest.get("recommended_value") is None or latest.get("status") != "pending":
             continue
 
-        all_trades = _fetch_trades(mode)
+        all_trades = _fetch_trades(mode, strategy_type)
         train, test = _train_test_split(all_trades)
         if len(train) < RECOMMENDATION_MIN_SAMPLE_SIZE or len(test) < RECOMMENDATION_MIN_SAMPLE_SIZE:
             continue
 
         candidate_value = latest["recommended_value"]
         batch_id = latest.get("batch_id")
-        capital_config = models.get_capital_config(mode)
+        capital_config = models.get_capital_config(mode, strategy_type)
         capital_to_use = capital_config["capital_to_use"] if capital_config else 0
 
-        version = models.get_latest_version()
+        version = models.get_latest_version(strategy_type)
         current_params = (version.get("params_json") or {}) if version else {}
         other_leg = "take_profit_pct" if param_name == "stop_loss_pct" else "stop_loss_pct"
         fixed_other = current_params.get(other_leg)
@@ -528,16 +541,17 @@ def simulate_exit_params_recommendation(
             passed=passed,
             research_note=research_note,
             validation_detail=validation_detail or None,
+            strategy_type=strategy_type,
         )
 
         if candidate_created:
             fitness = compute_fitness_score(candidate_stats, capital_to_use)
             candidate_row = _create_candidate_version(
                 mode, batch_id, simulation_row["id"], {param_name: candidate_value},
-                status=status, fitness_score=fitness["fitness_score"],
+                status=status, fitness_score=fitness["fitness_score"], strategy_type=strategy_type,
             )
             if candidate_row is not None:
-                _activate_exit_params_candidate(candidate_row)
+                _activate_exit_params_candidate(candidate_row, strategy_type)
 
         results.append(simulation_row)
 

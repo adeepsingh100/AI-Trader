@@ -161,8 +161,10 @@ def _execute(fn):
 # --- capital_config ---
 
 
-def get_capital_config(mode: str) -> dict | None:
-    rows = _execute(lambda: _run_query("SELECT * FROM capital_config WHERE mode = %s", (mode,)))
+def get_capital_config(mode: str, strategy_type: str = "default") -> dict | None:
+    rows = _execute(lambda: _run_query(
+        "SELECT * FROM capital_config WHERE mode = %s AND strategy_type = %s", (mode, strategy_type)
+    ))
     return rows[0] if rows else None
 
 
@@ -174,14 +176,15 @@ def upsert_capital_config(
     max_daily_loss: float,
     position_size_pct: float = 10,
     max_concurrent_positions: int = 5,
+    strategy_type: str = "default",
 ) -> None:
     _run_write(
         """
         INSERT INTO capital_config
-            (mode, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
+            (mode, strategy_type, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
              position_size_pct, max_concurrent_positions)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (mode) DO UPDATE SET
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (mode, strategy_type) DO UPDATE SET
             total_capital = EXCLUDED.total_capital,
             capital_to_use = EXCLUDED.capital_to_use,
             daily_profit_target = EXCLUDED.daily_profit_target,
@@ -189,41 +192,59 @@ def upsert_capital_config(
             position_size_pct = EXCLUDED.position_size_pct,
             max_concurrent_positions = EXCLUDED.max_concurrent_positions
         """,
-        (mode, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
+        (mode, strategy_type, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
          position_size_pct, max_concurrent_positions),
     )
+
+
+def get_active_strategy_types(mode: str) -> list[str]:
+    """Strategy types with a seeded capital_config row for this mode --
+    "active" = someone ran seed_config.py for it (src/seed_config.py).
+    Callers intersect this with src.config.STRATEGY_PROFILES; this module
+    stays DB-only and doesn't import config's registry."""
+    rows = _execute(lambda: _run_query(
+        "SELECT DISTINCT strategy_type FROM capital_config WHERE mode = %s", (mode,)
+    ))
+    return [r["strategy_type"] for r in rows]
 
 
 # --- strategy_versions (immutable once created, see spec §3) ---
 
 
-def get_latest_version() -> dict | None:
+def get_latest_version(strategy_type: str = "default") -> dict | None:
     # Excludes suspended versions (Strategy Health Engine, PROJECT_SPEC.md
     # §3d) — without this filter, auto-suspension would be a silent no-op
     # since this is still an unfiltered "newest row" query otherwise.
     rows = _execute(lambda: _run_query(
-        "SELECT * FROM strategy_versions WHERE status != 'suspended' "
-        "ORDER BY version_number DESC LIMIT 1"
+        "SELECT * FROM strategy_versions WHERE status != 'suspended' AND strategy_type = %s "
+        "ORDER BY version_number DESC LIMIT 1",
+        (strategy_type,),
     ))
     return rows[0] if rows else None
 
 
-def get_latest_promoted_version() -> dict | None:
+def get_latest_promoted_version(strategy_type: str = "default") -> dict | None:
     rows = _execute(lambda: _run_query(
         "SELECT * FROM strategy_versions WHERE promoted_to_real = true AND status != 'suspended' "
-        "ORDER BY version_number DESC LIMIT 1"
+        "AND strategy_type = %s ORDER BY version_number DESC LIMIT 1",
+        (strategy_type,),
     ))
     return rows[0] if rows else None
 
 
 def insert_strategy_version(
-    version_number: int, prompt_text: str, params_json: dict, notes: str | None = None
+    version_number: int,
+    prompt_text: str,
+    params_json: dict,
+    notes: str | None = None,
+    strategy_type: str = "default",
 ) -> dict:
     return _insert_row("strategy_versions", {
         "version_number": version_number,
         "prompt_text": prompt_text,
         "params_json": params_json,
         "notes": notes,
+        "strategy_type": strategy_type,
     })
 
 
@@ -292,28 +313,48 @@ def update_trade_excursion(trade_id: int, mfe_pct: float, mae_pct: float) -> Non
     _run_write("UPDATE trades SET mfe_pct = %s, mae_pct = %s WHERE id = %s", (mfe_pct, mae_pct, trade_id))
 
 
-def get_open_trades(mode: str) -> list[dict]:
+def get_open_trades(mode: str, strategy_type: str | None = None) -> list[dict]:
+    if strategy_type is None:
+        return _execute(lambda: _run_query(
+            "SELECT * FROM trades WHERE mode = %s AND status = 'open'", (mode,)
+        ))
     return _execute(lambda: _run_query(
-        "SELECT * FROM trades WHERE mode = %s AND status = 'open'", (mode,)
+        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
+        "WHERE t.mode = %s AND t.status = 'open' AND sv.strategy_type = %s",
+        (mode, strategy_type),
     ))
 
 
-def get_recently_closed_trades(mode: str, since: datetime) -> list[dict]:
+def get_recently_closed_trades(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:
     """Closed/flattened trades since `since` — mode-scoped, not
     version-scoped (unlike get_closed_trades), since strategy versions
     rotate and the learning engine's catch-up pass needs to see across
-    versions. Bounded by the caller's `since` (LEARNING_CATCHUP_LOOKBACK_HOURS
-    for process_closed_trades, LEARNING_HISTORY_WINDOW_DAYS for stats
-    bucket recompute) so this never becomes a full-table scan."""
+    versions of the SAME strategy_type. Bounded by the caller's `since`
+    (LEARNING_CATCHUP_LOOKBACK_HOURS for process_closed_trades,
+    LEARNING_HISTORY_WINDOW_DAYS for stats bucket recompute) so this
+    never becomes a full-table scan. strategy_type is additive/optional —
+    omitted keeps today's exact mode-wide (cross-strategy-type) query."""
+    if strategy_type is None:
+        return _run_query(
+            "SELECT * FROM trades WHERE mode = %s AND status = ANY(%s) AND closed_at >= %s",
+            (mode, ["closed", "flattened"], since.isoformat()),
+        )
     return _run_query(
-        "SELECT * FROM trades WHERE mode = %s AND status = ANY(%s) AND closed_at >= %s",
-        (mode, ["closed", "flattened"], since.isoformat()),
+        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
+        "WHERE t.mode = %s AND t.status = ANY(%s) AND t.closed_at >= %s AND sv.strategy_type = %s",
+        (mode, ["closed", "flattened"], since.isoformat(), strategy_type),
     )
 
 
-def get_recent_trades(mode: str, limit: int = 50) -> list[dict]:
+def get_recent_trades(mode: str, limit: int = 50, strategy_type: str | None = None) -> list[dict]:
+    if strategy_type is None:
+        return _run_query(
+            "SELECT * FROM trades WHERE mode = %s ORDER BY opened_at DESC LIMIT %s", (mode, limit)
+        )
     return _run_query(
-        "SELECT * FROM trades WHERE mode = %s ORDER BY opened_at DESC LIMIT %s", (mode, limit)
+        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
+        "WHERE t.mode = %s AND sv.strategy_type = %s ORDER BY t.opened_at DESC LIMIT %s",
+        (mode, strategy_type, limit),
     )
 
 
@@ -327,9 +368,10 @@ def get_closed_trades(mode: str, version_id: int) -> list[dict]:
 # --- daily_pnl ---
 
 
-def get_daily_pnl(day: Date, mode: str) -> dict | None:
+def get_daily_pnl(day: Date, mode: str, strategy_type: str = "default") -> dict | None:
     rows = _execute(lambda: _run_query(
-        "SELECT * FROM daily_pnl WHERE date = %s AND mode = %s", (day.isoformat(), mode)
+        "SELECT * FROM daily_pnl WHERE date = %s AND mode = %s AND strategy_type = %s",
+        (day.isoformat(), mode, strategy_type),
     ))
     return rows[0] if rows else None
 
@@ -341,18 +383,20 @@ def upsert_daily_pnl(
     trades_count: int,
     target_hit: bool,
     circuit_breaker_triggered: bool,
+    strategy_type: str = "default",
 ) -> None:
     _run_write(
         """
-        INSERT INTO daily_pnl (date, mode, realized_pnl, trades_count, target_hit, circuit_breaker_triggered)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (date, mode) DO UPDATE SET
+        INSERT INTO daily_pnl
+            (date, mode, strategy_type, realized_pnl, trades_count, target_hit, circuit_breaker_triggered)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (date, mode, strategy_type) DO UPDATE SET
             realized_pnl = EXCLUDED.realized_pnl,
             trades_count = EXCLUDED.trades_count,
             target_hit = EXCLUDED.target_hit,
             circuit_breaker_triggered = EXCLUDED.circuit_breaker_triggered
         """,
-        (day.isoformat(), mode, realized_pnl, trades_count, target_hit, circuit_breaker_triggered),
+        (day.isoformat(), mode, strategy_type, realized_pnl, trades_count, target_hit, circuit_breaker_triggered),
     )
 
 
@@ -447,21 +491,25 @@ def log_opportunity_evaluation(
 # --- learning_statistics ---
 
 
-def upsert_learning_statistics(mode: str, dimension_type: str, dimension_value: str, stats: dict) -> None:
-    cols = ["mode", "dimension_type", "dimension_value", *stats.keys()]
-    vals = [mode, dimension_type, dimension_value, *stats.values()]
+def upsert_learning_statistics(
+    mode: str, dimension_type: str, dimension_value: str, stats: dict, strategy_type: str = "default"
+) -> None:
+    cols = ["mode", "strategy_type", "dimension_type", "dimension_value", *stats.keys()]
+    vals = [mode, strategy_type, dimension_type, dimension_value, *stats.values()]
     col_list = ", ".join(cols)
     placeholders = ", ".join(["%s"] * len(cols))
     set_clause = ", ".join(f"{k} = EXCLUDED.{k}" for k in stats)
     _run_write(
         f"INSERT INTO learning_statistics ({col_list}) VALUES ({placeholders}) "
-        f"ON CONFLICT (mode, dimension_type, dimension_value) DO UPDATE SET {set_clause}",
+        f"ON CONFLICT (mode, strategy_type, dimension_type, dimension_value) DO UPDATE SET {set_clause}",
         tuple(vals),
     )
 
 
-def get_learning_statistics(mode: str, dimension_type: str | None = None) -> list[dict]:
-    clauses, params = ["mode = %s"], [mode]
+def get_learning_statistics(
+    mode: str, dimension_type: str | None = None, strategy_type: str = "default"
+) -> list[dict]:
+    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
     if dimension_type is not None:
         clauses.append("dimension_type = %s")
         params.append(dimension_type)
@@ -472,22 +520,30 @@ def get_learning_statistics(mode: str, dimension_type: str | None = None) -> lis
 
 
 def upsert_feature_importance(
-    mode: str, feature_name: str, correlation_score: float, sample_count: int, timeframe: str
+    mode: str,
+    feature_name: str,
+    correlation_score: float,
+    sample_count: int,
+    timeframe: str,
+    strategy_type: str = "default",
 ) -> None:
     _run_write(
         """
-        INSERT INTO feature_importance (mode, feature_name, correlation_score, sample_count, timeframe)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (mode, feature_name, timeframe) DO UPDATE SET
+        INSERT INTO feature_importance
+            (mode, strategy_type, feature_name, correlation_score, sample_count, timeframe)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (mode, strategy_type, feature_name, timeframe) DO UPDATE SET
             correlation_score = EXCLUDED.correlation_score,
             sample_count = EXCLUDED.sample_count
         """,
-        (mode, feature_name, correlation_score, sample_count, timeframe),
+        (mode, strategy_type, feature_name, correlation_score, sample_count, timeframe),
     )
 
 
-def get_feature_importance(mode: str, timeframe: str | None = None) -> list[dict]:
-    clauses, params = ["mode = %s"], [mode]
+def get_feature_importance(
+    mode: str, timeframe: str | None = None, strategy_type: str = "default"
+) -> list[dict]:
+    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
     if timeframe is not None:
         clauses.append("timeframe = %s")
         params.append(timeframe)
@@ -499,22 +555,42 @@ def get_opportunity_evaluations_for_trail(
     trade_id: int | None = None,
     symbol: str | None = None,
     since=None,
+    strategy_type: str | None = None,
 ) -> list[dict]:
     """Chronological rows for src.audit.trail.get_decision_trail — the one
     query that module needs, routed through here (rather than a raw
     query in audit/trail.py) so every DB access in src/ goes through this
-    file, per this repo's own convention."""
-    clauses, params = ["mode = %s"], [mode]
+    file, per this repo's own convention. strategy_type is additive/
+    optional — omitted keeps today's exact mode-wide (cross-strategy-type)
+    query, matching the audit trail's own "show everything" default."""
+    if strategy_type is None:
+        clauses, params = ["mode = %s"], [mode]
+        if trade_id is not None:
+            clauses.append("trade_id = %s")
+            params.append(trade_id)
+        if symbol is not None:
+            clauses.append("symbol = %s")
+            params.append(symbol)
+        if since is not None:
+            clauses.append("timestamp >= %s")
+            params.append(since.isoformat())
+        query = f"SELECT * FROM opportunity_evaluations WHERE {' AND '.join(clauses)} ORDER BY timestamp"
+        return _run_query(query, tuple(params))
+
+    clauses, params = ["oe.mode = %s", "sv.strategy_type = %s"], [mode, strategy_type]
     if trade_id is not None:
-        clauses.append("trade_id = %s")
+        clauses.append("oe.trade_id = %s")
         params.append(trade_id)
     if symbol is not None:
-        clauses.append("symbol = %s")
+        clauses.append("oe.symbol = %s")
         params.append(symbol)
     if since is not None:
-        clauses.append("timestamp >= %s")
+        clauses.append("oe.timestamp >= %s")
         params.append(since.isoformat())
-    query = f"SELECT * FROM opportunity_evaluations WHERE {' AND '.join(clauses)} ORDER BY timestamp"
+    query = (
+        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
+        f"WHERE {' AND '.join(clauses)} ORDER BY oe.timestamp"
+    )
     return _run_query(query, tuple(params))
 
 
@@ -565,11 +641,11 @@ def log_confidence_calibration(
 # --- recommendations ---
 
 
-def get_latest_recommendation(mode: str, metric_name: str) -> dict | None:
+def get_latest_recommendation(mode: str, metric_name: str, strategy_type: str = "default") -> dict | None:
     rows = _run_query(
-        "SELECT * FROM recommendations WHERE mode = %s AND metric_name = %s "
+        "SELECT * FROM recommendations WHERE mode = %s AND metric_name = %s AND strategy_type = %s "
         "ORDER BY created_at DESC LIMIT 1",
-        (mode, metric_name),
+        (mode, metric_name, strategy_type),
     )
     return rows[0] if rows else None
 
@@ -585,23 +661,24 @@ def insert_recommendation(
     confidence: float | None = None,
     evidence: dict | None = None,
     batch_id: str | None = None,
+    strategy_type: str = "default",
 ) -> None:
     _run_write(
         """
         INSERT INTO recommendations
-            (mode, metric_name, current_value, recommended_value, rationale, sample_size,
+            (mode, strategy_type, metric_name, current_value, recommended_value, rationale, sample_size,
              category, confidence, evidence, batch_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (mode, metric_name, current_value, recommended_value, rationale, sample_size,
+        (mode, strategy_type, metric_name, current_value, recommended_value, rationale, sample_size,
          category, confidence, evidence, batch_id),
     )
 
 
 def get_recommendations(
-    mode: str, status: str | None = None, category: str | None = None
+    mode: str, status: str | None = None, category: str | None = None, strategy_type: str = "default"
 ) -> list[dict]:
-    clauses, params = ["mode = %s"], [mode]
+    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
     if status is not None:
         clauses.append("status = %s")
         params.append(status)
@@ -628,6 +705,7 @@ def insert_strategy_simulation(
     passed: bool,
     research_note: str | None = None,
     validation_detail: dict | None = None,
+    strategy_type: str = "default",
 ) -> dict:
     """research_note/validation_detail (Scientific Strategy Optimization
     Framework) — a narrative Observation/Weakness/Hypothesis/Simulation/
@@ -636,6 +714,7 @@ def insert_strategy_simulation(
     return _insert_row("strategy_simulations", {
         "recommendation_batch_id": recommendation_batch_id,
         "mode": mode,
+        "strategy_type": strategy_type,
         "train_window_start": train_window_start.isoformat(),
         "train_window_end": train_window_end.isoformat(),
         "test_window_start": test_window_start.isoformat(),
@@ -649,8 +728,8 @@ def insert_strategy_simulation(
     })
 
 
-def get_strategy_simulations(mode: str, passed: bool | None = None) -> list[dict]:
-    clauses, params = ["mode = %s"], [mode]
+def get_strategy_simulations(mode: str, passed: bool | None = None, strategy_type: str = "default") -> list[dict]:
+    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
     if passed is not None:
         clauses.append("passed = %s")
         params.append(passed)
@@ -669,9 +748,11 @@ def insert_adaptive_strategy_version(
     source_simulation_id: int | None,
     notes: str | None = None,
     fitness_score: float | None = None,
+    strategy_type: str = "default",
 ) -> dict:
     return _insert_row("adaptive_strategy_versions", {
         "mode": mode,
+        "strategy_type": strategy_type,
         "version_number": version_number,
         "params_json": params_json,
         "source_recommendation_batch_id": source_recommendation_batch_id,
@@ -681,8 +762,10 @@ def insert_adaptive_strategy_version(
     })
 
 
-def get_adaptive_strategy_versions(mode: str, status: str | None = None) -> list[dict]:
-    clauses, params = ["mode = %s"], [mode]
+def get_adaptive_strategy_versions(
+    mode: str, status: str | None = None, strategy_type: str = "default"
+) -> list[dict]:
+    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
     if status is not None:
         clauses.append("status = %s")
         params.append(status)
@@ -690,10 +773,11 @@ def get_adaptive_strategy_versions(mode: str, status: str | None = None) -> list
     return _run_query(query, tuple(params))
 
 
-def get_latest_adaptive_strategy_version(mode: str) -> dict | None:
+def get_latest_adaptive_strategy_version(mode: str, strategy_type: str = "default") -> dict | None:
     rows = _run_query(
-        "SELECT * FROM adaptive_strategy_versions WHERE mode = %s ORDER BY version_number DESC LIMIT 1",
-        (mode,),
+        "SELECT * FROM adaptive_strategy_versions WHERE mode = %s AND strategy_type = %s "
+        "ORDER BY version_number DESC LIMIT 1",
+        (mode, strategy_type),
     )
     return rows[0] if rows else None
 
@@ -937,29 +1021,42 @@ def get_backtest_strategy_comparisons() -> list[dict]:
     return _run_query("SELECT * FROM backtest_strategy_comparisons ORDER BY created_at DESC")
 
 
-def get_entry_evaluations_since(mode: str, since: datetime) -> list[dict]:
+def get_entry_evaluations_since(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:
     """Entry-time opportunity_evaluations rows (final_decision='buy', so
     trade_id is always set) since `since` — the candidate pool
     find_similar_trades() ranks by distance. No embedded join to `trades`
     for the outcome (pnl/closed_at) — this codebase has no precedent for
     a join across models.py functions; callers fetch outcomes separately
     via get_trades_by_ids() and match in Python, same pattern as
-    process_closed_trades()'s diff."""
+    process_closed_trades()'s diff. strategy_type is additive/optional —
+    omitted keeps today's exact mode-wide (cross-strategy-type) query."""
+    if strategy_type is None:
+        return _run_query(
+            "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'buy' AND timestamp >= %s",
+            (mode, since.isoformat()),
+        )
     return _run_query(
-        "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'buy' AND timestamp >= %s",
-        (mode, since.isoformat()),
+        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
+        "WHERE oe.mode = %s AND oe.final_decision = 'buy' AND oe.timestamp >= %s AND sv.strategy_type = %s",
+        (mode, since.isoformat(), strategy_type),
     )
 
 
-def get_hold_evaluations_since(mode: str, since: datetime) -> list[dict]:
+def get_hold_evaluations_since(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:
     """Non-trade opportunity_evaluations rows (final_decision='hold') since
     `since` — every scanned-but-not-traded candidate, each carrying its own
     reason/risk_manager_result (Root Cause Analysis, Scientific Strategy
     Optimization Framework). Same shape as get_entry_evaluations_since,
     filtering the opposite final_decision value."""
+    if strategy_type is None:
+        return _run_query(
+            "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'hold' AND timestamp >= %s",
+            (mode, since.isoformat()),
+        )
     return _run_query(
-        "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'hold' AND timestamp >= %s",
-        (mode, since.isoformat()),
+        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
+        "WHERE oe.mode = %s AND oe.final_decision = 'hold' AND oe.timestamp >= %s AND sv.strategy_type = %s",
+        (mode, since.isoformat(), strategy_type),
     )
 
 
@@ -1155,9 +1252,11 @@ def insert_promotion_audit(
     gates: dict | None = None,
     breakdown: dict | None = None,
     reasons: list | None = None,
+    strategy_type: str = "default",
 ) -> dict:
     return _insert_row("promotion_audit", {
         "mode": mode,
+        "strategy_type": strategy_type,
         "event_type": event_type,
         "decision": decision,
         "candidate_version_id": candidate_version_id,
@@ -1172,16 +1271,20 @@ def insert_promotion_audit(
     })
 
 
-def get_latest_promotion_audit(mode: str, event_type: str | None = None) -> dict | None:
+def get_latest_promotion_audit(
+    mode: str, event_type: str | None = None, strategy_type: str = "default"
+) -> dict | None:
     if event_type is not None:
         rows = _run_query(
-            "SELECT * FROM promotion_audit WHERE mode = %s AND event_type = %s "
+            "SELECT * FROM promotion_audit WHERE mode = %s AND strategy_type = %s AND event_type = %s "
             "ORDER BY created_at DESC LIMIT 1",
-            (mode, event_type),
+            (mode, strategy_type, event_type),
         )
     else:
         rows = _run_query(
-            "SELECT * FROM promotion_audit WHERE mode = %s ORDER BY created_at DESC LIMIT 1", (mode,)
+            "SELECT * FROM promotion_audit WHERE mode = %s AND strategy_type = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (mode, strategy_type),
         )
     return rows[0] if rows else None
 

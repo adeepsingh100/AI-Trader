@@ -159,8 +159,8 @@ def _reason_for(next_stage: str | None, evidence_gaps: list[str]) -> str:
     return f"Need {' OR '.join(evidence_gaps)} to reach {next_stage}."
 
 
-def compute_learning_status(mode: str) -> LearningStatus:
-    evidence = EvidenceEngine().collect(mode)
+def compute_learning_status(mode: str, strategy_type: str = "default") -> LearningStatus:
+    evidence = EvidenceEngine().collect(mode, strategy_type)
     readiness = compute_evidence_readiness(evidence)
     evidence_readiness_pct = readiness["evidence_readiness_pct"]
     trades_collected = evidence["closed_trades"]
@@ -177,7 +177,7 @@ def compute_learning_status(mode: str) -> LearningStatus:
         trades_to_next_stage = 0
         evidence_gaps = []
 
-    version = models.get_latest_version()
+    version = models.get_latest_version(strategy_type)
     promotion_eligible = bool(version and version.get("promotion_eligible"))
 
     return LearningStatus(
@@ -189,9 +189,9 @@ def compute_learning_status(mode: str) -> LearningStatus:
         evidence=evidence,
         evidence_readiness_pct=evidence_readiness_pct,
         data_sufficiency_pct=readiness["components"]["trade_coverage"],
-        recommendations_count=len(models.get_recommendations(mode)),
-        simulations_count=len(models.get_strategy_simulations(mode)),
-        candidates_count=len(models.get_adaptive_strategy_versions(mode)),
+        recommendations_count=len(models.get_recommendations(mode, strategy_type=strategy_type)),
+        simulations_count=len(models.get_strategy_simulations(mode, strategy_type=strategy_type)),
+        candidates_count=len(models.get_adaptive_strategy_versions(mode, strategy_type=strategy_type)),
         promotion_eligible=promotion_eligible,
         next_stage=next_stage,
         trades_to_next_stage=trades_to_next_stage,
