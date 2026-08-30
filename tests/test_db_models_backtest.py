@@ -43,6 +43,19 @@ def test_get_historical_candles_filters_by_pair_interval_and_range(monkeypatch):
     assert params == ("I-BTC_INR", "1m", 0, 2000)
 
 
+def test_historical_candles_exist_uses_exists_not_select_star(monkeypatch):
+    conn, cur = _fake_connection(rows=[{"exists_": True}])
+    monkeypatch.setattr(models, "get_client", lambda: conn)
+
+    result = models.historical_candles_exist("I-BTC_INR", "1m", 0, 2000)
+
+    assert result is True
+    sql, params = _last_execute(cur)
+    assert "EXISTS" in sql
+    assert "SELECT *" not in sql
+    assert params == ("I-BTC_INR", "1m", 0, 2000)
+
+
 # --- backtest_runs ---
 
 

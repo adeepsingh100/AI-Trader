@@ -117,8 +117,7 @@ def _has_historical_candles(symbols: list[str], symbol_to_pair: dict[str, str], 
         return False
     start_ms = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
     end_ms = int(datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
-    rows = models.get_historical_candles(symbol_to_pair[symbols[0]], BACKTEST_TICK_TIMEFRAME, start_ms, end_ms)
-    return bool(rows)
+    return models.historical_candles_exist(symbol_to_pair[symbols[0]], BACKTEST_TICK_TIMEFRAME, start_ms, end_ms)
 
 
 def _build_research_note(

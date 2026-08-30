@@ -899,6 +899,22 @@ def get_historical_candles(pair: str, interval: str, start_time_ms: int, end_tim
     )
 
 
+def historical_candles_exist(pair: str, interval: str, start_time_ms: int, end_time_ms: int) -> bool:
+    """Existence-only check for the same range get_historical_candles
+    queries — callers that only need a yes/no (promotion_gate.py,
+    simulation.py, both gating an expensive backtest replay on "is there
+    any data at all") were pulling the full result set just to check
+    non-emptiness, at BACKTEST_TICK_TIMEFRAME granularity over a range
+    that can span a whole strategy version's trade history — real,
+    unnecessary Neon egress. This transfers one boolean instead."""
+    rows = _run_query(
+        "SELECT EXISTS (SELECT 1 FROM historical_candles "
+        "WHERE pair = %s AND interval = %s AND time >= %s AND time <= %s) AS exists_",
+        (pair, interval, start_time_ms, end_time_ms),
+    )
+    return rows[0]["exists_"]
+
+
 # --- backtest_runs ---
 
 
