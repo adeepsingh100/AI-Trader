@@ -1,30 +1,47 @@
-"""Neon (Postgres) data access. One function per read/write the agents
-need — see PROJECT_SPEC.md §6 for the schema these map to.
+"""Data access — one function per read/write the agents need, see
+PROJECT_SPEC.md §6 for the schema these map to.
 
 Migrated off Supabase (its free-tier disk filled and its instance got
-stuck in Postgres crash-recovery, unrecoverable from this codebase's
-side) onto Neon, a plain managed Postgres with no PostgREST/Auth/RLS
-layer — every function below is now hand-written parameterized SQL via
-psycopg2 instead of the Supabase client's chainable query builder.
-Every function's name, signature, and return shape (list[dict] / dict /
-None) is unchanged from before, so every caller in this repo (all ~30+
-modules that import this file) needed zero changes."""
+stuck in Postgres crash-recovery) onto Neon, a plain managed Postgres.
+Now mid-migration OFF Neon too (its free-tier data-transfer quota
+exhausted, hard-blocking the bot with no way to restore access short of
+paying — see PROJECT_SPEC.md) onto Firebase/Firestore, genuinely free at
+this scale. Migrating table-by-table, not a single cutover: functions
+for capital_config/strategy_versions/trades/daily_pnl/risk_check_lock/
+agent_logs/opportunity_evaluations/confidence_calibration/
+learning_statistics/trade_evaluations/feature_importance (the live
+trading hot path — Phase 1) talk to Firestore via get_firestore_client();
+everything else still talks to Neon via get_client()/psycopg2, until its
+own phase. Two backends in one file, but never two sources of truth for
+the same table — every table has exactly one backend at a time, tracked
+per-function below, not a dual-write. Every function's name, signature,
+and return shape (list[dict] / dict / None) stays unchanged across the
+swap, same discipline as the Supabase→Neon migration, so callers need
+zero changes — except open_trade/log_opportunity_evaluation, which
+gained a required strategy_type param: Firestore has no JOIN, so
+trades/opportunity_evaluations now carry strategy_type as a real field
+instead of deriving it via version_id → strategy_versions at read time."""
 
 from __future__ import annotations
 
+import json
+import os
 import psycopg2
 import psycopg2.extensions
 from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any
 
+import firebase_admin
+from firebase_admin import credentials, firestore
 from psycopg2.extras import Json, RealDictCursor, execute_values
 
-from src.config import DATABASE_URL
+from src.config import DATABASE_URL, FIREBASE_SERVICE_ACCOUNT_JSON
 from src.groq_client import ModelUsageEvent
 from src.resilience import retry_with_backoff
 
 _conn: psycopg2.extensions.connection | None = None
+_firebase_app: firebase_admin.App | None = None
 
 # psycopg2 defaults NUMERIC to Decimal; every downstream caller
 # (features/learning/agents) does float arithmetic on these values, and
@@ -64,6 +81,94 @@ def ping() -> None:
     with get_client().cursor() as cur:
         cur.execute("select mode from capital_config limit 1")
     get_client().commit()
+
+
+def get_firestore_client() -> firestore.Client:
+    """Separate seam from get_client() — deliberately, not a rename.
+    Phase 1 of the Neon→Firestore migration (see module docstring) moves
+    ~20 of this file's ~81 functions to Firestore; the rest keep using
+    get_client()/psycopg2 unchanged until their own phase. One shared
+    get_client() returning "whichever backend" would either break the
+    untouched functions or force a big-bang cutover — neither is what was
+    approved. FIREBASE_SERVICE_ACCOUNT_JSON is the whole service-account
+    key file's contents (Cloud Run Jobs' --set-secrets gives you a env
+    var, not a mounted file path)."""
+    global _firebase_app
+    if _firebase_app is None:
+        cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
+        _firebase_app = firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def _doc_to_dict(snap: firestore.DocumentSnapshot) -> dict:
+    data = snap.to_dict() or {}
+    data["id"] = snap.id
+    return data
+
+
+def _get_doc(collection: str, doc_id: str) -> dict | None:
+    snap = get_firestore_client().collection(collection).document(doc_id).get()
+    return _doc_to_dict(snap) if snap.exists else None
+
+
+def _set_doc(collection: str, doc_id: str, fields: dict) -> None:
+    """merge=True always — every SQL UPSERT this replaces has an explicit
+    ON CONFLICT DO UPDATE SET listing specific columns, never a blind
+    full-row overwrite; a plain (non-merge) .set() would silently delete
+    any field not in `fields` (e.g. capital_config.paused, set by a
+    different call site than upsert_capital_config) on every repeat
+    write. merge=True is the faithful translation of "only touch these
+    columns," matching Postgres's column-scoped UPDATE semantics."""
+    get_firestore_client().collection(collection).document(doc_id).set(fields, merge=True)
+
+
+def _insert_doc(collection: str, fields: dict) -> dict:
+    ref = get_firestore_client().collection(collection).document()
+    ref.set(fields)
+    return fields | {"id": ref.id}
+
+
+def _query(
+    collection: str,
+    filters: list[tuple] | None = None,
+    order_by: str | None = None,
+    desc: bool = False,
+    limit: int | None = None,
+) -> list[dict]:
+    q = get_firestore_client().collection(collection)
+    for field, op, value in filters or []:
+        q = q.where(filter=firestore.FieldFilter(field, op, value))
+    if order_by:
+        q = q.order_by(
+            order_by, direction=firestore.Query.DESCENDING if desc else firestore.Query.ASCENDING
+        )
+    if limit is not None:
+        q = q.limit(limit)
+    return [_doc_to_dict(d) for d in q.stream()]
+
+
+def _get_docs_by_ids(collection: str, doc_ids: list) -> list[firestore.DocumentSnapshot]:
+    """Batch get by doc ID — the natural translation of Postgres's
+    `id = ANY(%s)`. Unlike the `in` query operator, Client.get_all() has
+    no 30-item cap, so no chunking needed here."""
+    if not doc_ids:
+        return []
+    client = get_firestore_client()
+    refs = [client.collection(collection).document(str(doc_id)) for doc_id in doc_ids]
+    return [snap for snap in client.get_all(refs) if snap.exists]
+
+
+def _batch_set(collection: str, rows: list[dict], doc_id_fn=None) -> None:
+    """Batch insert/upsert, chunked at Firestore's 500-writes-per-batch
+    limit — the Firestore counterpart to _insert_rows' execute_values."""
+    client = get_firestore_client()
+    coll_ref = client.collection(collection)
+    for i in range(0, len(rows), 500):
+        batch = client.batch()
+        for row in rows[i:i + 500]:
+            doc_ref = coll_ref.document(doc_id_fn(row)) if doc_id_fn else coll_ref.document()
+            batch.set(doc_ref, row)
+        batch.commit()
 
 
 def _run_query(sql_text: str, params: tuple = ()) -> list[dict]:
@@ -162,10 +267,7 @@ def _execute(fn):
 
 
 def get_capital_config(mode: str, strategy_type: str = "default") -> dict | None:
-    rows = _execute(lambda: _run_query(
-        "SELECT * FROM capital_config WHERE mode = %s AND strategy_type = %s", (mode, strategy_type)
-    ))
-    return rows[0] if rows else None
+    return _execute(lambda: _get_doc("capital_config", f"{mode}_{strategy_type}"))
 
 
 def upsert_capital_config(
@@ -178,56 +280,54 @@ def upsert_capital_config(
     max_concurrent_positions: int = 5,
     strategy_type: str = "default",
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO capital_config
-            (mode, strategy_type, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
-             position_size_pct, max_concurrent_positions)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (mode, strategy_type) DO UPDATE SET
-            total_capital = EXCLUDED.total_capital,
-            capital_to_use = EXCLUDED.capital_to_use,
-            daily_profit_target = EXCLUDED.daily_profit_target,
-            max_daily_loss = EXCLUDED.max_daily_loss,
-            position_size_pct = EXCLUDED.position_size_pct,
-            max_concurrent_positions = EXCLUDED.max_concurrent_positions
-        """,
-        (mode, strategy_type, total_capital, capital_to_use, daily_profit_target, max_daily_loss,
-         position_size_pct, max_concurrent_positions),
-    )
+    _set_doc("capital_config", f"{mode}_{strategy_type}", {
+        "mode": mode,
+        "strategy_type": strategy_type,
+        "total_capital": total_capital,
+        "capital_to_use": capital_to_use,
+        "daily_profit_target": daily_profit_target,
+        "max_daily_loss": max_daily_loss,
+        "position_size_pct": position_size_pct,
+        "max_concurrent_positions": max_concurrent_positions,
+        "updated_at": datetime.now(timezone.utc),
+    })
 
 
 def get_active_strategy_types(mode: str) -> list[str]:
     """Strategy types with a seeded capital_config row for this mode --
     "active" = someone ran seed_config.py for it (src/seed_config.py).
     Callers intersect this with src.config.STRATEGY_PROFILES; this module
-    stays DB-only and doesn't import config's registry."""
-    rows = _execute(lambda: _run_query(
-        "SELECT DISTINCT strategy_type FROM capital_config WHERE mode = %s", (mode,)
-    ))
-    return [r["strategy_type"] for r in rows]
+    stays DB-only and doesn't import config's registry. Dedup happens
+    Python-side — Firestore has no SELECT DISTINCT, and this collection
+    is small (one doc per mode+strategy_type combo)."""
+    rows = _execute(lambda: _query("capital_config", [("mode", "==", mode)]))
+    return sorted({r["strategy_type"] for r in rows})
 
 
 # --- strategy_versions (immutable once created, see spec §3) ---
 
 
 def get_latest_version(strategy_type: str = "default") -> dict | None:
-    # Excludes suspended versions (Strategy Health Engine, PROJECT_SPEC.md
-    # §3d) — without this filter, auto-suspension would be a silent no-op
-    # since this is still an unfiltered "newest row" query otherwise.
-    rows = _execute(lambda: _run_query(
-        "SELECT * FROM strategy_versions WHERE status != 'suspended' AND strategy_type = %s "
-        "ORDER BY version_number DESC LIMIT 1",
-        (strategy_type,),
+    # status is only ever 'active'/'suspended' (update_strategy_version_status
+    # is the sole writer) — 'active' equality reads the same as the old
+    # 'status != suspended' filter but avoids a Firestore inequality-filter/
+    # order_by interaction. Excludes suspended versions (Strategy Health
+    # Engine, PROJECT_SPEC.md §3d) — without this filter, auto-suspension
+    # would be a silent no-op since this is still an unfiltered "newest
+    # row" query otherwise.
+    rows = _execute(lambda: _query(
+        "strategy_versions",
+        [("strategy_type", "==", strategy_type), ("status", "==", "active")],
+        order_by="version_number", desc=True, limit=1,
     ))
     return rows[0] if rows else None
 
 
 def get_latest_promoted_version(strategy_type: str = "default") -> dict | None:
-    rows = _execute(lambda: _run_query(
-        "SELECT * FROM strategy_versions WHERE promoted_to_real = true AND status != 'suspended' "
-        "AND strategy_type = %s ORDER BY version_number DESC LIMIT 1",
-        (strategy_type,),
+    rows = _execute(lambda: _query(
+        "strategy_versions",
+        [("strategy_type", "==", strategy_type), ("promoted_to_real", "==", True), ("status", "==", "active")],
+        order_by="version_number", desc=True, limit=1,
     ))
     return rows[0] if rows else None
 
@@ -239,17 +339,21 @@ def insert_strategy_version(
     notes: str | None = None,
     strategy_type: str = "default",
 ) -> dict:
-    return _insert_row("strategy_versions", {
+    return _insert_doc("strategy_versions", {
         "version_number": version_number,
         "prompt_text": prompt_text,
         "params_json": params_json,
+        "promoted_to_real": False,
         "notes": notes,
+        "status": "active",
+        "promotion_eligible": False,
         "strategy_type": strategy_type,
+        "created_at": datetime.now(timezone.utc),
     })
 
 
 def promote_version(version_id: int) -> None:
-    _run_write("UPDATE strategy_versions SET promoted_to_real = true WHERE id = %s", (version_id,))
+    _set_doc("strategy_versions", str(version_id), {"promoted_to_real": True})
 
 
 def set_strategy_version_promotion_eligible(version_id: int, eligible: bool) -> None:
@@ -258,11 +362,11 @@ def set_strategy_version_promotion_eligible(version_id: int, eligible: bool) -> 
     evolution_agent.py calls promote_version() itself immediately after on
     PROMOTE, fully automatically, no human step. This flag is a record of
     the decision, not a queue awaiting manual action."""
-    _run_write("UPDATE strategy_versions SET promotion_eligible = %s WHERE id = %s", (eligible, version_id))
+    _set_doc("strategy_versions", str(version_id), {"promotion_eligible": eligible})
 
 
 def get_all_strategy_versions() -> list[dict]:
-    return _run_query("SELECT * FROM strategy_versions ORDER BY version_number DESC")
+    return _query("strategy_versions", order_by="version_number", desc=True)
 
 
 # --- trades ---
@@ -277,14 +381,21 @@ def open_trade(
     entry_price: float,
     fees: float,
     reasoning_text: str,
+    strategy_type: str,
     stop_loss_price: float | None = None,
     take_profit_price: float | None = None,
     entry_slippage_pct: float | None = None,
     market_regime: str | None = None,
 ) -> dict:
-    return _insert_row("trades", {
+    """strategy_type is a required param here (not optional/additive like
+    the read-side functions below) — Firestore has no JOIN, so trades
+    carries its own strategy_type field instead of deriving one via
+    version_id -> strategy_versions at read time. Sole call site
+    (orchestrator.py) is already inside the per-strategy_type loop."""
+    return _insert_doc("trades", {
         "mode": mode,
         "version_id": version_id,
+        "strategy_type": strategy_type,
         "symbol": symbol,
         "side": side,
         "qty": qty,
@@ -296,33 +407,33 @@ def open_trade(
         "take_profit_price": take_profit_price,
         "entry_slippage_pct": entry_slippage_pct,
         "market_regime": market_regime,
+        "opened_at": datetime.now(timezone.utc),
+        "mfe_pct": 0,
+        "mae_pct": 0,
     })
 
 
 def close_trade(
     trade_id: int, exit_price: float, pnl: float, status: str = "closed", exit_reason: str | None = None
 ) -> None:
-    _run_write(
-        "UPDATE trades SET exit_price = %s, pnl = %s, status = %s, exit_reason = %s, closed_at = %s "
-        "WHERE id = %s",
-        (exit_price, pnl, status, exit_reason, datetime.now(timezone.utc).isoformat(), trade_id),
-    )
+    _set_doc("trades", str(trade_id), {
+        "exit_price": exit_price,
+        "pnl": pnl,
+        "status": status,
+        "exit_reason": exit_reason,
+        "closed_at": datetime.now(timezone.utc),
+    })
 
 
 def update_trade_excursion(trade_id: int, mfe_pct: float, mae_pct: float) -> None:
-    _run_write("UPDATE trades SET mfe_pct = %s, mae_pct = %s WHERE id = %s", (mfe_pct, mae_pct, trade_id))
+    _set_doc("trades", str(trade_id), {"mfe_pct": mfe_pct, "mae_pct": mae_pct})
 
 
 def get_open_trades(mode: str, strategy_type: str | None = None) -> list[dict]:
-    if strategy_type is None:
-        return _execute(lambda: _run_query(
-            "SELECT * FROM trades WHERE mode = %s AND status = 'open'", (mode,)
-        ))
-    return _execute(lambda: _run_query(
-        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
-        "WHERE t.mode = %s AND t.status = 'open' AND sv.strategy_type = %s",
-        (mode, strategy_type),
-    ))
+    filters = [("mode", "==", mode), ("status", "==", "open")]
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _execute(lambda: _query("trades", filters))
 
 
 def get_recently_closed_trades(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:
@@ -334,35 +445,23 @@ def get_recently_closed_trades(mode: str, since: datetime, strategy_type: str | 
     LEARNING_HISTORY_WINDOW_DAYS for stats bucket recompute) so this
     never becomes a full-table scan. strategy_type is additive/optional —
     omitted keeps today's exact mode-wide (cross-strategy-type) query."""
-    if strategy_type is None:
-        return _run_query(
-            "SELECT * FROM trades WHERE mode = %s AND status = ANY(%s) AND closed_at >= %s",
-            (mode, ["closed", "flattened"], since.isoformat()),
-        )
-    return _run_query(
-        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
-        "WHERE t.mode = %s AND t.status = ANY(%s) AND t.closed_at >= %s AND sv.strategy_type = %s",
-        (mode, ["closed", "flattened"], since.isoformat(), strategy_type),
-    )
+    filters = [("mode", "==", mode), ("status", "in", ["closed", "flattened"]), ("closed_at", ">=", since)]
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _query("trades", filters)
 
 
 def get_recent_trades(mode: str, limit: int = 50, strategy_type: str | None = None) -> list[dict]:
-    if strategy_type is None:
-        return _run_query(
-            "SELECT * FROM trades WHERE mode = %s ORDER BY opened_at DESC LIMIT %s", (mode, limit)
-        )
-    return _run_query(
-        "SELECT t.* FROM trades t JOIN strategy_versions sv ON t.version_id = sv.id "
-        "WHERE t.mode = %s AND sv.strategy_type = %s ORDER BY t.opened_at DESC LIMIT %s",
-        (mode, strategy_type, limit),
-    )
+    filters = [("mode", "==", mode)]
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _query("trades", filters, order_by="opened_at", desc=True, limit=limit)
 
 
 def get_closed_trades(mode: str, version_id: int) -> list[dict]:
-    return _run_query(
-        "SELECT * FROM trades WHERE mode = %s AND version_id = %s AND status = ANY(%s)",
-        (mode, version_id, ["closed", "flattened"]),
-    )
+    return _query("trades", [
+        ("mode", "==", mode), ("version_id", "==", version_id), ("status", "in", ["closed", "flattened"]),
+    ])
 
 
 # --- risk_check_lock ---
@@ -374,29 +473,46 @@ def try_acquire_risk_check_lock(mode: str, stale_after_seconds: int = 180) -> bo
     the next fires. `stale_after_seconds` self-heals a lock left held by
     a crashed process rather than deadlocking the mode forever (ponytail:
     fixed 3min ceiling, revisit only if a real run ever legitimately
-    takes that long)."""
-    rows = _run_write(
-        "UPDATE risk_check_lock SET locked_at = now() "
-        "WHERE mode = %s AND (locked_at IS NULL OR locked_at < now() - make_interval(secs => %s)) "
-        "RETURNING mode",
-        (mode, stale_after_seconds),
-    )
-    return bool(rows)
+    takes that long).
+
+    A plain get-then-set would be a TOCTOU race — two concurrent runs
+    could both read "unlocked" before either writes. Firestore's
+    optimistic-concurrency transaction closes that gap: if a concurrent
+    transaction commits a write to this doc between this one's read and
+    its own commit, this one aborts and the client library retries
+    _attempt, which re-reads the winner's fresh write and correctly
+    returns False. (Migration 0015's reason for avoiding
+    pg_advisory_lock — PgBouncer transaction-mode pooling breaking
+    session-level locks — doesn't apply to Firestore, which has no
+    connection-pooling session concept at all.)"""
+    doc_ref = get_firestore_client().collection("risk_check_lock").document(mode)
+
+    @firestore.transactional
+    def _attempt(transaction: firestore.Transaction) -> bool:
+        snapshot = doc_ref.get(transaction=transaction)
+        locked_at = snapshot.get("locked_at") if snapshot.exists else None
+        now = datetime.now(timezone.utc)
+        if locked_at is not None and (now - locked_at).total_seconds() < stale_after_seconds:
+            return False
+        transaction.set(doc_ref, {"mode": mode, "locked_at": now}, merge=True)
+        return True
+
+    return _attempt(get_firestore_client().transaction())
 
 
 def release_risk_check_lock(mode: str) -> None:
-    _run_write("UPDATE risk_check_lock SET locked_at = NULL WHERE mode = %s", (mode,))
+    _set_doc("risk_check_lock", mode, {"locked_at": None})
 
 
 # --- daily_pnl ---
 
 
+def _daily_pnl_doc_id(day: Date, mode: str, strategy_type: str) -> str:
+    return f"{day.isoformat()}_{mode}_{strategy_type}"
+
+
 def get_daily_pnl(day: Date, mode: str, strategy_type: str = "default") -> dict | None:
-    rows = _execute(lambda: _run_query(
-        "SELECT * FROM daily_pnl WHERE date = %s AND mode = %s AND strategy_type = %s",
-        (day.isoformat(), mode, strategy_type),
-    ))
-    return rows[0] if rows else None
+    return _execute(lambda: _get_doc("daily_pnl", _daily_pnl_doc_id(day, mode, strategy_type)))
 
 
 def upsert_daily_pnl(
@@ -408,19 +524,15 @@ def upsert_daily_pnl(
     circuit_breaker_triggered: bool,
     strategy_type: str = "default",
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO daily_pnl
-            (date, mode, strategy_type, realized_pnl, trades_count, target_hit, circuit_breaker_triggered)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (date, mode, strategy_type) DO UPDATE SET
-            realized_pnl = EXCLUDED.realized_pnl,
-            trades_count = EXCLUDED.trades_count,
-            target_hit = EXCLUDED.target_hit,
-            circuit_breaker_triggered = EXCLUDED.circuit_breaker_triggered
-        """,
-        (day.isoformat(), mode, strategy_type, realized_pnl, trades_count, target_hit, circuit_breaker_triggered),
-    )
+    _set_doc("daily_pnl", _daily_pnl_doc_id(day, mode, strategy_type), {
+        "date": day.isoformat(),
+        "mode": mode,
+        "strategy_type": strategy_type,
+        "realized_pnl": realized_pnl,
+        "trades_count": trades_count,
+        "target_hit": target_hit,
+        "circuit_breaker_triggered": circuit_breaker_triggered,
+    })
 
 
 # --- agent_logs ---
@@ -429,10 +541,13 @@ def upsert_daily_pnl(
 def log_agent_event(
     agent_name: str, level: str, message: str, raw_llm_response: Any = None
 ) -> None:
-    _run_write(
-        "INSERT INTO agent_logs (agent_name, level, message, raw_llm_response) VALUES (%s, %s, %s, %s)",
-        (agent_name, level, message, raw_llm_response),
-    )
+    _insert_doc("agent_logs", {
+        "timestamp": datetime.now(timezone.utc),
+        "agent_name": agent_name,
+        "level": level,
+        "message": message,
+        "raw_llm_response": raw_llm_response,
+    })
 
 
 # --- model_usage ---
@@ -477,6 +592,7 @@ def log_opportunity_evaluation(
     risk_manager_result: str | None,
     final_decision: str,
     reason: str | None,
+    strategy_type: str,
     trade_id: int | None = None,
     market_regime: str | None = None,
     config_version: str | None = None,
@@ -487,11 +603,16 @@ def log_opportunity_evaluation(
     input/decision/output/reason/strategy-version/confidence/trade-id) was
     already captured by this table plus confidence_calibration/trades, so
     src.audit.trail reads those three tables rather than adding a new
-    write path."""
-    return _insert_row("opportunity_evaluations", {
+    write path. strategy_type is required (not optional/additive) for the
+    same reason as open_trade's — Firestore has no JOIN, so this table
+    carries its own strategy_type field. Sole call site (orchestrator.py)
+    is already inside the per-strategy_type loop."""
+    return _insert_doc("opportunity_evaluations", {
+        "timestamp": datetime.now(timezone.utc),
         "mode": mode,
         "symbol": symbol,
         "version_id": version_id,
+        "strategy_type": strategy_type,
         "features": features,
         "trend_score": trend_score,
         "momentum_score": momentum_score,
@@ -517,26 +638,24 @@ def log_opportunity_evaluation(
 def upsert_learning_statistics(
     mode: str, dimension_type: str, dimension_value: str, stats: dict, strategy_type: str = "default"
 ) -> None:
-    cols = ["mode", "strategy_type", "dimension_type", "dimension_value", *stats.keys()]
-    vals = [mode, strategy_type, dimension_type, dimension_value, *stats.values()]
-    col_list = ", ".join(cols)
-    placeholders = ", ".join(["%s"] * len(cols))
-    set_clause = ", ".join(f"{k} = EXCLUDED.{k}" for k in stats)
-    _run_write(
-        f"INSERT INTO learning_statistics ({col_list}) VALUES ({placeholders}) "
-        f"ON CONFLICT (mode, strategy_type, dimension_type, dimension_value) DO UPDATE SET {set_clause}",
-        tuple(vals),
-    )
+    doc_id = f"{mode}_{strategy_type}_{dimension_type}_{dimension_value}"
+    _set_doc("learning_statistics", doc_id, {
+        "mode": mode,
+        "strategy_type": strategy_type,
+        "dimension_type": dimension_type,
+        "dimension_value": dimension_value,
+        **stats,
+        "computed_at": datetime.now(timezone.utc),
+    })
 
 
 def get_learning_statistics(
     mode: str, dimension_type: str | None = None, strategy_type: str = "default"
 ) -> list[dict]:
-    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if dimension_type is not None:
-        clauses.append("dimension_type = %s")
-        params.append(dimension_type)
-    return _run_query(f"SELECT * FROM learning_statistics WHERE {' AND '.join(clauses)}", tuple(params))
+        filters.append(("dimension_type", "==", dimension_type))
+    return _query("learning_statistics", filters)
 
 
 # --- feature_importance ---
@@ -550,27 +669,25 @@ def upsert_feature_importance(
     timeframe: str,
     strategy_type: str = "default",
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO feature_importance
-            (mode, strategy_type, feature_name, correlation_score, sample_count, timeframe)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (mode, strategy_type, feature_name, timeframe) DO UPDATE SET
-            correlation_score = EXCLUDED.correlation_score,
-            sample_count = EXCLUDED.sample_count
-        """,
-        (mode, strategy_type, feature_name, correlation_score, sample_count, timeframe),
-    )
+    doc_id = f"{mode}_{strategy_type}_{feature_name}_{timeframe}"
+    _set_doc("feature_importance", doc_id, {
+        "mode": mode,
+        "strategy_type": strategy_type,
+        "feature_name": feature_name,
+        "timeframe": timeframe,
+        "correlation_score": correlation_score,
+        "sample_count": sample_count,
+        "computed_at": datetime.now(timezone.utc),
+    })
 
 
 def get_feature_importance(
     mode: str, timeframe: str | None = None, strategy_type: str = "default"
 ) -> list[dict]:
-    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if timeframe is not None:
-        clauses.append("timeframe = %s")
-        params.append(timeframe)
-    return _run_query(f"SELECT * FROM feature_importance WHERE {' AND '.join(clauses)}", tuple(params))
+        filters.append(("timeframe", "==", timeframe))
+    return _query("feature_importance", filters)
 
 
 def get_opportunity_evaluations_for_trail(
@@ -585,42 +702,25 @@ def get_opportunity_evaluations_for_trail(
     query in audit/trail.py) so every DB access in src/ goes through this
     file, per this repo's own convention. strategy_type is additive/
     optional — omitted keeps today's exact mode-wide (cross-strategy-type)
-    query, matching the audit trail's own "show everything" default."""
-    if strategy_type is None:
-        clauses, params = ["mode = %s"], [mode]
-        if trade_id is not None:
-            clauses.append("trade_id = %s")
-            params.append(trade_id)
-        if symbol is not None:
-            clauses.append("symbol = %s")
-            params.append(symbol)
-        if since is not None:
-            clauses.append("timestamp >= %s")
-            params.append(since.isoformat())
-        query = f"SELECT * FROM opportunity_evaluations WHERE {' AND '.join(clauses)} ORDER BY timestamp"
-        return _run_query(query, tuple(params))
-
-    clauses, params = ["oe.mode = %s", "sv.strategy_type = %s"], [mode, strategy_type]
+    query, matching the audit trail's own "show everything" default. No
+    JOIN needed (unlike the old Postgres version) — Firestore reads
+    strategy_type straight off the row, written there by
+    log_opportunity_evaluation."""
+    filters = [("mode", "==", mode)]
     if trade_id is not None:
-        clauses.append("oe.trade_id = %s")
-        params.append(trade_id)
+        filters.append(("trade_id", "==", trade_id))
     if symbol is not None:
-        clauses.append("oe.symbol = %s")
-        params.append(symbol)
+        filters.append(("symbol", "==", symbol))
     if since is not None:
-        clauses.append("oe.timestamp >= %s")
-        params.append(since.isoformat())
-    query = (
-        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
-        f"WHERE {' AND '.join(clauses)} ORDER BY oe.timestamp"
-    )
-    return _run_query(query, tuple(params))
+        filters.append(("timestamp", ">=", since))
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _query("opportunity_evaluations", filters, order_by="timestamp")
 
 
 def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
-    rows = _run_query(
-        "SELECT * FROM opportunity_evaluations WHERE trade_id = %s AND final_decision = 'buy' LIMIT 1",
-        (trade_id,),
+    rows = _query(
+        "opportunity_evaluations", [("trade_id", "==", trade_id), ("final_decision", "==", "buy")], limit=1
     )
     return rows[0] if rows else None
 
@@ -629,9 +729,8 @@ def get_entry_evaluation_for_trade(trade_id: int) -> dict | None:
 
 
 def get_confidence_calibration_for_evaluation(opportunity_evaluation_id: int) -> dict | None:
-    rows = _run_query(
-        "SELECT * FROM confidence_calibration WHERE opportunity_evaluation_id = %s LIMIT 1",
-        (opportunity_evaluation_id,),
+    rows = _query(
+        "confidence_calibration", [("opportunity_evaluation_id", "==", opportunity_evaluation_id)], limit=1
     )
     return rows[0] if rows else None
 
@@ -648,17 +747,19 @@ def log_confidence_calibration(
     symbol_modifier: float | None = None,
     recent_performance_modifier: float | None = None,
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO confidence_calibration
-            (opportunity_evaluation_id, ai_confidence, historical_confidence, ai_weight,
-             historical_weight, final_confidence, similar_trades_count, regime_modifier,
-             symbol_modifier, recent_performance_modifier)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (opportunity_evaluation_id, ai_confidence, historical_confidence, ai_weight, historical_weight,
-         final_confidence, similar_trades_count, regime_modifier, symbol_modifier, recent_performance_modifier),
-    )
+    _insert_doc("confidence_calibration", {
+        "opportunity_evaluation_id": opportunity_evaluation_id,
+        "ai_confidence": ai_confidence,
+        "historical_confidence": historical_confidence,
+        "ai_weight": ai_weight,
+        "historical_weight": historical_weight,
+        "final_confidence": final_confidence,
+        "similar_trades_count": similar_trades_count,
+        "regime_modifier": regime_modifier,
+        "symbol_modifier": symbol_modifier,
+        "recent_performance_modifier": recent_performance_modifier,
+        "created_at": datetime.now(timezone.utc),
+    })
 
 
 # --- recommendations ---
@@ -819,34 +920,22 @@ def upsert_trade_evaluation(
     stop_loss_assessment: str | None,
     target_assessment: str | None,
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO trade_evaluations
-            (trade_id, predicted_confidence, predicted_opportunity_score, actual_outcome_won,
-             confidence_was_accurate, opportunity_score_was_accurate, risk_assessment,
-             stop_loss_assessment, target_assessment)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (trade_id) DO UPDATE SET
-            predicted_confidence = EXCLUDED.predicted_confidence,
-            predicted_opportunity_score = EXCLUDED.predicted_opportunity_score,
-            actual_outcome_won = EXCLUDED.actual_outcome_won,
-            confidence_was_accurate = EXCLUDED.confidence_was_accurate,
-            opportunity_score_was_accurate = EXCLUDED.opportunity_score_was_accurate,
-            risk_assessment = EXCLUDED.risk_assessment,
-            stop_loss_assessment = EXCLUDED.stop_loss_assessment,
-            target_assessment = EXCLUDED.target_assessment
-        """,
-        (trade_id, predicted_confidence, predicted_opportunity_score, actual_outcome_won,
-         confidence_was_accurate, opportunity_score_was_accurate, risk_assessment,
-         stop_loss_assessment, target_assessment),
-    )
+    _set_doc("trade_evaluations", str(trade_id), {
+        "trade_id": trade_id,
+        "predicted_confidence": predicted_confidence,
+        "predicted_opportunity_score": predicted_opportunity_score,
+        "actual_outcome_won": actual_outcome_won,
+        "confidence_was_accurate": confidence_was_accurate,
+        "opportunity_score_was_accurate": opportunity_score_was_accurate,
+        "risk_assessment": risk_assessment,
+        "stop_loss_assessment": stop_loss_assessment,
+        "target_assessment": target_assessment,
+        "evaluated_at": datetime.now(timezone.utc),
+    })
 
 
 def get_trade_evaluation_ids(trade_ids: list[int]) -> set[int]:
-    if not trade_ids:
-        return set()
-    rows = _run_query("SELECT trade_id FROM trade_evaluations WHERE trade_id = ANY(%s)", (trade_ids,))
-    return {row["trade_id"] for row in rows}
+    return {int(snap.id) for snap in _get_docs_by_ids("trade_evaluations", trade_ids)}
 
 
 def get_trade_evaluations(trade_ids: list[int]) -> list[dict]:
@@ -854,15 +943,11 @@ def get_trade_evaluations(trade_ids: list[int]) -> list[dict]:
     opportunity_score_was_accurate) for drift_detection.py — distinct from
     get_trade_evaluation_ids, which only returns the id set for the
     already-evaluated membership check process_closed_trades() needs."""
-    if not trade_ids:
-        return []
-    return _run_query("SELECT * FROM trade_evaluations WHERE trade_id = ANY(%s)", (trade_ids,))
+    return [_doc_to_dict(snap) for snap in _get_docs_by_ids("trade_evaluations", trade_ids)]
 
 
 def get_trades_by_ids(trade_ids: list[int]) -> list[dict]:
-    if not trade_ids:
-        return []
-    return _run_query("SELECT * FROM trades WHERE id = ANY(%s)", (trade_ids,))
+    return [_doc_to_dict(snap) for snap in _get_docs_by_ids("trades", trade_ids)]
 
 
 # --- historical_candles ---
@@ -1069,16 +1154,10 @@ def get_entry_evaluations_since(mode: str, since: datetime, strategy_type: str |
     via get_trades_by_ids() and match in Python, same pattern as
     process_closed_trades()'s diff. strategy_type is additive/optional —
     omitted keeps today's exact mode-wide (cross-strategy-type) query."""
-    if strategy_type is None:
-        return _run_query(
-            "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'buy' AND timestamp >= %s",
-            (mode, since.isoformat()),
-        )
-    return _run_query(
-        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
-        "WHERE oe.mode = %s AND oe.final_decision = 'buy' AND oe.timestamp >= %s AND sv.strategy_type = %s",
-        (mode, since.isoformat(), strategy_type),
-    )
+    filters = [("mode", "==", mode), ("final_decision", "==", "buy"), ("timestamp", ">=", since)]
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _query("opportunity_evaluations", filters)
 
 
 def get_hold_evaluations_since(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:
@@ -1087,16 +1166,10 @@ def get_hold_evaluations_since(mode: str, since: datetime, strategy_type: str | 
     reason/risk_manager_result (Root Cause Analysis, Scientific Strategy
     Optimization Framework). Same shape as get_entry_evaluations_since,
     filtering the opposite final_decision value."""
-    if strategy_type is None:
-        return _run_query(
-            "SELECT * FROM opportunity_evaluations WHERE mode = %s AND final_decision = 'hold' AND timestamp >= %s",
-            (mode, since.isoformat()),
-        )
-    return _run_query(
-        "SELECT oe.* FROM opportunity_evaluations oe JOIN strategy_versions sv ON oe.version_id = sv.id "
-        "WHERE oe.mode = %s AND oe.final_decision = 'hold' AND oe.timestamp >= %s AND sv.strategy_type = %s",
-        (mode, since.isoformat(), strategy_type),
-    )
+    filters = [("mode", "==", mode), ("final_decision", "==", "hold"), ("timestamp", ">=", since)]
+    if strategy_type is not None:
+        filters.append(("strategy_type", "==", strategy_type))
+    return _query("opportunity_evaluations", filters)
 
 
 # --- data_quality_log (Market Data Quality Engine + Data Repair Engine,
@@ -1194,13 +1267,13 @@ def update_strategy_version_status(version_id: int, status: str) -> None:
     """Status-only marking (active/suspended) — never a delete. A human can
     always flip it back; nothing in code reverses it the other direction
     automatically."""
-    _run_write("UPDATE strategy_versions SET status = %s WHERE id = %s", (status, version_id))
+    _set_doc("strategy_versions", str(version_id), {"status": status})
 
 
 def get_active_strategy_versions() -> list[dict]:
-    return _run_query(
-        "SELECT * FROM strategy_versions WHERE status != 'suspended' ORDER BY version_number DESC"
-    )
+    # status is only ever 'active'/'suspended' — see get_latest_version's
+    # comment on why 'active' equality replaces the old '!= suspended'.
+    return _query("strategy_versions", [("status", "==", "active")], order_by="version_number", desc=True)
 
 
 # --- system_metrics (Production Monitoring + Self-Diagnostics,

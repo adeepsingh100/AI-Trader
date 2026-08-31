@@ -3,48 +3,47 @@ from unittest.mock import MagicMock
 
 from src.db import models
 from src.groq_client import ModelUsageEvent
-from tests.conftest import _fake_connection, _inserted_row, _last_execute, _updated_row
+from tests.conftest import _fake_connection, _fake_firestore_client, _inserted_row, _last_execute, _updated_row
 
 
 def test_open_trade_inserts_expected_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    result = models.open_trade("paper", 1, "BTCINR", "buy", 0.001, 6200000, 5.0, "signal said buy")
+    result = models.open_trade(
+        "paper", 1, "BTCINR", "buy", 0.001, 6200000, 5.0, "signal said buy", strategy_type="default"
+    )
 
-    row = _inserted_row(cur)
+    (row,) = store["trades"].values()
     assert row["mode"] == "paper"
     assert row["status"] == "open"
     assert row["symbol"] == "BTCINR"
-    assert result == {"id": 1}
+    assert row["strategy_type"] == "default"
+    assert result["id"] in store["trades"]
 
 
 def test_close_trade_sets_closed_fields(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client(seed={"trades": {"1": {"status": "open"}}})
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.close_trade(1, exit_price=6300000, pnl=100.0)
 
-    row = _updated_row(cur)
+    row = store["trades"]["1"]
     assert row["exit_price"] == 6300000
     assert row["pnl"] == 100.0
     assert row["status"] == "closed"
     assert "closed_at" in row
-    sql, params = _last_execute(cur)
-    assert params[-1] == 1  # WHERE id = %s
 
 
 def test_upsert_daily_pnl_conflict_key(monkeypatch):
     import datetime
 
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_daily_pnl(datetime.date(2026, 8, 15), "paper", 100.0, 3, True, False)
 
-    sql, params = _last_execute(cur)
-    assert "ON CONFLICT (date, mode, strategy_type)" in sql
-    row = _inserted_row(cur)
+    row = store["daily_pnl"]["2026-08-15_paper_default"]
     assert row["date"] == "2026-08-15"
     assert row["mode"] == "paper"
     assert row["strategy_type"] == "default"
@@ -78,20 +77,22 @@ def test_log_model_usage_skips_empty(monkeypatch):
 
 
 def test_get_latest_promoted_version_filters_and_orders(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 2, "promoted_to_real": True}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"strategy_versions": {
+        "1": {"strategy_type": "default", "status": "active", "promoted_to_real": False, "version_number": 1},
+        "2": {"strategy_type": "default", "status": "active", "promoted_to_real": True, "version_number": 2},
+        "3": {"strategy_type": "default", "status": "active", "promoted_to_real": True, "version_number": 1},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_latest_promoted_version()
 
-    sql, _ = _last_execute(cur)
-    assert "promoted_to_real = true" in sql
-    assert "ORDER BY version_number DESC" in sql
-    assert result["id"] == 2
+    assert result["id"] == "2"  # promoted, and the higher version_number of the two promoted rows
 
 
 def test_log_opportunity_evaluation_inserts_expected_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.log_opportunity_evaluation(
         mode="paper",
@@ -110,75 +111,76 @@ def test_log_opportunity_evaluation_inserts_expected_row(monkeypatch):
         risk_manager_result="size",
         final_decision="buy",
         reason="strong setup",
+        strategy_type="default",
     )
 
-    row = _inserted_row(cur)
+    (row,) = store["opportunity_evaluations"].values()
     assert row["symbol"] == "BTCINR"
     assert row["opportunity_score"] == 82.0
     assert row["llm_decision"] == "accept"
     assert row["final_decision"] == "buy"
     assert row["features"] == {"5m": {"rsi": 55.0}}
+    assert row["strategy_type"] == "default"
 
 
 # --- learning engine: trades extensions ---
 
 
 def test_open_trade_includes_learning_engine_fields(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.open_trade(
-        "paper", 1, "BTCINR", "buy", 0.001, 6200000, 5.0, "go",
+        "paper", 1, "BTCINR", "buy", 0.001, 6200000, 5.0, "go", strategy_type="default",
         stop_loss_price=6076000, take_profit_price=6448000,
         entry_slippage_pct=0.05, market_regime="strong_bull",
     )
 
-    row = _inserted_row(cur)
+    (row,) = store["trades"].values()
     assert row["stop_loss_price"] == 6076000
     assert row["take_profit_price"] == 6448000
     assert row["market_regime"] == "strong_bull"
 
 
 def test_close_trade_includes_exit_reason(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client(seed={"trades": {"1": {"status": "open"}}})
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.close_trade(1, exit_price=6300000, pnl=100.0, exit_reason="take_profit")
 
-    row = _updated_row(cur)
-    assert row["exit_reason"] == "take_profit"
+    assert store["trades"]["1"]["exit_reason"] == "take_profit"
 
 
 def test_update_trade_excursion(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client(seed={"trades": {"1": {}}})
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.update_trade_excursion(1, mfe_pct=2.5, mae_pct=1.1)
 
-    row = _updated_row(cur)
-    assert row == {"mfe_pct": 2.5, "mae_pct": 1.1}
-    sql, params = _last_execute(cur)
-    assert params[-1] == 1
+    assert store["trades"]["1"] == {"mfe_pct": 2.5, "mae_pct": 1.1}
 
 
 def test_get_recently_closed_trades_filters_by_mode_status_and_time(monkeypatch):
     import datetime
 
-    conn, cur = _fake_connection(rows=[{"id": 1, "status": "closed"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"trades": {
+        "1": {"mode": "paper", "status": "closed", "closed_at": datetime.datetime(2026, 1, 2, tzinfo=datetime.timezone.utc)},
+        "2": {"mode": "paper", "status": "open", "closed_at": None},
+        "3": {"mode": "paper", "status": "closed", "closed_at": datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)},
+        "4": {"mode": "real", "status": "closed", "closed_at": datetime.datetime(2026, 1, 2, tzinfo=datetime.timezone.utc)},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     since = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
     result = models.get_recently_closed_trades("paper", since)
 
-    sql, params = _last_execute(cur)
-    assert "mode = %s" in sql and "status = ANY(%s)" in sql and "closed_at >= %s" in sql
-    assert params == ("paper", ["closed", "flattened"], since.isoformat())
-    assert result == [{"id": 1, "status": "closed"}]
+    assert {r["id"] for r in result} == {"1"}
 
 
 def test_log_opportunity_evaluation_returns_row_and_includes_trade_id(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 42}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.log_opportunity_evaluation(
         mode="paper", symbol="BTCINR", version_id=1, features={},
@@ -186,87 +188,93 @@ def test_log_opportunity_evaluation_returns_row_and_includes_trade_id(monkeypatc
         volatility_score=None, risk_score=None, opportunity_score=None,
         llm_decision=None, llm_reasoning=None, llm_raw_response=None,
         risk_manager_result=None, final_decision="hold", reason=None,
-        trade_id=7,
+        strategy_type="default", trade_id=7,
     )
 
-    row = _inserted_row(cur)
+    (row,) = store["opportunity_evaluations"].values()
     assert row["trade_id"] == 7
-    assert result == {"id": 42}
+    assert result["trade_id"] == 7
+    assert result["id"] in store["opportunity_evaluations"]
 
 
 # --- learning_statistics ---
 
 
 def test_upsert_learning_statistics_conflict_key(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_learning_statistics("paper", "symbol", "BTCINR", {"win_rate": 0.5, "trades_count": 10})
 
-    sql, params = _last_execute(cur)
-    assert "ON CONFLICT (mode, strategy_type, dimension_type, dimension_value)" in sql
-    row = _inserted_row(cur)
+    row = store["learning_statistics"]["paper_default_symbol_BTCINR"]
     assert row["dimension_type"] == "symbol"
     assert row["win_rate"] == 0.5
     assert row["strategy_type"] == "default"
 
 
 def test_get_learning_statistics_filters_by_dimension_type(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"dimension_value": "BTCINR"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"learning_statistics": {
+        "paper_default_symbol_BTCINR": {
+            "mode": "paper", "strategy_type": "default", "dimension_type": "symbol", "dimension_value": "BTCINR",
+        },
+        "paper_default_regime_bull": {
+            "mode": "paper", "strategy_type": "default", "dimension_type": "regime", "dimension_value": "bull",
+        },
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_learning_statistics("paper", dimension_type="symbol")
 
-    sql, params = _last_execute(cur)
-    assert "dimension_type = %s" in sql
-    assert "symbol" in params
-    assert result == [{"dimension_value": "BTCINR"}]
+    assert [r["dimension_value"] for r in result] == ["BTCINR"]
 
 
 # --- feature_importance ---
 
 
 def test_upsert_feature_importance_conflict_key(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_feature_importance("paper", "rsi", 0.42, 30, "1h")
 
-    sql, _ = _last_execute(cur)
-    assert "ON CONFLICT (mode, strategy_type, feature_name, timeframe)" in sql
-    row = _inserted_row(cur)
+    row = store["feature_importance"]["paper_default_rsi_1h"]
     assert row["timeframe"] == "1h"
     assert row["strategy_type"] == "default"
 
 
 def test_get_feature_importance_filters_by_timeframe(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"feature_name": "trend_score", "timeframe": "blended"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"feature_importance": {
+        "paper_default_trend_score_blended": {
+            "mode": "paper", "strategy_type": "default", "feature_name": "trend_score", "timeframe": "blended",
+        },
+        "paper_default_trend_score_1h": {
+            "mode": "paper", "strategy_type": "default", "feature_name": "trend_score", "timeframe": "1h",
+        },
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_feature_importance("paper", timeframe="blended")
 
-    sql, params = _last_execute(cur)
-    assert "timeframe = %s" in sql
-    assert "blended" in params
-    assert result == [{"feature_name": "trend_score", "timeframe": "blended"}]
+    assert [r["timeframe"] for r in result] == ["blended"]
 
 
 # --- confidence_calibration ---
 
 
 def test_log_confidence_calibration_inserts_expected_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.log_confidence_calibration(
         opportunity_evaluation_id=42, ai_confidence=80, historical_confidence=60,
         ai_weight=0.6, historical_weight=0.4, final_confidence=72.0, similar_trades_count=10,
     )
 
-    sql, params = _last_execute(cur)
-    assert "INSERT INTO confidence_calibration" in sql
-    assert 42 in params
-    assert 72.0 in params
+    (row,) = store["confidence_calibration"].values()
+    assert row["opportunity_evaluation_id"] == 42
+    assert row["final_confidence"] == 72.0
 
 
 # --- recommendations ---
@@ -294,8 +302,8 @@ def test_get_latest_recommendation_none_when_no_rows(monkeypatch):
 
 
 def test_upsert_trade_evaluation_conflict_key(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_trade_evaluation(
         trade_id=7, predicted_confidence=80.0, predicted_opportunity_score=85.0,
@@ -304,21 +312,28 @@ def test_upsert_trade_evaluation_conflict_key(monkeypatch):
         stop_loss_assessment="appropriate", target_assessment="realistic",
     )
 
-    sql, _ = _last_execute(cur)
-    assert "ON CONFLICT (trade_id)" in sql
+    row = store["trade_evaluations"]["7"]  # doc ID IS the trade_id — upsert-by-doc-ID is the conflict key
+    assert row["trade_id"] == 7
+    assert row["actual_outcome_won"] is True
 
 
 def test_get_trade_evaluation_ids_empty_input_skips_query(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    called = False
+
+    def _fail(*a, **kw):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
 
     assert models.get_trade_evaluation_ids([]) == set()
-    conn.cursor.assert_not_called()
+    assert not called
 
 
 def test_get_trade_evaluation_ids_returns_set(monkeypatch):
-    conn, _ = _fake_connection(rows=[{"trade_id": 1}, {"trade_id": 3}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"trade_evaluations": {"1": {"trade_id": 1}, "3": {"trade_id": 3}}}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     assert models.get_trade_evaluation_ids([1, 2, 3]) == {1, 3}
 
@@ -423,53 +438,55 @@ def test_get_latest_promotion_audit_returns_none_when_empty(monkeypatch):
 
 
 # --- multi-strategy-type: strategy_type=None keeps the old mode-wide
-# query byte-identical; passing a real value switches to the join-through-
-# version_id-to-strategy_versions pattern, never both at once. ---
+# query byte-identical; passing a real value adds a strategy_type
+# equality filter, read straight off the trade doc (no JOIN needed —
+# Firestore has none, and open_trade denormalizes strategy_type onto
+# every trade at write time). ---
 
 
 def test_get_open_trades_without_strategy_type_is_unchanged_mode_wide_query(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"trades": {
+        "1": {"mode": "paper", "status": "open", "strategy_type": "default"},
+        "2": {"mode": "paper", "status": "open", "strategy_type": "swing"},
+        "3": {"mode": "paper", "status": "closed", "strategy_type": "default"},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.get_open_trades("paper")
+    result = models.get_open_trades("paper")
 
-    sql, params = _last_execute(cur)
-    assert "JOIN" not in sql
-    assert "trades WHERE mode = %s AND status = 'open'" in sql
-    assert params == ("paper",)
+    assert {r["id"] for r in result} == {"1", "2"}  # both strategy_types, mode-wide
 
 
-def test_get_open_trades_with_strategy_type_joins_strategy_versions(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_get_open_trades_with_strategy_type_filters_on_the_denormalized_field(monkeypatch):
+    seed = {"trades": {
+        "1": {"mode": "paper", "status": "open", "strategy_type": "default"},
+        "2": {"mode": "paper", "status": "open", "strategy_type": "swing"},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.get_open_trades("paper", "swing")
+    result = models.get_open_trades("paper", "swing")
 
-    sql, params = _last_execute(cur)
-    assert "JOIN strategy_versions sv ON t.version_id = sv.id" in sql
-    assert "sv.strategy_type = %s" in sql
-    assert params == ("paper", "swing")
+    assert {r["id"] for r in result} == {"2"}
 
 
 def test_get_capital_config_filters_by_mode_and_strategy_type(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"mode": "paper", "strategy_type": "swing"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"capital_config": {"paper_swing": {"mode": "paper", "strategy_type": "swing"}}}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_capital_config("paper", "swing")
 
-    sql, params = _last_execute(cur)
-    assert "mode = %s AND strategy_type = %s" in sql
-    assert params == ("paper", "swing")
-    assert result == {"mode": "paper", "strategy_type": "swing"}
+    assert result["mode"] == "paper"
+    assert result["strategy_type"] == "swing"
 
 
 def test_upsert_capital_config_conflict_key_is_mode_and_strategy_type(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_capital_config("paper", 1000, 1000, 50, 100, strategy_type="swing")
 
-    sql, _ = _last_execute(cur)
-    assert "ON CONFLICT (mode, strategy_type)" in sql
-    row = _inserted_row(cur)
+    row = store["capital_config"]["paper_swing"]  # doc ID IS the (mode, strategy_type) conflict key
     assert row["strategy_type"] == "swing"

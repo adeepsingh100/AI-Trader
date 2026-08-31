@@ -22,7 +22,7 @@ gcloud services enable \
   cloudbuild.googleapis.com
 ```
 
-### 1. Secrets — same 9 values currently in GitHub Secrets
+### 1. Secrets
 
 ```bash
 echo -n "VALUE" | gcloud secrets create LLM_PROVIDER --data-file=-
@@ -34,6 +34,7 @@ echo -n "VALUE" | gcloud secrets create OLLAMA_MODEL_CHAIN --data-file=-
 echo -n "VALUE" | gcloud secrets create DATABASE_URL --data-file=-
 echo -n "VALUE" | gcloud secrets create COINDCX_API_KEY --data-file=-
 echo -n "VALUE" | gcloud secrets create COINDCX_API_SECRET --data-file=-
+gcloud secrets create FIREBASE_SERVICE_ACCOUNT_JSON --data-file=service-account.json
 ```
 
 (Migrating off Supabase: `DATABASE_URL` is Neon's **pooled** connection
@@ -42,7 +43,20 @@ string — the same one `src/db/models.py` reads locally via `.env`. If
 delete them once every job below has been redeployed and verified:
 `gcloud secrets delete SUPABASE_URL SUPABASE_SERVICE_KEY`.)
 
-(Updating a value later: `echo -n "NEW_VALUE" | gcloud secrets versions add NAME --data-file=-`)
+(Migrating off Neon onto Firebase/Firestore, table-by-table — see
+`src/db/models.py`'s module docstring: `FIREBASE_SERVICE_ACCOUNT_JSON`
+is required starting Phase 1 alongside `DATABASE_URL`, not replacing it
+— every table not yet on its own migration phase still needs Neon.
+`service-account.json` is the key file downloaded from Firebase Console
+→ Project Settings → Service Accounts → Generate new private key,
+project `ai-bot-14723`; `--data-file=` uploads its contents as the
+secret value, same idea as the inline `echo -n` calls above but for a
+whole file. `DATABASE_URL` can be deleted once every table has migrated
+— not yet.)
+
+(Updating a value later: `echo -n "NEW_VALUE" | gcloud secrets versions add NAME --data-file=-`,
+or `gcloud secrets versions add FIREBASE_SERVICE_ACCOUNT_JSON --data-file=service-account.json`
+for the key file.)
 
 ### 2. Deploy the 3 Cloud Run Jobs
 
@@ -62,7 +76,7 @@ gcloud run jobs deploy trading-cycle \
   --command=bash \
   --args=deploy/run_trading_cycle.sh \
   --max-retries=0 \
-  --set-secrets=LLM_PROVIDER=LLM_PROVIDER:latest,GROQ_API_KEY=GROQ_API_KEY:latest,GROQ_MODEL_CHAIN=GROQ_MODEL_CHAIN:latest,OLLAMA_API_KEY=OLLAMA_API_KEY:latest,OLLAMA_BASE_URL=OLLAMA_BASE_URL:latest,OLLAMA_MODEL_CHAIN=OLLAMA_MODEL_CHAIN:latest,DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest
+  --set-secrets=LLM_PROVIDER=LLM_PROVIDER:latest,GROQ_API_KEY=GROQ_API_KEY:latest,GROQ_MODEL_CHAIN=GROQ_MODEL_CHAIN:latest,OLLAMA_API_KEY=OLLAMA_API_KEY:latest,OLLAMA_BASE_URL=OLLAMA_BASE_URL:latest,OLLAMA_MODEL_CHAIN=OLLAMA_MODEL_CHAIN:latest,DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 
 gcloud run jobs deploy risk-check \
   --source . \
@@ -70,7 +84,7 @@ gcloud run jobs deploy risk-check \
   --command=bash \
   --args=deploy/run_risk_check.sh \
   --max-retries=0 \
-  --set-secrets=DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest
+  --set-secrets=DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 
 gcloud run jobs deploy evolution \
   --source . \
@@ -78,7 +92,7 @@ gcloud run jobs deploy evolution \
   --command=bash \
   --args=deploy/run_evolution.sh \
   --max-retries=0 \
-  --set-secrets=DATABASE_URL=DATABASE_URL:latest
+  --set-secrets=DATABASE_URL=DATABASE_URL:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 ```
 
 ### 3. Invoker service account (lets Cloud Scheduler trigger the Jobs)

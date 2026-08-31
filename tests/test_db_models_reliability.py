@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from src.db import models
-from tests.conftest import _fake_connection, _inserted_row, _last_execute, _updated_row
+from tests.conftest import _fake_connection, _fake_firestore_client, _inserted_row, _last_execute, _updated_row
 
 
 # --- data_quality_log ---
@@ -90,26 +90,25 @@ def test_get_latest_strategy_health_score_none_when_missing(monkeypatch):
 
 
 def test_update_strategy_version_status_updates_by_id(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client(seed={"strategy_versions": {"5": {"status": "active"}}})
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.update_strategy_version_status(5, "suspended")
 
-    row = _updated_row(cur)
-    assert row == {"status": "suspended"}
-    sql, params = _last_execute(cur)
-    assert params[-1] == 5
+    assert store["strategy_versions"]["5"]["status"] == "suspended"
 
 
 def test_get_active_strategy_versions_excludes_suspended(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1, "status": "active"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"strategy_versions": {
+        "1": {"status": "active", "version_number": 1},
+        "2": {"status": "suspended", "version_number": 2},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_active_strategy_versions()
 
-    assert result == [{"id": 1, "status": "active"}]
-    sql, _ = _last_execute(cur)
-    assert "status != 'suspended'" in sql
+    assert [r["id"] for r in result] == ["1"]
 
 
 # --- system_metrics ---
@@ -178,32 +177,30 @@ def test_get_trade_evaluations_noop_on_empty(monkeypatch):
 
 
 def test_get_trade_evaluations_returns_full_rows(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"trade_id": 1, "confidence_was_accurate": True}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"trade_evaluations": {"1": {"trade_id": 1, "confidence_was_accurate": True}}}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_trade_evaluations([1])
 
-    assert result == [{"trade_id": 1, "confidence_was_accurate": True}]
-    sql, params = _last_execute(cur)
-    assert "trade_id = ANY(%s)" in sql
-    assert params == ([1],)
+    assert result == [{"trade_id": 1, "confidence_was_accurate": True, "id": "1"}]
 
 
 # --- opportunity_evaluations: config_version/market_regime additions ---
 
 
 def test_log_opportunity_evaluation_includes_market_regime_and_config_version(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.log_opportunity_evaluation(
         mode="paper", symbol="BTCINR", version_id=1, features={}, trend_score=None,
         momentum_score=None, volume_score=None, volatility_score=None, risk_score=None,
         opportunity_score=None, llm_decision=None, llm_reasoning=None, llm_raw_response=None,
-        risk_manager_result=None, final_decision="hold", reason=None,
+        risk_manager_result=None, final_decision="hold", reason=None, strategy_type="default",
         market_regime="strong_bull", config_version="abc123",
     )
 
-    row = _inserted_row(cur)
+    (row,) = store["opportunity_evaluations"].values()
     assert row["market_regime"] == "strong_bull"
     assert row["config_version"] == "abc123"
