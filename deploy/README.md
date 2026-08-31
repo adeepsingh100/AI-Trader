@@ -1,5 +1,18 @@
 # Deploying to Google Cloud Run Jobs + Cloud Scheduler
 
+**Not actually deployed — confirmed directly with the repo owner (no
+gcloud CLI set up, never run). This describes a planned alternative to
+the GitHub Actions crons, not what's live.** The GH Actions workflows
+(`.github/workflows/*.yml`) are the real, live execution path — an
+external pinger hits `dashboard/src/app/api/cron/[workflow]/route.ts`
+on a real clock, which dispatches `trading_cycle.yml`/`risk_check.yml`
+via the GitHub API (`evolution.yml` has its own native hourly
+`schedule:` trigger, reliable enough at that cadence). Treat everything
+below as a design doc for a future migration, not ground truth about
+what's running right now.
+
+---
+
 Replaces GitHub Actions as the execution layer (private repo was blowing
 past the free 2,000 min/month). Code stays private; Cloud Run Jobs +
 Cloud Scheduler are free at this scale (Job execution well within the

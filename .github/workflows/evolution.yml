@@ -25,6 +25,7 @@ jobs:
       - run: python -m src.agents.evolution_agent
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       # Adaptive Strategy Intelligence Engine (PROJECT_SPEC.md §3b) — the
       # sole authoritative strategy-change pipeline (Scientific Strategy
       # Optimization Framework). Mostly pure statistics; makes one
@@ -38,6 +39,7 @@ jobs:
       - run: python -m src.learning.adaptive_strategy_engine
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL_CHAIN: ${{ secrets.GROQ_MODEL_CHAIN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -50,6 +52,8 @@ jobs:
       - run: python -m src.learning.drift_detection
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       - run: python -m src.learning.strategy_health
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}

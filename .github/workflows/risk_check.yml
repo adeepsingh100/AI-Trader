@@ -1,15 +1,19 @@
 name: Risk check
 
 # Stop-loss/take-profit + circuit-breaker sweep only — no LLM calls, no
-# market snapshot. Runs every 1min in prod (Cloud Scheduler, see
-# deploy/README.md) so an open position isn't sitting unwatched for the
-# full gap between trading_cycle.yml runs. This file is a manual
-# workflow_dispatch fallback only, not the live trigger — see
+# market snapshot. So an open position isn't sitting unwatched for the
+# full gap between trading_cycle.yml runs — see
 # src/orchestrator.py:run_risk_check.
 #
 # No `schedule:` trigger — GitHub Actions' own cron is unreliable below
 # ~15min cadence (observed 40-57min gaps on a nominal 5min schedule).
-# Triggered externally via workflow_dispatch on a real clock instead.
+# This is the actual live trigger path: an external pinger hits
+# dashboard/src/app/api/cron/[workflow]/route.ts on a real clock, which
+# dispatches this workflow via the GitHub API — deploy/README.md
+# describes a GCP Cloud Run + Cloud Scheduler setup that documents an
+# alternative path, not what's actually deployed (confirmed directly
+# with the repo owner — no gcloud setup exists; these GH Actions crons
+# are the live ones).
 
 on:
   workflow_dispatch:
@@ -26,6 +30,7 @@ jobs:
       - run: python -m src.orchestrator --mode=paper --risk-only
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       # Self Diagnostics (PROJECT_SPEC.md §3d) — its own step, not merged
       # into run_risk_check, so it fails independently of the SL/TP sweep
       # above. Piggybacks on this cron's 5-minute interval rather than a
@@ -33,6 +38,7 @@ jobs:
       - run: python -m src.monitoring.diagnostics --mode=paper
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
 
   real:
     runs-on: ubuntu-latest
@@ -48,6 +54,8 @@ jobs:
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       - run: python -m src.monitoring.diagnostics --mode=real
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
