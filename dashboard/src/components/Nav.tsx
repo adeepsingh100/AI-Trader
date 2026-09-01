@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { signOut } from "firebase/auth";
+import { auth } from "@/lib/firebase";
 
 const LINKS = [
   { href: "/", label: "Overview" },
@@ -14,6 +16,21 @@ const LINKS = [
 
 export function Nav() {
   const pathname = usePathname();
+  const router = useRouter();
+
+  // proxy.ts gates every route (including /sign-in redirect targets) on
+  // the session cookie, not the client SDK's own auth state — so signing
+  // out means clearing both: the client SDK session (so a stale client
+  // doesn't silently re-mint a token) and the cookie via /api/session
+  // (what proxy.ts actually checks).
+  async function handleSignOut() {
+    await signOut(auth);
+    await fetch("/api/session", { method: "DELETE" });
+    router.push("/sign-in");
+    router.refresh();
+  }
+
+  if (pathname === "/sign-in") return null;
 
   return (
     <header className="border-b" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
@@ -38,6 +55,13 @@ export function Nav() {
             );
           })}
         </nav>
+        <button
+          onClick={handleSignOut}
+          className="ml-auto text-sm hover:underline"
+          style={{ color: "var(--text-muted)" }}
+        >
+          Sign out
+        </button>
       </div>
     </header>
   );

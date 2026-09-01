@@ -7,96 +7,16 @@ import { useStrategyType, StrategyTypeToggle } from "@/components/StrategyTypeTo
 import { STATUS } from "@/lib/palette";
 import type { CapitalConfig } from "@/lib/types";
 
+// No in-page auth check anymore — proxy.ts gates the whole dashboard
+// behind Firebase Auth before this page can even render (was previously
+// its own password gate here, the only protected page; now every page
+// is protected the same way, so Sign out lives in Nav instead).
 export default function ConfigClient() {
-  const [authed, setAuthed] = useState<boolean | undefined>(undefined);
-
-  useEffect(() => {
-    fetchJson<{ authed: boolean }>("/api/config/auth")
-      .then((data) => setAuthed(data.authed))
-      .catch(() => setAuthed(false));
-  }, []);
-
-  async function handleSignOut() {
-    await fetch("/api/config/auth", { method: "DELETE" });
-    setAuthed(false);
-  }
-
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold tracking-tight">Config</h1>
-        {authed && (
-          <button
-            onClick={handleSignOut}
-            className="text-sm hover:underline"
-            style={{ color: "var(--text-muted)" }}
-          >
-            Sign out
-          </button>
-        )}
-      </div>
-
-      {authed === undefined && <p style={{ color: "var(--text-muted)" }}>Loading…</p>}
-      {authed === false && <LoginForm onSignedIn={() => setAuthed(true)} />}
-      {authed && <ConfigForm />}
+      <h1 className="text-2xl font-semibold tracking-tight">Config</h1>
+      <ConfigForm />
     </div>
-  );
-}
-
-function LoginForm({ onSignedIn }: { onSignedIn: () => void }) {
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSubmitting(true);
-    setError(null);
-    try {
-      await fetchJson("/api/config/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password }),
-      });
-      onSignedIn();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="max-w-sm space-y-3 rounded-xl p-5 shadow-sm"
-      style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
-    >
-      <p className="text-sm" style={{ color: "var(--text-muted)" }}>
-        Sign in to edit capital, target, and loss limits.
-      </p>
-      <input
-        type="password"
-        placeholder="Password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        className="w-full rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-neutral-900/20"
-        style={{ border: "1px solid var(--border)" }}
-        required
-      />
-      {error && (
-        <p className="text-sm" style={{ color: "var(--status-critical)" }}>
-          {error}
-        </p>
-      )}
-      <button
-        type="submit"
-        disabled={submitting}
-        className="rounded-md bg-neutral-900 text-white text-sm px-3 py-1.5 disabled:opacity-50 hover:bg-neutral-800 transition-colors"
-      >
-        {submitting ? "Signing in…" : "Sign in"}
-      </button>
-    </form>
   );
 }
 

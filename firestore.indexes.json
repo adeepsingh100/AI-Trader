@@ -102,6 +102,24 @@
       ]
     },
     {
+      "collectionGroup": "opportunity_evaluations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "timestamp", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "opportunity_evaluations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "symbol", "order": "ASCENDING" },
+        { "fieldPath": "timestamp", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "learning_statistics",
       "queryScope": "COLLECTION",
       "fields": [
@@ -117,6 +135,69 @@
         { "fieldPath": "mode", "order": "ASCENDING" },
         { "fieldPath": "strategy_type", "order": "ASCENDING" },
         { "fieldPath": "timeframe", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "recommendations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "recommendations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "metric_name", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "strategy_simulations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "adaptive_strategy_versions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "adaptive_strategy_versions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "version_number", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "daily_pnl",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "date", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "strategy_versions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "version_number", "order": "DESCENDING" }
       ]
     }
   ],

@@ -1,7 +1,6 @@
-import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
-import { pool } from "@/lib/db";
-import { COOKIE_NAME, isValidSession } from "@/lib/configAuth";
+import { adminDb } from "@/lib/firebaseAdmin";
+import { serializeTimestamps } from "@/lib/firestoreSerialize";
 
 const ALLOWED_FIELDS = new Set([
   "total_capital",
@@ -17,37 +16,28 @@ export async function GET(request: NextRequest) {
   const mode = request.nextUrl.searchParams.get("mode") ?? "paper";
   const strategyType = request.nextUrl.searchParams.get("strategy_type") ?? "default";
   try {
-    const res = await pool.query(
-      "SELECT * FROM capital_config WHERE mode = $1 AND strategy_type = $2",
-      [mode, strategyType]
-    );
-    return NextResponse.json(res.rows[0] ?? null);
+    const snap = await adminDb.collection("capital_config").doc(`${mode}_${strategyType}`).get();
+    return NextResponse.json(snap.exists ? serializeTimestamps({ ...snap.data(), id: snap.id }) : null);
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
   }
 }
 
+// No password/session check here anymore — proxy.ts already gates every
+// route behind Firebase Auth for the whole dashboard, so a second
+// per-route check would be redundant (was the old isValidSession check
+// against CONFIG_EDIT_PASSWORD, now deleted).
 export async function PATCH(request: NextRequest) {
-  const cookieStore = await cookies();
-  if (!isValidSession(cookieStore.get(COOKIE_NAME)?.value)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
-
   const mode = request.nextUrl.searchParams.get("mode") ?? "paper";
   const strategyType = request.nextUrl.searchParams.get("strategy_type") ?? "default";
   const body = await request.json().catch(() => ({}));
-  const fields = Object.keys(body).filter((k) => ALLOWED_FIELDS.has(k));
-  if (fields.length === 0) {
+  const fields = Object.fromEntries(Object.entries(body).filter(([k]) => ALLOWED_FIELDS.has(k)));
+  if (Object.keys(fields).length === 0) {
     return NextResponse.json({ error: "no valid fields in body" }, { status: 400 });
   }
 
-  const setClause = fields.map((f, i) => `${f} = $${i + 1}`).join(", ");
-  const values = fields.map((f) => body[f]);
   try {
-    await pool.query(
-      `UPDATE capital_config SET ${setClause} WHERE mode = $${fields.length + 1} AND strategy_type = $${fields.length + 2}`,
-      [...values, mode, strategyType]
-    );
+    await adminDb.collection("capital_config").doc(`${mode}_${strategyType}`).set(fields, { merge: true });
     return NextResponse.json({ ok: true });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });

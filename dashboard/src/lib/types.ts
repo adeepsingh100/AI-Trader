@@ -13,7 +13,7 @@ export interface CapitalConfig {
 }
 
 export interface StrategyVersion {
-  id: number;
+  id: string;
   version_number: number;
   prompt_text: string;
   params_json: Record<string, unknown>;
@@ -23,9 +23,9 @@ export interface StrategyVersion {
 }
 
 export interface Trade {
-  id: number;
+  id: string;
   mode: Mode;
-  version_id: number;
+  version_id: string;
   symbol: string;
   side: "buy" | "sell";
   qty: number;
@@ -51,7 +51,7 @@ export interface DailyPnl {
 }
 
 export interface ModelUsage {
-  id: number;
+  id: string;
   timestamp: string;
   model_used: string;
   fallback_reason: string | null;
@@ -89,7 +89,7 @@ export interface Recommendation {
 }
 
 export interface StrategySimulation {
-  id: number;
+  id: string;
   created_at: string;
   passed: boolean;
   p_value: number | null;
@@ -102,7 +102,7 @@ export interface AdaptiveStrategyVersion {
   fitness_score: number | null;
   notes: string | null;
   created_at: string;
-  source_simulation_id: number | null;
+  source_simulation_id: string | null;
 }
 
 export type LearningStage = "BOOTSTRAP" | "OBSERVATION" | "HYPOTHESIS" | "SIMULATION" | "VALIDATION";

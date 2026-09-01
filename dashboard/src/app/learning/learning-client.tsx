@@ -278,7 +278,7 @@ export default function LearningClient() {
     [data]
   );
   const fitnessBySimulationId = useMemo(() => {
-    const map = new Map<number, number | null>();
+    const map = new Map<string, number | null>();
     for (const v of data?.versions ?? []) {
       if (v.source_simulation_id != null) map.set(v.source_simulation_id, v.fitness_score);
     }

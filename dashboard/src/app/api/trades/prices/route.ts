@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { pool } from "@/lib/db";
+import { adminDb } from "@/lib/firebaseAdmin";
+import { serializeTimestamps } from "@/lib/firestoreSerialize";
 
 // Backs trades-client.tsx's 20s live-price poll — kept as its own route
 // (not folded into /api/trades) since it's a genuinely different table,
@@ -12,12 +13,27 @@ export async function GET(request: NextRequest) {
   if (symbols.length === 0) return NextResponse.json([]);
 
   try {
-    const res = await pool.query(
-      "SELECT symbol, timestamp, features FROM opportunity_evaluations " +
-        "WHERE mode = $1 AND symbol = ANY($2) ORDER BY timestamp DESC LIMIT 200",
-      [mode, symbols]
+    // Firestore's "in" operator caps at 30 values, unlike Postgres's
+    // unbounded = ANY($2) — chunk and merge.
+    const chunks = [];
+    for (let i = 0; i < symbols.length; i += 30) chunks.push(symbols.slice(i, i + 30));
+
+    const results = await Promise.all(
+      chunks.map((chunk) =>
+        adminDb
+          .collection("opportunity_evaluations")
+          .where("mode", "==", mode)
+          .where("symbol", "in", chunk)
+          .orderBy("timestamp", "desc")
+          .limit(200)
+          .get()
+      )
     );
-    return NextResponse.json(res.rows);
+    const rows = results
+      .flatMap((snap) => snap.docs.map((d) => d.data()))
+      .sort((a, b) => (b.timestamp?.toMillis?.() ?? 0) - (a.timestamp?.toMillis?.() ?? 0))
+      .slice(0, 200);
+    return NextResponse.json(serializeTimestamps(rows));
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
   }
