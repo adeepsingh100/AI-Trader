@@ -349,43 +349,53 @@ def test_get_trade_evaluation_ids_returns_set(monkeypatch):
 # --- purge_old_data (Data Retention) ---
 
 
-def test_purge_old_data_deletes_rows_past_cutoff_per_table(monkeypatch):
-    conn, cur = _fake_connection(rowcount=2)
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-
+def test_purge_old_data_deletes_docs_past_cutoff_per_collection(monkeypatch):
     cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    seed = {
+        "opportunity_evaluations": {
+            "1": {"timestamp": datetime(2025, 12, 1, tzinfo=timezone.utc)},
+            "2": {"timestamp": datetime(2026, 2, 1, tzinfo=timezone.utc)},  # after cutoff, kept
+        },
+        "agent_logs": {
+            "1": {"timestamp": datetime(2025, 11, 1, tzinfo=timezone.utc)},
+        },
+    }
+    client, store = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+
     result = models.purge_old_data({"opportunity_evaluations": cutoff, "agent_logs": cutoff})
 
-    assert result == {"opportunity_evaluations": 2, "agent_logs": 2}
-    sql, params = _last_execute(cur)
-    assert "DELETE FROM agent_logs WHERE timestamp < %s" == sql
-    assert params == (cutoff.isoformat(),)
+    assert result == {"opportunity_evaluations": 1, "agent_logs": 1}
+    assert list(store["opportunity_evaluations"].keys()) == ["2"]
+    assert store["agent_logs"] == {}
 
 
-def test_purge_old_data_skips_tables_without_a_cutoff(monkeypatch):
-    conn, cur = _fake_connection(rowcount=0)
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_purge_old_data_skips_collections_without_a_cutoff(monkeypatch):
+    seed = {"agent_logs": {"1": {"timestamp": datetime(2020, 1, 1, tzinfo=timezone.utc)}}}
+    client, store = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.purge_old_data({"agent_logs": datetime.now(timezone.utc)})
 
-    assert cur.execute.call_count == 1  # every other _RETENTION_TABLES entry skipped, no query at all
-    assert result == {"agent_logs": 0}
+    assert result == {"agent_logs": 1}  # every other _RETENTION_TABLES entry skipped untouched
+    assert store["agent_logs"] == {}
 
 
 def test_purge_old_data_empty_cutoffs_touches_nothing(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore with no cutoffs supplied")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
 
     assert models.purge_old_data({}) == {}
-    conn.cursor.assert_not_called()
 
 
 # --- promotion_audit (src/learning/promotion_gate.py) ---
 
 
 def test_insert_promotion_audit_inserts_expected_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.insert_promotion_audit(
         mode="paper",
@@ -400,9 +410,7 @@ def test_insert_promotion_audit_inserts_expected_row(monkeypatch):
         reasons=["all gates cleared"],
     )
 
-    sql, _ = _last_execute(cur)
-    assert "INSERT INTO promotion_audit" in sql
-    row = _inserted_row(cur)
+    row = store["promotion_audit"][result["id"]]
     assert row["mode"] == "paper"
     assert row["event_type"] == "promotion"
     assert row["decision"] == "PROMOTE"
@@ -410,37 +418,37 @@ def test_insert_promotion_audit_inserts_expected_row(monkeypatch):
     assert row["previous_champion_id"] == 3
     assert row["new_champion_id"] == 5
     assert row["promotion_score"] == 85.0
-    assert result == {"id": 1}
 
 
-def test_insert_promotion_audit_defaults_jsonb_fields(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_insert_promotion_audit_defaults_empty_fields(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.insert_promotion_audit(mode="paper", event_type="evaluation", decision="REJECT")
+    result = models.insert_promotion_audit(mode="paper", event_type="evaluation", decision="REJECT")
 
-    row = _inserted_row(cur)
+    row = store["promotion_audit"][result["id"]]
     assert row["gates"] == {}
     assert row["breakdown"] == {}
-    # reasons is wrapped in psycopg2.extras.Json — compare its .adapted value
-    assert row["reasons"].adapted == []
+    assert row["reasons"] == []
 
 
 def test_get_latest_promotion_audit_filters_by_mode_and_event_type(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 7, "decision": "PROMOTE"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"promotion_audit": {
+        "1": {"mode": "paper", "strategy_type": "default", "event_type": "promotion", "decision": "PROMOTE", "created_at": 2},
+        "2": {"mode": "paper", "strategy_type": "default", "event_type": "evaluation", "decision": "REJECT", "created_at": 3},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_latest_promotion_audit("paper", event_type="promotion")
 
-    sql, params = _last_execute(cur)
-    assert "mode = %s" in sql and "event_type = %s" in sql
-    assert params == ("paper", "default", "promotion")
-    assert result == {"id": 7, "decision": "PROMOTE"}
+    assert result["id"] == "1"
+    assert result["decision"] == "PROMOTE"
 
 
 def test_get_latest_promotion_audit_returns_none_when_empty(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     assert models.get_latest_promotion_audit("paper") is None
 

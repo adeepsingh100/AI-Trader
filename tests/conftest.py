@@ -78,16 +78,22 @@ def _matches_filter(data: dict, field: str, op: str, value) -> bool:
         return actual == value
     if op == ">=":
         return actual is not None and actual >= value
+    if op == "<":
+        return actual is not None and actual < value
     if op == "in":
         return actual in value
     raise NotImplementedError(f"fake firestore: unsupported op {op!r}")
 
 
 class _FakeDocSnapshot:
-    def __init__(self, doc_id, data):
+    def __init__(self, doc_id, data, store=None, collection=None):
         self.id = doc_id
         self._data = data
         self.exists = data is not None
+        # store/collection are None for snapshots built outside a query
+        # (e.g. a doc_ref.get() in code that never touches .reference) --
+        # only the purge path's batch.delete(doc.reference) needs this.
+        self.reference = _FakeDocRef(store, collection, doc_id) if store is not None else None
 
     def to_dict(self):
         return dict(self._data) if self._data is not None else None
@@ -104,7 +110,7 @@ class _FakeDocRef:
 
     def get(self, transaction=None):
         data = self._store.setdefault(self._collection, {}).get(self.id)
-        return _FakeDocSnapshot(self.id, data)
+        return _FakeDocSnapshot(self.id, data, self._store, self._collection)
 
     def set(self, fields, merge=False):
         coll = self._store.setdefault(self._collection, {})
@@ -112,6 +118,9 @@ class _FakeDocRef:
             coll[self.id] = {**coll[self.id], **fields}
         else:
             coll[self.id] = dict(fields)
+
+    def delete(self):
+        self._store.get(self._collection, {}).pop(self.id, None)
 
 
 class _FakeQuery:
@@ -149,7 +158,7 @@ class _FakeQuery:
             matches.sort(key=lambda item: item[1].get(self._order_field), reverse=self._desc)
         if self._limit is not None:
             matches = matches[: self._limit]
-        return [_FakeDocSnapshot(doc_id, data) for doc_id, data in matches]
+        return [_FakeDocSnapshot(doc_id, data, self._store, self._collection) for doc_id, data in matches]
 
 
 class _FakeCollectionRef(_FakeQuery):
@@ -169,11 +178,14 @@ class _FakeBatch:
         self._ops = []
 
     def set(self, doc_ref, fields):
-        self._ops.append((doc_ref, fields))
+        self._ops.append(("set", doc_ref, fields))
+
+    def delete(self, doc_ref):
+        self._ops.append(("delete", doc_ref, None))
 
     def commit(self):
-        for doc_ref, fields in self._ops:
-            doc_ref.set(fields)
+        for op, doc_ref, fields in self._ops:
+            doc_ref.set(fields) if op == "set" else doc_ref.delete()
         self._ops = []
 
 

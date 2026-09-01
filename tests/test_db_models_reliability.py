@@ -1,91 +1,96 @@
-from unittest.mock import MagicMock
-
 from src.db import models
-from tests.conftest import _fake_connection, _fake_firestore_client, _inserted_row, _last_execute, _updated_row
+from tests.conftest import _fake_connection, _fake_firestore_client
 
 
 # --- data_quality_log ---
 
 
 def test_insert_data_quality_issues_noop_on_empty_list(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
 
     models.insert_data_quality_issues([])
 
-    conn.cursor.assert_not_called()
+
+def test_insert_data_quality_issues_dedups_via_deterministic_doc_id(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+
+    row = {"pair": "I-BTC_INR", "interval": "5m", "issue_type": "duplicate", "candle_time": 1700000000}
+    models.insert_data_quality_issues([row])
+
+    assert store["data_quality_log"]["I-BTC_INR_5m_duplicate_1700000000"]["pair"] == "I-BTC_INR"
 
 
-def test_insert_data_quality_issues_batches_rows(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    fake_execute_values = MagicMock()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    monkeypatch.setattr(models, "execute_values", fake_execute_values)
+def test_insert_data_quality_issues_batch_level_issue_gets_auto_id(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.insert_data_quality_issues([{"pair": "I-BTC_INR", "issue_type": "duplicate"}])
+    models.insert_data_quality_issues([{"pair": "I-BTC_INR", "issue_type": "exchange_outage", "candle_time": None}])
 
-    sql, rows = fake_execute_values.call_args[0][1], fake_execute_values.call_args[0][2]
-    assert "INSERT INTO data_quality_log" in sql
-    assert rows[0] == ("I-BTC_INR", "duplicate")
+    (row,) = store["data_quality_log"].values()
+    assert row["issue_type"] == "exchange_outage"
 
 
 def test_get_data_quality_log_filters_by_pair_and_source(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"data_quality_log": {
+        "1": {"pair": "I-BTC_INR", "source": "live", "created_at": 2},
+        "2": {"pair": "I-BTC_INR", "source": "backtest", "created_at": 1},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_data_quality_log(pair="I-BTC_INR", source="live")
 
-    assert result == [{"id": 1}]
-    sql, params = _last_execute(cur)
-    assert "pair = %s" in sql and "source = %s" in sql
-    assert "I-BTC_INR" in params and "live" in params
+    assert [r["id"] for r in result] == ["1"]
 
 
 # --- drift_alerts ---
 
 
 def test_insert_drift_alert_returns_inserted_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.insert_drift_alert("feature_engine", "feature_distribution:rsi", "warning", 0.05, 0.20)
 
-    assert result == {"id": 1}
-    row = _inserted_row(cur)
-    assert row["component"] == "feature_engine"
-    assert row["severity"] == "warning"
+    assert result["component"] == "feature_engine"
+    assert result["severity"] == "warning"
+    assert store["drift_alerts"][result["id"]]["component"] == "feature_engine"
 
 
 def test_get_drift_alerts_filters_by_component(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1, "component": "feature_engine"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"drift_alerts": {
+        "1": {"component": "feature_engine", "detected_at": 1},
+        "2": {"component": "other", "detected_at": 2},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_drift_alerts(component="feature_engine")
 
-    assert result == [{"id": 1, "component": "feature_engine"}]
-    sql, params = _last_execute(cur)
-    assert "component = %s" in sql
-    assert params[0] == "feature_engine"
+    assert [r["id"] for r in result] == ["1"]
 
 
 # --- strategy_health_scores / strategy_versions.status ---
 
 
 def test_insert_strategy_health_score(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.insert_strategy_health_score(5, 72.5, "good", {"sharpe": 80})
 
-    assert result == {"id": 1}
-    row = _inserted_row(cur)
-    assert row["strategy_version_id"] == 5
-    assert row["tier"] == "good"
+    assert result["strategy_version_id"] == 5
+    assert result["tier"] == "good"
+    assert store["strategy_health_scores"][result["id"]]["tier"] == "good"
 
 
 def test_get_latest_strategy_health_score_none_when_missing(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
     assert models.get_latest_strategy_health_score(5) is None
 
 
@@ -115,55 +120,56 @@ def test_get_active_strategy_versions_excludes_suspended(monkeypatch):
 
 
 def test_insert_system_metrics_noop_on_empty(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
     models.insert_system_metrics([])
-    conn.cursor.assert_not_called()
 
 
 def test_get_recent_system_metrics_filters_by_component(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"system_metrics": {
+        "1": {"component": "orchestrator", "recorded_at": 1},
+        "2": {"component": "other", "recorded_at": 2},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_recent_system_metrics(component="orchestrator")
 
-    assert result == [{"id": 1}]
-    sql, params = _last_execute(cur)
-    assert "component = %s" in sql
-    assert params[0] == "orchestrator"
+    assert [r["id"] for r in result] == ["1"]
 
 
 # --- circuit_breaker_state ---
 
 
 def test_get_circuit_breaker_state_none_when_missing(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
     assert models.get_circuit_breaker_state("coindcx_api") is None
 
 
-def test_upsert_circuit_breaker_state_upserts_with_conflict_key(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_upsert_circuit_breaker_state_upserts_by_component(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.upsert_circuit_breaker_state("coindcx_api", 3, 1234567890)
 
-    sql, _ = _last_execute(cur)
-    assert "ON CONFLICT (component)" in sql
-    row = _inserted_row(cur)
+    row = store["circuit_breaker_state"]["coindcx_api"]
     assert row["consecutive_failures"] == 3
     assert row["tripped_until"] == 1234567890
 
 
 def test_reset_circuit_breaker_zeroes_failures(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"circuit_breaker_state": {"llm": {"consecutive_failures": 4, "tripped_until": 999}}}
+    client, store = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     models.reset_circuit_breaker("llm")
 
-    sql, params = _last_execute(cur)
-    assert "ON CONFLICT (component)" in sql
-    assert params == ("llm",)  # consecutive_failures=0/tripped_until=NULL are literals, not params
+    row = store["circuit_breaker_state"]["llm"]
+    assert row["consecutive_failures"] == 0
+    assert row["tripped_until"] is None
 
 
 # --- trade_evaluations (drift_detection.py support) ---

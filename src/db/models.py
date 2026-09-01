@@ -10,9 +10,13 @@ this scale. Migrating table-by-table, not a single cutover: functions
 for capital_config/strategy_versions/trades/daily_pnl/risk_check_lock/
 agent_logs/opportunity_evaluations/confidence_calibration/
 learning_statistics/trade_evaluations/feature_importance (the live
-trading hot path — Phase 1) talk to Firestore via get_firestore_client();
-everything else still talks to Neon via get_client()/psycopg2, until its
-own phase. Two backends in one file, but never two sources of truth for
+trading hot path — Phase 1), plus recommendations/strategy_simulations/
+adaptive_strategy_versions/model_usage/promotion_audit/drift_alerts/
+strategy_health_scores/system_metrics/data_quality_log/
+circuit_breaker_state (remaining learning/evolution tables — Phase 2),
+talk to Firestore via get_firestore_client(); only the backtest
+subsystem (Phase 3) still talks to Neon via get_client()/psycopg2, until
+its own phase. Two backends in one file, but never two sources of truth for
 the same table — every table has exactly one backend at a time, tracked
 per-function below, not a dual-write. Every function's name, signature,
 and return shape (list[dict] / dict / None) stays unchanged across the
@@ -61,9 +65,10 @@ psycopg2.extensions.register_type(_DEC2FLOAT)
 # for `list` (register_adapter(list, Json)) on purpose: several functions
 # pass a plain list of ids/values into `= ANY(%s)` for a native Postgres
 # array (psycopg2's built-in list adapter), and a global list->Json
-# adapter would silently break every one of those. The one list-typed
-# jsonb column this file writes (promotion_audit.reasons) wraps its value
-# in Json(...) explicitly at that single call site instead.
+# adapter would silently break every one of those. (The one list-typed
+# jsonb column this file used to write this way, promotion_audit.reasons,
+# moved to Firestore in Phase 2 — see get_firestore_client's docstring —
+# where a list is a native field type, no wrapping needed.)
 psycopg2.extensions.register_adapter(dict, Json)
 
 
@@ -85,9 +90,10 @@ def ping() -> None:
 
 def get_firestore_client() -> firestore.Client:
     """Separate seam from get_client() — deliberately, not a rename.
-    Phase 1 of the Neon→Firestore migration (see module docstring) moves
-    ~20 of this file's ~81 functions to Firestore; the rest keep using
-    get_client()/psycopg2 unchanged until their own phase. One shared
+    Phases 1-2 of the Neon→Firestore migration (see module docstring) move
+    most of this file's ~81 functions to Firestore; the rest (the backtest
+    subsystem, Phase 3) keep using get_client()/psycopg2 unchanged until
+    their own phase. One shared
     get_client() returning "whichever backend" would either break the
     untouched functions or force a big-bang cutover — neither is what was
     approved. FIREBASE_SERVICE_ACCOUNT_JSON is the whole service-account
@@ -169,6 +175,27 @@ def _batch_set(collection: str, rows: list[dict], doc_id_fn=None) -> None:
             doc_ref = coll_ref.document(doc_id_fn(row)) if doc_id_fn else coll_ref.document()
             batch.set(doc_ref, row)
         batch.commit()
+
+
+def _purge_before(collection: str, field: str, cutoff: datetime) -> int:
+    """Deletes every doc in `collection` where `field` < cutoff, chunked
+    at Firestore's 500-per-batch write limit. Re-runs the same query after
+    each batch rather than paging with a cursor — the docs just deleted no
+    longer match `< cutoff`, so the next `stream()` naturally returns the
+    next-oldest batch. `field < cutoff` needs no composite index (a plain
+    single-field index, which Firestore creates automatically)."""
+    client = get_firestore_client()
+    coll_ref = client.collection(collection)
+    deleted = 0
+    while True:
+        docs = list(coll_ref.where(filter=firestore.FieldFilter(field, "<", cutoff)).limit(500).stream())
+        if not docs:
+            return deleted
+        batch = client.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+        deleted += len(docs)
 
 
 def _run_query(sql_text: str, params: tuple = ()) -> list[dict]:
@@ -1180,37 +1207,38 @@ def get_hold_evaluations_since(mode: str, since: datetime, strategy_type: str | 
 
 
 def insert_data_quality_issues(rows: list[dict]) -> None:
-    """ON CONFLICT DO NOTHING on (pair, interval, issue_type, candle_time) --
-    the same rolling candle window is re-validated every cycle, so an
-    unrepaired issue on a still-in-window candle would otherwise be
-    re-logged every cycle forever (the root cause of a real disk-fill
-    incident)."""
+    """Dedup on (pair, interval, issue_type, candle_time) via a
+    deterministic doc ID -- the same rolling candle window is
+    re-validated every cycle, so an unrepaired issue on a still-in-window
+    candle would otherwise be re-logged every cycle forever (the root
+    cause of a real disk-fill incident). A repeat write overwrites rather
+    than no-ops (Postgres's DO NOTHING) -- latest wins, harmless for
+    advisory logging. candle_time is None for batch-level issues (e.g.
+    exchange_outage), which never deduped in Postgres either (NULLs are
+    distinct in a unique index) -- those get a plain auto-ID instead."""
     if not rows:
         return
-    cols = list(rows[0].keys())
-    col_list = ", ".join(cols)
-    query = f"INSERT INTO data_quality_log ({col_list}) VALUES %s ON CONFLICT (pair, interval, issue_type, candle_time) DO NOTHING"
-    conn = get_client()
-    try:
-        with conn.cursor() as cur:
-            execute_values(cur, query, [tuple(r[c] for c in cols) for r in rows])
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        r.setdefault("created_at", now)
+    keyed = [r for r in rows if r.get("candle_time") is not None]
+    unkeyed = [r for r in rows if r.get("candle_time") is None]
+    if keyed:
+        _batch_set(
+            "data_quality_log", keyed,
+            doc_id_fn=lambda r: f"{r['pair']}_{r['interval']}_{r['issue_type']}_{r['candle_time']}",
+        )
+    if unkeyed:
+        _batch_set("data_quality_log", unkeyed)
 
 
 def get_data_quality_log(pair: str | None = None, source: str | None = None, limit: int = 200) -> list[dict]:
-    clauses, params = [], []
+    filters = []
     if pair is not None:
-        clauses.append("pair = %s")
-        params.append(pair)
+        filters.append(("pair", "==", pair))
     if source is not None:
-        clauses.append("source = %s")
-        params.append(source)
-    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-    params.append(limit)
-    return _run_query(f"SELECT * FROM data_quality_log {where}ORDER BY created_at DESC LIMIT %s", tuple(params))
+        filters.append(("source", "==", source))
+    return _query("data_quality_log", filters, order_by="created_at", desc=True, limit=limit)
 
 
 # --- drift_alerts (Feature Drift Detection, PROJECT_SPEC.md §3d) ---
@@ -1224,23 +1252,20 @@ def insert_drift_alert(
     recent_value: float | None,
     detail: dict | None = None,
 ) -> dict:
-    return _insert_row("drift_alerts", {
+    return _insert_doc("drift_alerts", {
         "component": component,
         "drift_type": drift_type,
         "severity": severity,
         "baseline_value": baseline_value,
         "recent_value": recent_value,
         "detail": detail or {},
+        "detected_at": datetime.now(timezone.utc),
     })
 
 
 def get_drift_alerts(component: str | None = None, limit: int = 200) -> list[dict]:
-    if component is not None:
-        return _run_query(
-            "SELECT * FROM drift_alerts WHERE component = %s ORDER BY detected_at DESC LIMIT %s",
-            (component, limit),
-        )
-    return _run_query("SELECT * FROM drift_alerts ORDER BY detected_at DESC LIMIT %s", (limit,))
+    filters = [("component", "==", component)] if component is not None else []
+    return _query("drift_alerts", filters, order_by="detected_at", desc=True, limit=limit)
 
 
 # --- strategy_health_scores (Strategy Health Engine, PROJECT_SPEC.md §3d) ---
@@ -1249,19 +1274,20 @@ def get_drift_alerts(component: str | None = None, limit: int = 200) -> list[dic
 def insert_strategy_health_score(
     strategy_version_id: int, health_score: float | None, tier: str, breakdown: dict
 ) -> dict:
-    return _insert_row("strategy_health_scores", {
+    return _insert_doc("strategy_health_scores", {
         "strategy_version_id": strategy_version_id,
         "health_score": health_score,
         "tier": tier,
         "breakdown": breakdown,
+        "computed_at": datetime.now(timezone.utc),
     })
 
 
 def get_latest_strategy_health_score(strategy_version_id: int) -> dict | None:
-    rows = _run_query(
-        "SELECT * FROM strategy_health_scores WHERE strategy_version_id = %s "
-        "ORDER BY computed_at DESC LIMIT 1",
-        (strategy_version_id,),
+    rows = _query(
+        "strategy_health_scores",
+        [("strategy_version_id", "==", strategy_version_id)],
+        order_by="computed_at", desc=True, limit=1,
     )
     return rows[0] if rows else None
 
@@ -1287,50 +1313,35 @@ def get_active_strategy_versions() -> list[dict]:
 def insert_system_metrics(rows: list[dict]) -> None:
     if not rows:
         return
-    _insert_rows("system_metrics", rows)
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        r.setdefault("recorded_at", now)
+    _batch_set("system_metrics", rows)
 
 
 def get_recent_system_metrics(component: str | None = None, limit: int = 200) -> list[dict]:
-    if component is not None:
-        return _run_query(
-            "SELECT * FROM system_metrics WHERE component = %s ORDER BY recorded_at DESC LIMIT %s",
-            (component, limit),
-        )
-    return _run_query("SELECT * FROM system_metrics ORDER BY recorded_at DESC LIMIT %s", (limit,))
+    filters = [("component", "==", component)] if component is not None else []
+    return _query("system_metrics", filters, order_by="recorded_at", desc=True, limit=limit)
 
 
 # --- circuit_breaker_state (src/resilience.py) ---
 
 
 def get_circuit_breaker_state(component: str) -> dict | None:
-    rows = _run_query("SELECT * FROM circuit_breaker_state WHERE component = %s", (component,))
-    return rows[0] if rows else None
+    return _get_doc("circuit_breaker_state", component)
 
 
 def upsert_circuit_breaker_state(component: str, consecutive_failures: int, tripped_until: int | None) -> None:
-    _run_write(
-        """
-        INSERT INTO circuit_breaker_state (component, consecutive_failures, tripped_until)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (component) DO UPDATE SET
-            consecutive_failures = EXCLUDED.consecutive_failures,
-            tripped_until = EXCLUDED.tripped_until
-        """,
-        (component, consecutive_failures, tripped_until),
-    )
+    _set_doc("circuit_breaker_state", component, {
+        "component": component,
+        "consecutive_failures": consecutive_failures,
+        "tripped_until": tripped_until,
+        "updated_at": datetime.now(timezone.utc),
+    })
 
 
 def reset_circuit_breaker(component: str) -> None:
-    _run_write(
-        """
-        INSERT INTO circuit_breaker_state (component, consecutive_failures, tripped_until)
-        VALUES (%s, 0, NULL)
-        ON CONFLICT (component) DO UPDATE SET
-            consecutive_failures = EXCLUDED.consecutive_failures,
-            tripped_until = EXCLUDED.tripped_until
-        """,
-        (component,),
-    )
+    upsert_circuit_breaker_state(component, 0, None)
 
 
 # --- Data Retention ---
@@ -1369,7 +1380,7 @@ def insert_promotion_audit(
     reasons: list | None = None,
     strategy_type: str = "default",
 ) -> dict:
-    return _insert_row("promotion_audit", {
+    return _insert_doc("promotion_audit", {
         "mode": mode,
         "strategy_type": strategy_type,
         "event_type": event_type,
@@ -1380,56 +1391,33 @@ def insert_promotion_audit(
         "promotion_score": promotion_score,
         "gates": gates or {},
         "breakdown": breakdown or {},
-        "reasons": Json(reasons or []),  # jsonb column holding a list, not a dict — the one
-                                          # call site needing an explicit wrap (see the global
-                                          # dict->Json adapter note near the top of this file)
+        "reasons": reasons or [],  # Firestore stores a list natively, no Json(...) wrap needed
+        "created_at": datetime.now(timezone.utc),
     })
 
 
 def get_latest_promotion_audit(
     mode: str, event_type: str | None = None, strategy_type: str = "default"
 ) -> dict | None:
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if event_type is not None:
-        rows = _run_query(
-            "SELECT * FROM promotion_audit WHERE mode = %s AND strategy_type = %s AND event_type = %s "
-            "ORDER BY created_at DESC LIMIT 1",
-            (mode, strategy_type, event_type),
-        )
-    else:
-        rows = _run_query(
-            "SELECT * FROM promotion_audit WHERE mode = %s AND strategy_type = %s "
-            "ORDER BY created_at DESC LIMIT 1",
-            (mode, strategy_type),
-        )
+        filters.append(("event_type", "==", event_type))
+    rows = _query("promotion_audit", filters, order_by="created_at", desc=True, limit=1)
     return rows[0] if rows else None
 
 
 def purge_old_data(cutoffs: dict[str, datetime]) -> dict[str, int]:
-    """Deletes rows older than `cutoffs[table]` for every table in
-    _RETENTION_TABLES a cutoff was supplied for (a table with no entry in
-    `cutoffs` is skipped, not purged with some default). Delete is
-    naturally idempotent (re-deleting an already-gone row is a no-op), so
-    this goes through _execute's retry like every other idempotent write
-    in this module. Returns {table: rows_deleted} for the caller to log —
-    cur.rowcount after a DELETE gives the count directly, no RETURNING/
-    representation trick needed the way the old Supabase client required."""
+    """Deletes docs older than `cutoffs[collection]` for every collection
+    in _RETENTION_TABLES a cutoff was supplied for (a collection with no
+    entry in `cutoffs` is skipped, not purged with some default). Delete
+    is naturally idempotent (re-deleting an already-gone doc is a no-op),
+    so this goes through _execute's retry like every other idempotent
+    write in this module. Returns {collection: docs_deleted} for the
+    caller to log."""
     deleted: dict[str, int] = {}
-    for table, column in _RETENTION_TABLES:
-        cutoff = cutoffs.get(table)
+    for collection, field in _RETENTION_TABLES:
+        cutoff = cutoffs.get(collection)
         if cutoff is None:
             continue
-
-        def _delete(table=table, column=column, cutoff=cutoff):
-            conn = get_client()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {table} WHERE {column} < %s", (cutoff.isoformat(),))
-                    count = cur.rowcount
-                conn.commit()
-                return count
-            except Exception:
-                conn.rollback()
-                raise
-
-        deleted[table] = _execute(_delete)
+        deleted[collection] = _execute(lambda collection=collection, field=field, cutoff=cutoff: _purge_before(collection, field, cutoff))
     return deleted

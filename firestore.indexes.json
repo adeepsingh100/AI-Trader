@@ -199,6 +199,58 @@
         { "fieldPath": "strategy_type", "order": "ASCENDING" },
         { "fieldPath": "version_number", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "data_quality_log",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pair", "order": "ASCENDING" },
+        { "fieldPath": "source", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "drift_alerts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "component", "order": "ASCENDING" },
+        { "fieldPath": "detected_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "strategy_health_scores",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "strategy_version_id", "order": "ASCENDING" },
+        { "fieldPath": "computed_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "system_metrics",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "component", "order": "ASCENDING" },
+        { "fieldPath": "recorded_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "promotion_audit",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "promotion_audit",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "mode", "order": "ASCENDING" },
+        { "fieldPath": "strategy_type", "order": "ASCENDING" },
+        { "fieldPath": "event_type", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
