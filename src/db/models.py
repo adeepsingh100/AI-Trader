@@ -556,8 +556,10 @@ def log_agent_event(
 def log_model_usage(events: list[ModelUsageEvent]) -> None:
     if not events:
         return
+    now = datetime.now(timezone.utc)
     rows = [
         {
+            "timestamp": now,
             "model_used": e.model_used,
             "fallback_reason": e.fallback_reason,
             "latency_ms": e.latency_ms,
@@ -565,11 +567,11 @@ def log_model_usage(events: list[ModelUsageEvent]) -> None:
         }
         for e in events
     ]
-    _insert_rows("model_usage", rows)
+    _batch_set("model_usage", rows)
 
 
 def get_recent_model_usage(limit: int = 500) -> list[dict]:
-    return _run_query("SELECT * FROM model_usage ORDER BY timestamp DESC LIMIT %s", (limit,))
+    return _query("model_usage", order_by="timestamp", desc=True, limit=limit)
 
 
 # --- opportunity_evaluations ---
@@ -766,10 +768,10 @@ def log_confidence_calibration(
 
 
 def get_latest_recommendation(mode: str, metric_name: str, strategy_type: str = "default") -> dict | None:
-    rows = _run_query(
-        "SELECT * FROM recommendations WHERE mode = %s AND metric_name = %s AND strategy_type = %s "
-        "ORDER BY created_at DESC LIMIT 1",
-        (mode, metric_name, strategy_type),
+    rows = _query(
+        "recommendations",
+        [("mode", "==", mode), ("metric_name", "==", metric_name), ("strategy_type", "==", strategy_type)],
+        order_by="created_at", desc=True, limit=1,
     )
     return rows[0] if rows else None
 
@@ -787,30 +789,32 @@ def insert_recommendation(
     batch_id: str | None = None,
     strategy_type: str = "default",
 ) -> None:
-    _run_write(
-        """
-        INSERT INTO recommendations
-            (mode, strategy_type, metric_name, current_value, recommended_value, rationale, sample_size,
-             category, confidence, evidence, batch_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (mode, strategy_type, metric_name, current_value, recommended_value, rationale, sample_size,
-         category, confidence, evidence, batch_id),
-    )
+    _insert_doc("recommendations", {
+        "mode": mode,
+        "strategy_type": strategy_type,
+        "metric_name": metric_name,
+        "current_value": current_value,
+        "recommended_value": recommended_value,
+        "rationale": rationale,
+        "sample_size": sample_size,
+        "status": "pending",
+        "category": category,
+        "confidence": confidence,
+        "evidence": evidence,
+        "batch_id": batch_id,
+        "created_at": datetime.now(timezone.utc),
+    })
 
 
 def get_recommendations(
     mode: str, status: str | None = None, category: str | None = None, strategy_type: str = "default"
 ) -> list[dict]:
-    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if status is not None:
-        clauses.append("status = %s")
-        params.append(status)
+        filters.append(("status", "==", status))
     if category is not None:
-        clauses.append("category = %s")
-        params.append(category)
-    query = f"SELECT * FROM recommendations WHERE {' AND '.join(clauses)} ORDER BY created_at DESC"
-    return _run_query(query, tuple(params))
+        filters.append(("category", "==", category))
+    return _query("recommendations", filters, order_by="created_at", desc=True)
 
 
 # --- strategy_simulations ---
@@ -835,30 +839,29 @@ def insert_strategy_simulation(
     Framework) — a narrative Observation/Weakness/Hypothesis/Simulation/
     Walk Forward/Decision report and the raw numbers behind it (bootstrap
     CI, walk-forward folds, strategy-comparison result where run)."""
-    return _insert_row("strategy_simulations", {
+    return _insert_doc("strategy_simulations", {
         "recommendation_batch_id": recommendation_batch_id,
         "mode": mode,
         "strategy_type": strategy_type,
-        "train_window_start": train_window_start.isoformat(),
-        "train_window_end": train_window_end.isoformat(),
-        "test_window_start": test_window_start.isoformat(),
-        "test_window_end": test_window_end.isoformat(),
+        "train_window_start": train_window_start,
+        "train_window_end": train_window_end,
+        "test_window_start": test_window_start,
+        "test_window_end": test_window_end,
         "baseline_metrics": baseline_metrics,
         "candidate_metrics": candidate_metrics,
         "p_value": p_value,
         "passed": passed,
         "research_note": research_note,
         "validation_detail": validation_detail,
+        "created_at": datetime.now(timezone.utc),
     })
 
 
 def get_strategy_simulations(mode: str, passed: bool | None = None, strategy_type: str = "default") -> list[dict]:
-    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if passed is not None:
-        clauses.append("passed = %s")
-        params.append(passed)
-    query = f"SELECT * FROM strategy_simulations WHERE {' AND '.join(clauses)} ORDER BY created_at DESC"
-    return _run_query(query, tuple(params))
+        filters.append(("passed", "==", passed))
+    return _query("strategy_simulations", filters, order_by="created_at", desc=True)
 
 
 # --- adaptive_strategy_versions ---
@@ -874,34 +877,34 @@ def insert_adaptive_strategy_version(
     fitness_score: float | None = None,
     strategy_type: str = "default",
 ) -> dict:
-    return _insert_row("adaptive_strategy_versions", {
+    return _insert_doc("adaptive_strategy_versions", {
         "mode": mode,
         "strategy_type": strategy_type,
         "version_number": version_number,
         "params_json": params_json,
         "source_recommendation_batch_id": source_recommendation_batch_id,
         "source_simulation_id": source_simulation_id,
+        "status": "candidate",
         "notes": notes,
         "fitness_score": fitness_score,
+        "created_at": datetime.now(timezone.utc),
     })
 
 
 def get_adaptive_strategy_versions(
     mode: str, status: str | None = None, strategy_type: str = "default"
 ) -> list[dict]:
-    clauses, params = ["mode = %s", "strategy_type = %s"], [mode, strategy_type]
+    filters = [("mode", "==", mode), ("strategy_type", "==", strategy_type)]
     if status is not None:
-        clauses.append("status = %s")
-        params.append(status)
-    query = f"SELECT * FROM adaptive_strategy_versions WHERE {' AND '.join(clauses)} ORDER BY created_at DESC"
-    return _run_query(query, tuple(params))
+        filters.append(("status", "==", status))
+    return _query("adaptive_strategy_versions", filters, order_by="created_at", desc=True)
 
 
 def get_latest_adaptive_strategy_version(mode: str, strategy_type: str = "default") -> dict | None:
-    rows = _run_query(
-        "SELECT * FROM adaptive_strategy_versions WHERE mode = %s AND strategy_type = %s "
-        "ORDER BY version_number DESC LIMIT 1",
-        (mode, strategy_type),
+    rows = _query(
+        "adaptive_strategy_versions",
+        [("mode", "==", mode), ("strategy_type", "==", strategy_type)],
+        order_by="version_number", desc=True, limit=1,
     )
     return rows[0] if rows else None
 

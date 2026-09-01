@@ -50,10 +50,8 @@ def test_upsert_daily_pnl_conflict_key(monkeypatch):
 
 
 def test_log_model_usage_batches_rows(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    fake_execute_values = MagicMock()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    monkeypatch.setattr(models, "execute_values", fake_execute_values)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     events = [
         ModelUsageEvent("model-a", None, 120, False),
@@ -61,19 +59,23 @@ def test_log_model_usage_batches_rows(monkeypatch):
     ]
     models.log_model_usage(events)
 
-    sql, rows = fake_execute_values.call_args[0][1], fake_execute_values.call_args[0][2]
-    assert "INSERT INTO model_usage" in sql
+    rows = list(store["model_usage"].values())
     assert len(rows) == 2
-    assert rows[1][0] == "model-b"  # model_used is the first column in the insert
+    assert {r["model_used"] for r in rows} == {"model-a", "model-b"}
 
 
 def test_log_model_usage_skips_empty(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    called = False
+
+    def _fail(*a, **kw):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
 
     models.log_model_usage([])
 
-    conn.cursor.assert_not_called()
+    assert not called
 
 
 def test_get_latest_promoted_version_filters_and_orders(monkeypatch):
@@ -281,19 +283,25 @@ def test_log_confidence_calibration_inserts_expected_row(monkeypatch):
 
 
 def test_get_latest_recommendation_orders_by_created_at(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"recommended_value": 75}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    import datetime as dt
+
+    seed = {"recommendations": {
+        "1": {"mode": "paper", "strategy_type": "default", "metric_name": "MIN_OPPORTUNITY_SCORE",
+              "recommended_value": 75, "created_at": dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc)},
+        "2": {"mode": "paper", "strategy_type": "default", "metric_name": "MIN_OPPORTUNITY_SCORE",
+              "recommended_value": 60, "created_at": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_latest_recommendation("paper", "MIN_OPPORTUNITY_SCORE")
 
-    sql, _ = _last_execute(cur)
-    assert "ORDER BY created_at DESC" in sql
-    assert result == {"recommended_value": 75}
+    assert result["recommended_value"] == 75
 
 
 def test_get_latest_recommendation_none_when_no_rows(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     assert models.get_latest_recommendation("paper", "MIN_OPPORTUNITY_SCORE") is None
 
