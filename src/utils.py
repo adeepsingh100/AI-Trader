@@ -14,7 +14,7 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 def parse_timestamp(raw: str | datetime) -> datetime:
     """`raw` is a str (ISO, from JSON/tests) or already a datetime
-    (psycopg2 returns native tz-aware datetimes for timestamptz columns)."""
+    (Firestore returns native tz-aware datetimes for Timestamp fields)."""
     if isinstance(raw, datetime):
         return raw
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))

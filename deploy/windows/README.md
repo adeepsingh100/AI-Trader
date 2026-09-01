@@ -1,7 +1,7 @@
 # Running the bot 24/7 on Windows (replaces GCP Cloud Run Jobs + Scheduler)
 
 Same 3 jobs as `deploy/README.md`'s GCP setup, same cadence, running as
-native Windows Scheduled Tasks against the same Neon database instead:
+native Windows Scheduled Tasks against the same Firestore project instead:
 
 | Task | Runs | Interval |
 |---|---|---|
@@ -17,9 +17,9 @@ native Windows Scheduled Tasks against the same Neon database instead:
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 
-# 2. .env at the repo root — same DATABASE_URL/COINDCX_*/GROQ_*/GEMINI_*
-#    values you already use for local dev. If you don't have one yet,
-#    copy .env.example and fill in real values.
+# 2. .env at the repo root — same FIREBASE_SERVICE_ACCOUNT_JSON/COINDCX_*/
+#    GROQ_*/GEMINI_* values you already use for local dev. If you don't
+#    have one yet, copy .env.example and fill in real values.
 
 # 3. Register the 3 scheduled tasks — run as Administrator
 powershell -ExecutionPolicy Bypass -File deploy\windows\register_tasks.ps1
@@ -49,12 +49,14 @@ timestamp, not just a clean exit code.
 
 ## Critical: don't run this alongside GCP
 
-Both point at the same Neon database. `run_risk_check` has a DB mutex
-(`risk_check_lock`, migration `0015`) that protects against two overlapping
-risk-check runs double-closing a position — that mutex is keyed in the
-shared DB, so it also protects across GCP-vs-Windows overlap. **Trading-cycle
-has no equivalent guard**: two sources both opening entries in the same
-window can double-count available capital and open duplicate positions.
+Both point at the same Firestore project. `run_risk_check` has a mutex
+(`try_acquire_risk_check_lock`, a Firestore transaction on the
+`risk_check_lock` collection — see `src/db/models.py`) that protects
+against two overlapping risk-check runs double-closing a position — that
+mutex is keyed in the shared DB, so it also protects across
+GCP-vs-Windows overlap. **Trading-cycle has no equivalent guard**: two
+sources both opening entries in the same window can double-count
+available capital and open duplicate positions.
 
 Before or immediately after running `register_tasks.ps1`, pause GCP's
 triggers so only one source is ever live:

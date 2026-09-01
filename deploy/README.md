@@ -44,28 +44,20 @@ echo -n "VALUE" | gcloud secrets create GROQ_MODEL_CHAIN --data-file=-
 echo -n "VALUE" | gcloud secrets create OLLAMA_API_KEY --data-file=-
 echo -n "VALUE" | gcloud secrets create OLLAMA_BASE_URL --data-file=-
 echo -n "VALUE" | gcloud secrets create OLLAMA_MODEL_CHAIN --data-file=-
-echo -n "VALUE" | gcloud secrets create DATABASE_URL --data-file=-
 echo -n "VALUE" | gcloud secrets create COINDCX_API_KEY --data-file=-
 echo -n "VALUE" | gcloud secrets create COINDCX_API_SECRET --data-file=-
 gcloud secrets create FIREBASE_SERVICE_ACCOUNT_JSON --data-file=service-account.json
 ```
 
-(Migrating off Supabase: `DATABASE_URL` is Neon's **pooled** connection
-string — the same one `src/db/models.py` reads locally via `.env`. If
-`SUPABASE_URL`/`SUPABASE_SERVICE_KEY` secrets already exist from before,
-delete them once every job below has been redeployed and verified:
-`gcloud secrets delete SUPABASE_URL SUPABASE_SERVICE_KEY`.)
-
-(Migrating off Neon onto Firebase/Firestore, table-by-table — see
-`src/db/models.py`'s module docstring: `FIREBASE_SERVICE_ACCOUNT_JSON`
-is required starting Phase 1 alongside `DATABASE_URL`, not replacing it
-— every table not yet on its own migration phase still needs Neon.
+(The DB is Firebase/Firestore, not Neon/Postgres — see `src/db/models.py`'s
+module docstring; that migration is done, every table moved.
 `service-account.json` is the key file downloaded from Firebase Console
 → Project Settings → Service Accounts → Generate new private key,
 project `ai-bot-14723`; `--data-file=` uploads its contents as the
 secret value, same idea as the inline `echo -n` calls above but for a
-whole file. `DATABASE_URL` can be deleted once every table has migrated
-— not yet.)
+whole file. If `DATABASE_URL`/`SUPABASE_URL`/`SUPABASE_SERVICE_KEY`
+secrets exist from before either migration, they're safe to delete:
+`gcloud secrets delete DATABASE_URL SUPABASE_URL SUPABASE_SERVICE_KEY`.)
 
 (Updating a value later: `echo -n "NEW_VALUE" | gcloud secrets versions add NAME --data-file=-`,
 or `gcloud secrets versions add FIREBASE_SERVICE_ACCOUNT_JSON --data-file=service-account.json`
@@ -89,7 +81,7 @@ gcloud run jobs deploy trading-cycle \
   --command=bash \
   --args=deploy/run_trading_cycle.sh \
   --max-retries=0 \
-  --set-secrets=LLM_PROVIDER=LLM_PROVIDER:latest,GROQ_API_KEY=GROQ_API_KEY:latest,GROQ_MODEL_CHAIN=GROQ_MODEL_CHAIN:latest,OLLAMA_API_KEY=OLLAMA_API_KEY:latest,OLLAMA_BASE_URL=OLLAMA_BASE_URL:latest,OLLAMA_MODEL_CHAIN=OLLAMA_MODEL_CHAIN:latest,DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
+  --set-secrets=LLM_PROVIDER=LLM_PROVIDER:latest,GROQ_API_KEY=GROQ_API_KEY:latest,GROQ_MODEL_CHAIN=GROQ_MODEL_CHAIN:latest,OLLAMA_API_KEY=OLLAMA_API_KEY:latest,OLLAMA_BASE_URL=OLLAMA_BASE_URL:latest,OLLAMA_MODEL_CHAIN=OLLAMA_MODEL_CHAIN:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 
 gcloud run jobs deploy risk-check \
   --source . \
@@ -97,7 +89,7 @@ gcloud run jobs deploy risk-check \
   --command=bash \
   --args=deploy/run_risk_check.sh \
   --max-retries=0 \
-  --set-secrets=DATABASE_URL=DATABASE_URL:latest,COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
+  --set-secrets=COINDCX_API_KEY=COINDCX_API_KEY:latest,COINDCX_API_SECRET=COINDCX_API_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 
 gcloud run jobs deploy evolution \
   --source . \
@@ -105,7 +97,7 @@ gcloud run jobs deploy evolution \
   --command=bash \
   --args=deploy/run_evolution.sh \
   --max-retries=0 \
-  --set-secrets=DATABASE_URL=DATABASE_URL:latest,FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
+  --set-secrets=FIREBASE_SERVICE_ACCOUNT_JSON=FIREBASE_SERVICE_ACCOUNT_JSON:latest
 ```
 
 ### 3. Invoker service account (lets Cloud Scheduler trigger the Jobs)
@@ -127,10 +119,10 @@ done
 Risk-check runs every minute, not every 5 — a position whose stop/target
 was hit could otherwise sit unwatched for most of a 5min gap and turn a
 winner into a loss before the next poll (`src/orchestrator.py::
-run_risk_check` guards this cadence with a DB mutex — an overlapping run
-skips instead of double-closing a position — see migration
-`0015_risk_check_lock.sql`). Trading-cycle stays at 10min (throttled by
-feature-computation cost, not by this concern).
+run_risk_check` guards this cadence with a Firestore transaction —
+`try_acquire_risk_check_lock` in `src/db/models.py` — an overlapping run
+skips instead of double-closing a position). Trading-cycle stays at
+10min (throttled by feature-computation cost, not by this concern).
 
 **Already deployed?** Update the existing job in place instead of
 `create` (which errors on a name that already exists):
@@ -139,10 +131,6 @@ gcloud scheduler jobs update http risk-check-trigger \
   --location=asia-south1 \
   --schedule="* * * * *"
 ```
-Then apply migration `0015_risk_check_lock.sql` against Neon before the
-next trigger fires (the app doesn't need to be redeployed for a Job —
-just re-run `gcloud run jobs deploy risk-check --source . ...` from
-step 2 once, so the running image has the mutex code).
 
 ```bash
 gcloud scheduler jobs create http trading-cycle-trigger \
@@ -174,24 +162,24 @@ gcloud scheduler jobs create http evolution-trigger \
    ```bash
    docker build -t ai-trader .
    docker run --rm \
-     -e DATABASE_URL=... \
+     -e FIREBASE_SERVICE_ACCOUNT_JSON=... \
      -e LLM_PROVIDER=... -e GROQ_API_KEY=... \
      ai-trader bash deploy/run_trading_cycle.sh
    ```
-   (Uses the real paper-mode Neon database — safe, same DB the bot
+   (Uses the real paper-mode Firestore project — safe, same DB the bot
    already writes to every cycle.)
 
 2. **After deploying each Job**, fire it manually once and check both
-   the execution log AND that a real row landed in Neon — a clean
+   the execution log AND that a real doc landed in Firestore — a clean
    exit code alone doesn't prove the trading logic ran:
    ```bash
    gcloud run jobs execute trading-cycle --region=asia-south1
    gcloud run jobs execute risk-check --region=asia-south1
    gcloud run jobs execute evolution --region=asia-south1
    ```
-   Check `opportunity_evaluations`/`trades`/`model_usage` (trading-cycle,
+   Check the `opportunity_evaluations`/`trades`/`model_usage` (trading-cycle,
    risk-check) or `recommendations`/`adaptive_strategy_versions`
-   (evolution) for a fresh timestamp.
+   (evolution) collections, in the Firebase Console, for a fresh timestamp.
 
 3. **After creating the Scheduler jobs**, watch Cloud Run's execution
    history for the next 30-60 min to confirm cadence actually holds —

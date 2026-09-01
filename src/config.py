@@ -29,17 +29,12 @@ GEMINI_MODEL_CHAIN = [
 ]
 
 # --- Credentials -------------------------------------------------------------
-# Neon Postgres, pooled connection string — this repo's DB traffic shape
-# (many short queries per short-lived cron process) is exactly what
-# pooled is for. The unpooled/direct string is only for manual psql/
-# pg_dump work (schema migrations) — never read by this module.
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-
-# Firebase (Firestore) — mid-migration off Neon (see src/db/models.py's
-# module docstring). Service account JSON, the whole key file's contents
-# as one env var (same shape as every other secret here), not a path —
-# a path assumes a mounted file, which Cloud Run Jobs' --set-secrets
-# doesn't give you. project ai-bot-14723.
+# Firebase (Firestore) — the only DB backend now (see src/db/models.py's
+# module docstring; migrated off Neon across three phases). Service
+# account JSON, the whole key file's contents as one env var (same shape
+# as every other secret here), not a path — a path assumes a mounted
+# file, which GitHub Actions secrets/Cloud Run Jobs' --set-secrets don't
+# give you. project ai-bot-14723.
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
 
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")

@@ -29,7 +29,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m src.orchestrator --mode=paper --risk-only
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       # Self Diagnostics (PROJECT_SPEC.md §3d) — its own step, not merged
       # into run_risk_check, so it fails independently of the SL/TP sweep
@@ -37,7 +36,6 @@ jobs:
       # new workflow file, which risks silently going stale unnoticed.
       - run: python -m src.monitoring.diagnostics --mode=paper
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
 
   real:
@@ -53,9 +51,7 @@ jobs:
         env:
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       - run: python -m src.monitoring.diagnostics --mode=real
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}

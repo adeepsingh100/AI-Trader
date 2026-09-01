@@ -8,7 +8,7 @@
 # and auto-restarts a task that crashes.
 #
 # Before running this: create the venv and make sure .env exists at the
-# repo root (same one used for local dev) with DATABASE_URL etc.
+# repo root (same one used for local dev) with FIREBASE_SERVICE_ACCOUNT_JSON etc.
 #   python -m venv .venv
 #   .venv\Scripts\pip install -r requirements.txt
 
@@ -20,7 +20,7 @@ if (-not (Test-Path $PythonExe)) {
     exit 1
 }
 if (-not (Test-Path (Join-Path $RepoRoot ".env"))) {
-    Write-Error "No .env at $RepoRoot\.env — the bot has no DATABASE_URL/API keys without it."
+    Write-Error "No .env at $RepoRoot\.env — the bot has no FIREBASE_SERVICE_ACCOUNT_JSON/API keys without it."
     exit 1
 }
 
