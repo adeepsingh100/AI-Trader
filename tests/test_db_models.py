@@ -1,9 +1,8 @@
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
 
 from src.db import models
 from src.groq_client import ModelUsageEvent
-from tests.conftest import _fake_connection, _fake_firestore_client, _inserted_row, _last_execute, _updated_row
+from tests.conftest import _fake_firestore_client
 
 
 def test_open_trade_inserts_expected_row(monkeypatch):

@@ -20,7 +20,7 @@ def _fmt(value, spec: str = ".2f") -> str:
     return "-" if value is None else format(value, spec)
 
 
-def generate_backtest_report_html(run_id: int) -> str:
+def generate_backtest_report_html(run_id: str) -> str:
     from src.agents.reporting_agent import _table
 
     run = models.get_backtest_run(run_id)
@@ -107,7 +107,7 @@ def generate_backtest_report_html(run_id: int) -> str:
     """
 
 
-def export_trades_csv(run_id: int) -> str:
+def export_trades_csv(run_id: str) -> str:
     trades = models.get_backtest_trades(run_id)
     buf = io.StringIO()
     if trades:
@@ -117,7 +117,7 @@ def export_trades_csv(run_id: int) -> str:
     return buf.getvalue()
 
 
-def export_run_json(run_id: int) -> str:
+def export_run_json(run_id: str) -> str:
     run = models.get_backtest_run(run_id)
     trades = models.get_backtest_trades(run_id)
     perf = models.get_backtest_performance_metrics(run_id)

@@ -1,202 +1,227 @@
 from datetime import date, datetime, timezone
-from unittest.mock import MagicMock
 
 from src.db import models
-from tests.conftest import _fake_connection, _inserted_row, _last_execute, _updated_row
+from tests.conftest import _fake_firestore_client
 
 
 # --- historical_candles ---
 
 
 def test_upsert_historical_candles_noop_on_empty_list(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
 
     models.upsert_historical_candles("I-BTC_INR", "1m", [])
 
-    conn.cursor.assert_not_called()
 
-
-def test_upsert_historical_candles_upserts_with_conflict_key(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    fake_execute_values = MagicMock()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    monkeypatch.setattr(models, "execute_values", fake_execute_values)
+def test_upsert_historical_candles_upserts_by_deterministic_doc_id(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     candles = [{"time": 1000, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10}]
     models.upsert_historical_candles("I-BTC_INR", "1m", candles)
 
-    sql, rows = fake_execute_values.call_args[0][1], fake_execute_values.call_args[0][2]
-    assert "ON CONFLICT (pair, interval, time)" in sql
-    assert rows[0] == ("I-BTC_INR", "1m", 1000, 1, 2, 0.5, 1.5, 10)
+    row = store["historical_candles"]["I-BTC_INR_1m_1000"]
+    assert row["open"] == 1 and row["volume"] == 10
+
+    # a repeat write for the same pair/interval/time overwrites, not duplicates
+    models.upsert_historical_candles("I-BTC_INR", "1m", [{**candles[0], "close": 9.9}])
+    assert len(store["historical_candles"]) == 1
+    assert store["historical_candles"]["I-BTC_INR_1m_1000"]["close"] == 9.9
 
 
 def test_get_historical_candles_filters_by_pair_interval_and_range(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"time": 1000}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"historical_candles": {
+        "I-BTC_INR_1m_500": {"pair": "I-BTC_INR", "interval": "1m", "time": 500},
+        "I-BTC_INR_1m_1000": {"pair": "I-BTC_INR", "interval": "1m", "time": 1000},
+        "I-BTC_INR_1m_3000": {"pair": "I-BTC_INR", "interval": "1m", "time": 3000},  # out of range
+        "I-ETH_INR_1m_1000": {"pair": "I-ETH_INR", "interval": "1m", "time": 1000},  # wrong pair
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_historical_candles("I-BTC_INR", "1m", 0, 2000)
 
-    assert result == [{"time": 1000}]
-    sql, params = _last_execute(cur)
-    assert "pair = %s" in sql and "interval = %s" in sql and "time >= %s" in sql and "time <= %s" in sql
-    assert params == ("I-BTC_INR", "1m", 0, 2000)
+    assert [r["time"] for r in result] == [500, 1000]
 
 
-def test_historical_candles_exist_uses_exists_not_select_star(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"exists_": True}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_historical_candles_exist_true_and_false(monkeypatch):
+    seed = {"historical_candles": {"I-BTC_INR_1m_1000": {"pair": "I-BTC_INR", "interval": "1m", "time": 1000}}}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    result = models.historical_candles_exist("I-BTC_INR", "1m", 0, 2000)
-
-    assert result is True
-    sql, params = _last_execute(cur)
-    assert "EXISTS" in sql
-    assert "SELECT *" not in sql
-    assert params == ("I-BTC_INR", "1m", 0, 2000)
+    assert models.historical_candles_exist("I-BTC_INR", "1m", 0, 2000) is True
+    assert models.historical_candles_exist("I-BTC_INR", "1m", 5000, 6000) is False
 
 
 # --- backtest_runs ---
 
 
-def test_insert_backtest_run_returns_inserted_row(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_insert_backtest_run_defaults_status_running(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.insert_backtest_run(
         symbols=["BTCINR"], start_date=date(2024, 1, 1), end_date=date(2024, 2, 1),
         warmup_buffer_days=260, starting_capital=100000, params_json={},
     )
 
-    assert result == {"id": 1}
-    row = _inserted_row(cur)
+    row = store["backtest_runs"][result["id"]]
     assert row["symbols"] == ["BTCINR"]
-    assert "status" not in row  # left to the DB default ('running'), not overridden here
+    assert row["status"] == "running"
 
 
 def test_update_backtest_run_status_sets_completed_at_when_given(monkeypatch):
-    conn, cur = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"backtest_runs": {"run1": {"status": "running"}}}
+    client, store = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    models.update_backtest_run_status(1, "completed", completed_at=now)
+    models.update_backtest_run_status("run1", "completed", completed_at=now)
 
-    row = _updated_row(cur)
+    row = store["backtest_runs"]["run1"]
     assert row["status"] == "completed"
-    assert row["completed_at"] == now.isoformat()
+    assert row["completed_at"] == now
 
 
 def test_get_backtest_run_none_when_missing(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    assert models.get_backtest_run(999) is None
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+    assert models.get_backtest_run("missing") is None
 
 
 def test_get_backtest_runs_filters_by_status(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1, "status": "completed"}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    seed = {"backtest_runs": {
+        "1": {"status": "completed", "created_at": 1},
+        "2": {"status": "running", "created_at": 2},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     result = models.get_backtest_runs(status="completed")
 
-    assert result == [{"id": 1, "status": "completed"}]
-    sql, params = _last_execute(cur)
-    assert "status = %s" in sql
-    assert params == ("completed",)
+    assert [r["id"] for r in result] == ["1"]
 
 
-# --- backtest_trades / snapshots / execution history (batch inserts) ---
+# --- backtest_trades / snapshots / execution history (run-scoped subcollections) ---
 
 
-def test_insert_backtest_trade_attaches_run_id(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_insert_backtest_trade_scoped_to_run(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.insert_backtest_trade(5, {"symbol": "BTCINR", "pnl": 10.0})
+    models.insert_backtest_trade("run5", {"symbol": "BTCINR", "pnl": 10.0, "entry_time": 1})
+    models.insert_backtest_trade("run5", {"symbol": "ETHINR", "pnl": -5.0, "entry_time": 2})
 
-    row = _inserted_row(cur)
-    assert row["run_id"] == 5
-    assert row["symbol"] == "BTCINR"
+    trades = models.get_backtest_trades("run5")
+    assert len(trades) == 2  # two separate inserts into the same run must not collide on doc ID
+    assert {t["symbol"] for t in trades} == {"BTCINR", "ETHINR"}
+
+
+def test_get_backtest_trades_ordered_by_entry_time(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+
+    models.insert_backtest_trade("run5", {"symbol": "B", "entry_time": 2})
+    models.insert_backtest_trade("run5", {"symbol": "A", "entry_time": 1})
+
+    result = models.get_backtest_trades("run5")
+    assert [r["symbol"] for r in result] == ["A", "B"]
 
 
 def test_insert_backtest_portfolio_snapshots_noop_on_empty(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    models.insert_backtest_portfolio_snapshots(1, [])
-    conn.cursor.assert_not_called()
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
+    models.insert_backtest_portfolio_snapshots("run5", [])
 
 
 def test_insert_backtest_portfolio_snapshots_batches_all_rows(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    fake_execute_values = MagicMock()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    monkeypatch.setattr(models, "execute_values", fake_execute_values)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
     snapshots = [{"snapshot_time": "t1", "equity": 100}, {"snapshot_time": "t2", "equity": 110}]
-    models.insert_backtest_portfolio_snapshots(1, snapshots)
+    models.insert_backtest_portfolio_snapshots("run5", snapshots)
 
-    sql, rows = fake_execute_values.call_args[0][1], fake_execute_values.call_args[0][2]
-    assert "INSERT INTO backtest_portfolio_snapshots" in sql
-    assert len(rows) == 2
-    assert all(r[0] == 1 for r in rows)  # run_id is always the first column here
+    result = models.get_backtest_portfolio_snapshots("run5")
+    assert len(result) == 2
 
 
 def test_insert_backtest_execution_events_noop_on_empty(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    models.insert_backtest_execution_events(1, [])
-    conn.cursor.assert_not_called()
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
+    models.insert_backtest_execution_events("run5", [])
 
 
 # --- performance metrics / walk-forward folds / strategy comparisons ---
 
 
-def test_insert_backtest_performance_metrics(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1, "run_id": 5}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_insert_and_get_backtest_performance_metrics(monkeypatch):
+    seed = {"backtest_runs": {"run5": {"status": "running"}}}
+    client, store = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    result = models.insert_backtest_performance_metrics(5, {"win_rate": 0.6})
+    models.insert_backtest_performance_metrics("run5", {"win_rate": 0.6})
 
-    assert result == {"id": 1, "run_id": 5}
-    row = _inserted_row(cur)
-    assert row["metrics"] == {"win_rate": 0.6}
+    result = models.get_backtest_performance_metrics("run5")
+    assert result == {"run_id": "run5", "metrics": {"win_rate": 0.6}}
+    # the run doc's other fields survive -- this is a merge onto the run, not an overwrite
+    assert store["backtest_runs"]["run5"]["status"] == "running"
 
 
 def test_get_backtest_performance_metrics_none_when_missing(monkeypatch):
-    conn, _ = _fake_connection(rows=[])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
-    assert models.get_backtest_performance_metrics(5) is None
+    seed = {"backtest_runs": {"run5": {"status": "running"}}}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+    assert models.get_backtest_performance_metrics("run5") is None
 
 
-def test_insert_backtest_walk_forward_fold_attaches_run_id(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+def test_insert_backtest_walk_forward_fold_scoped_to_run(monkeypatch):
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    models.insert_backtest_walk_forward_fold(5, {"fold_number": 1, "passed": True})
+    models.insert_backtest_walk_forward_fold("run5", {"fold_number": 1, "passed": True})
 
-    row = _inserted_row(cur)
-    assert row["run_id"] == 5
-    assert row["fold_number"] == 1
+    folds = models.get_backtest_walk_forward_folds("run5")
+    assert len(folds) == 1
+    assert folds[0]["fold_number"] == 1
 
 
 def test_get_backtest_walk_forward_folds_ordered_by_fold_number(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"fold_number": 1}, {"fold_number": 2}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    result = models.get_backtest_walk_forward_folds(5)
+    models.insert_backtest_walk_forward_fold("run5", {"fold_number": 2})
+    models.insert_backtest_walk_forward_fold("run5", {"fold_number": 1})
 
-    assert result == [{"fold_number": 1}, {"fold_number": 2}]
-    sql, _ = _last_execute(cur)
-    assert "ORDER BY fold_number" in sql
+    result = models.get_backtest_walk_forward_folds("run5")
+    assert [r["fold_number"] for r in result] == [1, 2]
 
 
 def test_insert_backtest_strategy_comparison(monkeypatch):
-    conn, cur = _fake_connection(rows=[{"id": 1}])
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
 
-    result = models.insert_backtest_strategy_comparison(1, 2, {"a": 1}, {"b": 2}, {"p": 0.01}, "b", True)
+    result = models.insert_backtest_strategy_comparison("run1", "run2", {"a": 1}, {"b": 2}, {"p": 0.01}, "b", True)
 
-    assert result == {"id": 1}
-    row = _inserted_row(cur)
-    assert row["run_id_a"] == 1
-    assert row["run_id_b"] == 2
+    row = store["backtest_strategy_comparisons"][result["id"]]
+    assert row["run_id_a"] == "run1"
+    assert row["run_id_b"] == "run2"
     assert row["promotion_recommended"] is True
+
+
+def test_get_backtest_strategy_comparisons_ordered_by_created_at_desc(monkeypatch):
+    seed = {"backtest_strategy_comparisons": {
+        "1": {"run_id_a": "a", "run_id_b": "b", "created_at": 1},
+        "2": {"run_id_a": "c", "run_id_b": "d", "created_at": 2},
+    }}
+    client, _ = _fake_firestore_client(seed=seed)
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+
+    result = models.get_backtest_strategy_comparisons()
+    assert [r["id"] for r in result] == ["2", "1"]

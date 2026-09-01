@@ -3,102 +3,63 @@ PROJECT_SPEC.md §6 for the schema these map to.
 
 Migrated off Supabase (its free-tier disk filled and its instance got
 stuck in Postgres crash-recovery) onto Neon, a plain managed Postgres.
-Now mid-migration OFF Neon too (its free-tier data-transfer quota
-exhausted, hard-blocking the bot with no way to restore access short of
-paying — see PROJECT_SPEC.md) onto Firebase/Firestore, genuinely free at
-this scale. Migrating table-by-table, not a single cutover: functions
-for capital_config/strategy_versions/trades/daily_pnl/risk_check_lock/
-agent_logs/opportunity_evaluations/confidence_calibration/
-learning_statistics/trade_evaluations/feature_importance (the live
-trading hot path — Phase 1), plus recommendations/strategy_simulations/
-adaptive_strategy_versions/model_usage/promotion_audit/drift_alerts/
-strategy_health_scores/system_metrics/data_quality_log/
-circuit_breaker_state (remaining learning/evolution tables — Phase 2),
-talk to Firestore via get_firestore_client(); only the backtest
-subsystem (Phase 3) still talks to Neon via get_client()/psycopg2, until
-its own phase. Two backends in one file, but never two sources of truth for
-the same table — every table has exactly one backend at a time, tracked
-per-function below, not a dual-write. Every function's name, signature,
-and return shape (list[dict] / dict / None) stays unchanged across the
-swap, same discipline as the Supabase→Neon migration, so callers need
-zero changes — except open_trade/log_opportunity_evaluation, which
-gained a required strategy_type param: Firestore has no JOIN, so
+Then migrated OFF Neon too (its free-tier data-transfer quota exhausted,
+hard-blocking the bot with no way to restore access short of paying —
+see PROJECT_SPEC.md) onto Firebase/Firestore, genuinely free at this
+scale. Migrated table-by-table across three phases, not a single
+cutover: the live trading hot path (Phase 1), the remaining
+learning/evolution tables (Phase 2), then the backtest subsystem
+(Phase 3, historical_candles/backtest_runs and its children) — the last
+Postgres consumer in this file, so get_client()/psycopg2 is gone
+entirely now, not just unused per-function. Every function's name,
+signature, and return shape (list[dict] / dict / None) stayed unchanged
+across the swap, same discipline as the Supabase→Neon migration, so
+callers needed zero changes — except open_trade/log_opportunity_evaluation,
+which gained a required strategy_type param: Firestore has no JOIN, so
 trades/opportunity_evaluations now carry strategy_type as a real field
-instead of deriving it via version_id → strategy_versions at read time."""
+instead of deriving it via version_id → strategy_versions at read time;
+and the backtest run/trade/fold/etc. id fields, which are Firestore
+auto-ID strings now, not bigserial ints."""
 
 from __future__ import annotations
 
 import json
 import os
-import psycopg2
-import psycopg2.extensions
 from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any
 
 import firebase_admin
 from firebase_admin import credentials, firestore
-from psycopg2.extras import Json, RealDictCursor, execute_values
 
-from src.config import DATABASE_URL, FIREBASE_SERVICE_ACCOUNT_JSON
+from src.config import FIREBASE_SERVICE_ACCOUNT_JSON
 from src.groq_client import ModelUsageEvent
 from src.resilience import retry_with_backoff
 
-_conn: psycopg2.extensions.connection | None = None
 _firebase_app: firebase_admin.App | None = None
-
-# psycopg2 defaults NUMERIC to Decimal; every downstream caller
-# (features/learning/agents) does float arithmetic on these values, and
-# Supabase's JSON/PostgREST layer always returned floats — register this
-# once so return shapes stay byte-identical to before.
-_DEC2FLOAT = psycopg2.extensions.new_type(
-    psycopg2.extensions.DECIMAL.values,
-    "DEC2FLOAT",
-    lambda value, curs: float(value) if value is not None else None,
-)
-psycopg2.extensions.register_type(_DEC2FLOAT)
-
-# psycopg2 doesn't adapt a plain dict to jsonb on write by default. Every
-# dict-typed parameter in this file is destined for a jsonb column
-# (features/params_json/raw_llm_response/breakdown/gates/evidence/detail/
-# metadata/...) — registering this globally covers all of them. NOT done
-# for `list` (register_adapter(list, Json)) on purpose: several functions
-# pass a plain list of ids/values into `= ANY(%s)` for a native Postgres
-# array (psycopg2's built-in list adapter), and a global list->Json
-# adapter would silently break every one of those. (The one list-typed
-# jsonb column this file used to write this way, promotion_audit.reasons,
-# moved to Firestore in Phase 2 — see get_firestore_client's docstring —
-# where a list is a native field type, no wrapping needed.)
-psycopg2.extensions.register_adapter(dict, Json)
-
-
-def get_client() -> psycopg2.extensions.connection:
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = psycopg2.connect(DATABASE_URL)  # pooled connection string — see src/config.py
-    return _conn
 
 
 def ping() -> None:
     """Trivial reachability check — used by monitoring/diagnostics.py's
-    database health check, which needs no real data, just confirmation the
-    connection works."""
-    with get_client().cursor() as cur:
-        cur.execute("select mode from capital_config limit 1")
-    get_client().commit()
+    database health check, which needs no real data, just confirmation
+    Firestore is reachable. capital_config moved off Neon in Phase 1 (see
+    module docstring); this used to check Neon via that same table and
+    would have permanently reported the DB unhealthy after the cutover
+    (worse: Neon's own quota block was the reason for this migration, so
+    the "DB down" alert would never have cleared) had it not moved too."""
+    _query("capital_config", limit=1)
 
 
 def get_firestore_client() -> firestore.Client:
-    """Separate seam from get_client() — deliberately, not a rename.
-    Phases 1-2 of the Neon→Firestore migration (see module docstring) move
-    most of this file's ~81 functions to Firestore; the rest (the backtest
-    subsystem, Phase 3) keep using get_client()/psycopg2 unchanged until
-    their own phase. One shared
-    get_client() returning "whichever backend" would either break the
-    untouched functions or force a big-bang cutover — neither is what was
-    approved. FIREBASE_SERVICE_ACCOUNT_JSON is the whole service-account
-    key file's contents (Cloud Run Jobs' --set-secrets gives you a env
-    var, not a mounted file path)."""
+    """The sole DB client this file uses now — all three migration phases
+    (see module docstring) are done, every function below talks to
+    Firestore. Named get_firestore_client rather than get_client (a plain
+    rename once psycopg2's get_client was deleted) as a paper trail: three
+    phases ran with both a Postgres get_client() and this one live side by
+    side, each function pinned to exactly one, never both. FIREBASE_
+    SERVICE_ACCOUNT_JSON is the whole service-account key file's contents
+    (Cloud Run Jobs' --set-secrets gives you an env var, not a mounted
+    file path)."""
     global _firebase_app
     if _firebase_app is None:
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
@@ -166,7 +127,7 @@ def _get_docs_by_ids(collection: str, doc_ids: list) -> list[firestore.DocumentS
 
 def _batch_set(collection: str, rows: list[dict], doc_id_fn=None) -> None:
     """Batch insert/upsert, chunked at Firestore's 500-writes-per-batch
-    limit — the Firestore counterpart to _insert_rows' execute_values."""
+    limit — a multi-row write in one round trip instead of one per row."""
     client = get_firestore_client()
     coll_ref = client.collection(collection)
     for i in range(0, len(rows), 500):
@@ -198,96 +159,15 @@ def _purge_before(collection: str, field: str, cutoff: datetime) -> int:
         deleted += len(docs)
 
 
-def _run_query(sql_text: str, params: tuple = ()) -> list[dict]:
-    """SELECT helper — every read in this file goes through this (or
-    _run_write for a read that follows a write in the same call). Commits
-    after every query, even reads: this connection is long-lived across
-    many calls in one process run, and leaving a transaction open would
-    hold a backend connection under Neon's pooled (PgBouncer transaction-
-    mode) connection string longer than necessary."""
-    conn = get_client()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql_text, params)
-            rows = [dict(r) for r in cur.fetchall()]
-        conn.commit()
-        return rows
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def _run_write(sql_text: str, params: tuple = ()) -> list[dict]:
-    """INSERT/UPDATE/UPSERT/DELETE helper, optionally with RETURNING.
-    Returns the RETURNING rows (or [] if the statement had none)."""
-    conn = get_client()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql_text, params)
-            rows = [dict(r) for r in cur.fetchall()] if cur.description else []
-        conn.commit()
-        return rows
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def _insert_row(table: str, row: dict) -> dict:
-    """Dynamic single-row insert (table/column names come from this
-    file's own call sites — internal Python dict keys, never external
-    input — safe to interpolate directly, same reasoning this file
-    already applies to ORDER BY/LIMIT clauses below)."""
-    cols = list(row.keys())
-    col_list = ", ".join(cols)
-    placeholders = ", ".join(["%s"] * len(cols))
-    query = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) RETURNING *"
-    return _run_write(query, tuple(row.values()))[0]
-
-
-def _insert_rows(table: str, rows: list[dict]) -> None:
-    """Dynamic batch insert — a multi-month equity curve or a cycle's
-    worth of log rows is many rows, one-row-per-round-trip would be
-    needlessly slow. All rows in one call are assumed to share the same
-    keys (true at every call site below)."""
-    if not rows:
-        return
-    cols = list(rows[0].keys())
-    col_list = ", ".join(cols)
-    query = f"INSERT INTO {table} ({col_list}) VALUES %s"
-    conn = get_client()
-    try:
-        with conn.cursor() as cur:
-            execute_values(cur, query, [tuple(r[c] for c in cols) for r in rows])
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-
 def _execute(fn):
-    """Retries fn() on a transient connection error — safe here because
-    every call site below is naturally idempotent (a repeat select/
-    upsert/delete doesn't create a second row). Plain single-row inserts
-    are NOT routed through this: a retry after a request whose response
-    was lost but which actually succeeded server-side would insert a
-    duplicate row (a trade, a log line) — a real correctness risk this
-    codebase's own "never fabricate/duplicate financial state" ethos
-    rules out. Also resets the module-level connection on
-    OperationalError before re-raising — psycopg2 doesn't health-check a
-    connection per-call the way the old Supabase HTTP client implicitly
-    did, so a connection Neon dropped (e.g. after a scale-to-zero
-    suspend) needs a fresh one on the next attempt, not a retry against
-    the same dead socket."""
-    def attempt():
-        try:
-            return fn()
-        except psycopg2.OperationalError:
-            global _conn
-            if _conn is not None:
-                _conn.close()
-            _conn = None
-            raise
-    return retry_with_backoff(attempt)
+    """Retries fn() on a transient error — safe here because every call
+    site below is naturally idempotent (a repeat select/upsert/delete
+    doesn't create a second row). Plain single-row inserts are NOT routed
+    through this: a retry after a request whose response was lost but
+    which actually succeeded server-side would insert a duplicate row (a
+    trade, a log line) — a real correctness risk this codebase's own
+    "never fabricate/duplicate financial state" ethos rules out."""
+    return retry_with_backoff(fn)
 
 
 # --- capital_config ---
@@ -985,32 +865,22 @@ def get_trades_by_ids(trade_ids: list[int]) -> list[dict]:
 
 def upsert_historical_candles(pair: str, interval: str, candles: list[dict]) -> None:
     """candles: list of {"time","open","high","low","close","volume"} dicts,
-    CoinDCX's own raw shape — caller passes them through unchanged."""
+    CoinDCX's own raw shape — caller passes them through unchanged.
+    Deterministic doc ID (pair_interval_time) makes a repeat write a plain
+    overwrite of the same doc — Postgres's ON CONFLICT DO UPDATE rewrote
+    every value column anyway, so this is byte-identical upsert behavior."""
     if not candles:
         return
-    rows = [(pair, interval, c["time"], c["open"], c["high"], c["low"], c["close"], c["volume"]) for c in candles]
-    conn = get_client()
-    try:
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                "INSERT INTO historical_candles (pair, interval, time, open, high, low, close, volume) VALUES %s "
-                "ON CONFLICT (pair, interval, time) DO UPDATE SET "
-                "open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, "
-                "close = EXCLUDED.close, volume = EXCLUDED.volume",
-                rows,
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    rows = [{"pair": pair, "interval": interval, **c} for c in candles]
+    _batch_set("historical_candles", rows, doc_id_fn=lambda r: f"{r['pair']}_{r['interval']}_{r['time']}")
 
 
 def get_historical_candles(pair: str, interval: str, start_time_ms: int, end_time_ms: int) -> list[dict]:
-    return _run_query(
-        "SELECT * FROM historical_candles WHERE pair = %s AND interval = %s AND time >= %s AND time <= %s "
-        "ORDER BY time",
-        (pair, interval, start_time_ms, end_time_ms),
+    return _query(
+        "historical_candles",
+        [("pair", "==", pair), ("interval", "==", interval),
+         ("time", ">=", start_time_ms), ("time", "<=", end_time_ms)],
+        order_by="time",
     )
 
 
@@ -1021,13 +891,15 @@ def historical_candles_exist(pair: str, interval: str, start_time_ms: int, end_t
     any data at all") were pulling the full result set just to check
     non-emptiness, at BACKTEST_TICK_TIMEFRAME granularity over a range
     that can span a whole strategy version's trade history — real,
-    unnecessary Neon egress. This transfers one boolean instead."""
-    rows = _run_query(
-        "SELECT EXISTS (SELECT 1 FROM historical_candles "
-        "WHERE pair = %s AND interval = %s AND time >= %s AND time <= %s) AS exists_",
-        (pair, interval, start_time_ms, end_time_ms),
+    unnecessary egress either backend. limit=1 transfers at most one doc
+    instead of the whole range."""
+    rows = _query(
+        "historical_candles",
+        [("pair", "==", pair), ("interval", "==", interval),
+         ("time", ">=", start_time_ms), ("time", "<=", end_time_ms)],
+        limit=1,
     )
-    return rows[0]["exists_"]
+    return len(rows) > 0
 
 
 # --- backtest_runs ---
@@ -1041,10 +913,10 @@ def insert_backtest_run(
     starting_capital: float,
     params_json: dict,
     use_llm_signal_agent: bool = False,
-    source_adaptive_strategy_version_id: int | None = None,
+    source_adaptive_strategy_version_id: str | None = None,
     name: str | None = None,
 ) -> dict:
-    return _insert_row("backtest_runs", {
+    return _insert_doc("backtest_runs", {
         "name": name,
         "symbols": symbols,
         "start_date": start_date.isoformat(),
@@ -1054,113 +926,109 @@ def insert_backtest_run(
         "params_json": params_json,
         "use_llm_signal_agent": use_llm_signal_agent,
         "source_adaptive_strategy_version_id": source_adaptive_strategy_version_id,
+        "status": "running",  # Firestore has no column default -- explicit here
+        "created_at": datetime.now(timezone.utc),
     })
 
 
-def update_backtest_run_status(run_id: int, status: str, completed_at: datetime | None = None) -> None:
+def update_backtest_run_status(run_id: str, status: str, completed_at: datetime | None = None) -> None:
+    fields = {"status": status}
     if completed_at is not None:
-        _run_write(
-            "UPDATE backtest_runs SET status = %s, completed_at = %s WHERE id = %s",
-            (status, completed_at.isoformat(), run_id),
-        )
-    else:
-        _run_write("UPDATE backtest_runs SET status = %s WHERE id = %s", (status, run_id))
+        fields["completed_at"] = completed_at
+    _set_doc("backtest_runs", run_id, fields)
 
 
-def get_backtest_run(run_id: int) -> dict | None:
-    rows = _run_query("SELECT * FROM backtest_runs WHERE id = %s", (run_id,))
-    return rows[0] if rows else None
+def get_backtest_run(run_id: str) -> dict | None:
+    return _get_doc("backtest_runs", run_id)
 
 
 def get_backtest_runs(status: str | None = None) -> list[dict]:
-    if status is not None:
-        return _run_query(
-            "SELECT * FROM backtest_runs WHERE status = %s ORDER BY created_at DESC", (status,)
-        )
-    return _run_query("SELECT * FROM backtest_runs ORDER BY created_at DESC")
+    filters = [("status", "==", status)] if status is not None else []
+    return _query("backtest_runs", filters, order_by="created_at", desc=True)
 
 
-# --- backtest_trades ---
+# --- backtest_trades (a subcollection of backtest_runs — not top-level:
+# every read is already scoped to one run_id, and Firestore has no JOIN
+# to reassemble a top-level collection back to its parent run anyway) ---
 
 
-def insert_backtest_trade(run_id: int, trade: dict) -> dict:
-    return _insert_row("backtest_trades", {"run_id": run_id, **trade})
+def insert_backtest_trade(run_id: str, trade: dict) -> dict:
+    return _insert_doc(f"backtest_runs/{run_id}/trades", trade)
 
 
-def get_backtest_trades(run_id: int) -> list[dict]:
-    return _run_query("SELECT * FROM backtest_trades WHERE run_id = %s ORDER BY entry_time", (run_id,))
+def get_backtest_trades(run_id: str) -> list[dict]:
+    return _query(f"backtest_runs/{run_id}/trades", order_by="entry_time")
 
 
 # --- backtest_portfolio_snapshots ---
 
 
-def insert_backtest_portfolio_snapshots(run_id: int, snapshots: list[dict]) -> None:
+def insert_backtest_portfolio_snapshots(run_id: str, snapshots: list[dict]) -> None:
     """Batch insert — a multi-month equity curve is thousands of points,
     one-row-per-network-call would be needlessly slow."""
     if not snapshots:
         return
-    _insert_rows("backtest_portfolio_snapshots", [{"run_id": run_id, **s} for s in snapshots])
+    _batch_set(f"backtest_runs/{run_id}/portfolio_snapshots", snapshots)
 
 
-def get_backtest_portfolio_snapshots(run_id: int) -> list[dict]:
-    return _run_query(
-        "SELECT * FROM backtest_portfolio_snapshots WHERE run_id = %s ORDER BY snapshot_time", (run_id,)
-    )
+def get_backtest_portfolio_snapshots(run_id: str) -> list[dict]:
+    return _query(f"backtest_runs/{run_id}/portfolio_snapshots", order_by="snapshot_time")
 
 
 # --- backtest_execution_history ---
 
 
-def insert_backtest_execution_events(run_id: int, events: list[dict]) -> None:
+def insert_backtest_execution_events(run_id: str, events: list[dict]) -> None:
     if not events:
         return
-    _insert_rows("backtest_execution_history", [{"run_id": run_id, **e} for e in events])
+    _batch_set(f"backtest_runs/{run_id}/execution_history", events)
 
 
-def get_backtest_execution_history(run_id: int) -> list[dict]:
-    return _run_query(
-        "SELECT * FROM backtest_execution_history WHERE run_id = %s ORDER BY event_time", (run_id,)
-    )
+def get_backtest_execution_history(run_id: str) -> list[dict]:
+    return _query(f"backtest_runs/{run_id}/execution_history", order_by="event_time")
 
 
-# --- backtest_performance_metrics ---
+# --- backtest_performance_metrics: a genuine 1:1 with backtest_runs, so it
+# lives as a field on the run doc itself rather than its own collection ---
 
 
-def insert_backtest_performance_metrics(run_id: int, metrics: dict) -> dict:
-    return _insert_row("backtest_performance_metrics", {"run_id": run_id, "metrics": metrics})
+def insert_backtest_performance_metrics(run_id: str, metrics: dict) -> dict:
+    _set_doc("backtest_runs", run_id, {"metrics": metrics})
+    return {"run_id": run_id, "metrics": metrics}
 
 
-def get_backtest_performance_metrics(run_id: int) -> dict | None:
-    rows = _run_query("SELECT * FROM backtest_performance_metrics WHERE run_id = %s", (run_id,))
-    return rows[0] if rows else None
+def get_backtest_performance_metrics(run_id: str) -> dict | None:
+    doc = _get_doc("backtest_runs", run_id)
+    if doc is None or "metrics" not in doc:
+        return None
+    return {"run_id": run_id, "metrics": doc["metrics"]}
 
 
 # --- backtest_walk_forward_folds ---
 
 
-def insert_backtest_walk_forward_fold(run_id: int, fold: dict) -> dict:
-    return _insert_row("backtest_walk_forward_folds", {"run_id": run_id, **fold})
+def insert_backtest_walk_forward_fold(run_id: str, fold: dict) -> dict:
+    return _insert_doc(f"backtest_runs/{run_id}/walk_forward_folds", fold)
 
 
-def get_backtest_walk_forward_folds(run_id: int) -> list[dict]:
-    return _run_query(
-        "SELECT * FROM backtest_walk_forward_folds WHERE run_id = %s ORDER BY fold_number", (run_id,)
-    )
+def get_backtest_walk_forward_folds(run_id: str) -> list[dict]:
+    return _query(f"backtest_runs/{run_id}/walk_forward_folds", order_by="fold_number")
 
 
-# --- backtest_strategy_comparisons ---
+# --- backtest_strategy_comparisons: stays top-level, not a subcollection —
+# it references two runs (run_id_a/run_id_b), doesn't belong under either ---
 
 
 def insert_backtest_strategy_comparison(
-    run_id_a: int,
-    run_id_b: int,
+    run_id_a: str,
+    run_id_b: str,
     metrics_a: dict | None,
     metrics_b: dict | None,
     p_values: dict | None,
     winner: str | None,
     promotion_recommended: bool | None,
 ) -> dict:
-    return _insert_row("backtest_strategy_comparisons", {
+    return _insert_doc("backtest_strategy_comparisons", {
         "run_id_a": run_id_a,
         "run_id_b": run_id_b,
         "metrics_a": metrics_a,
@@ -1168,11 +1036,12 @@ def insert_backtest_strategy_comparison(
         "p_values": p_values,
         "winner": winner,
         "promotion_recommended": promotion_recommended,
+        "created_at": datetime.now(timezone.utc),
     })
 
 
 def get_backtest_strategy_comparisons() -> list[dict]:
-    return _run_query("SELECT * FROM backtest_strategy_comparisons ORDER BY created_at DESC")
+    return _query("backtest_strategy_comparisons", order_by="created_at", desc=True)
 
 
 def get_entry_evaluations_since(mode: str, since: datetime, strategy_type: str | None = None) -> list[dict]:

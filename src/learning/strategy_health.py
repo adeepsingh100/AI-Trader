@@ -78,7 +78,7 @@ def _recent_vs_historical_component(recent_stats: dict, historical_stats: dict) 
     return 75.0 if recent_exp > historical_exp else 25.0
 
 
-def _walk_forward_component(run_id: int | None) -> float | None:
+def _walk_forward_component(run_id: str | None) -> float | None:
     if run_id is None:
         return None
     folds = models.get_backtest_walk_forward_folds(run_id)
@@ -103,7 +103,7 @@ def _tier(score: float | None) -> str:
 
 
 def compute_health_score(
-    mode: str, version: dict, capital_to_use: float, backtest_run_id: int | None = None
+    mode: str, version: dict, capital_to_use: float, backtest_run_id: str | None = None
 ) -> dict:
     trades = models.get_closed_trades(mode, version["id"])
     recent_since = datetime.now(timezone.utc) - timedelta(days=30)

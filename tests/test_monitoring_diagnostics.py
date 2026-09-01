@@ -1,13 +1,13 @@
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 from src.db import models
 from src.monitoring.diagnostics import run_health_check
+from tests.conftest import _fake_firestore_client
 
 
 def _healthy_mocks(monkeypatch):
-    # MagicMock (not plain Mock) — models.ping() does `with get_client().
-    # cursor() as cur:`, which needs the context-manager protocol.
-    monkeypatch.setattr(models, "get_client", lambda: MagicMock())
+    client, _ = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
     monkeypatch.setattr(models, "get_entry_evaluations_since", lambda mode, since: [{"id": 1}])
     monkeypatch.setattr(
         models,
@@ -49,7 +49,7 @@ def test_run_health_check_db_error_marks_unhealthy_not_a_crash(monkeypatch):
     def _raise():
         raise RuntimeError("connection refused")
 
-    monkeypatch.setattr(models, "get_client", _raise)
+    monkeypatch.setattr(models, "get_firestore_client", _raise)
     result = run_health_check("paper")  # must not raise
     assert result["checks"]["database"]["healthy"] is False
     assert result["overall_healthy"] is False

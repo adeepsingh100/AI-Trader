@@ -1,5 +1,5 @@
 from src.db import models
-from tests.conftest import _fake_connection, _fake_firestore_client
+from tests.conftest import _fake_firestore_client
 
 
 # --- data_quality_log ---
@@ -176,10 +176,11 @@ def test_reset_circuit_breaker_zeroes_failures(monkeypatch):
 
 
 def test_get_trade_evaluations_noop_on_empty(monkeypatch):
-    conn, _ = _fake_connection()
-    monkeypatch.setattr(models, "get_client", lambda: conn)
+    def _fail(*a, **kw):
+        raise AssertionError("should not touch Firestore for an empty id list")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
     assert models.get_trade_evaluations([]) == []
-    conn.cursor.assert_not_called()
 
 
 def test_get_trade_evaluations_returns_full_rows(monkeypatch):

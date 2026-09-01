@@ -359,7 +359,7 @@ def run_and_persist(
     params_json: dict | None = None,
     name: str | None = None,
     **engine_kwargs,
-) -> int:
+) -> str:
     """Runs a backtest end to end and persists the run/trades/snapshots/
     execution history/performance metrics — the CLI entry point's
     implementation, also reusable directly (e.g. by walk_forward_validator
