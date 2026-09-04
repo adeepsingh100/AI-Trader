@@ -34,6 +34,29 @@ def test_insert_data_quality_issues_batch_level_issue_gets_auto_id(monkeypatch):
     assert row["issue_type"] == "exchange_outage"
 
 
+def test_insert_data_quality_issues_drops_ignore_severity_rows(monkeypatch):
+    def _fail(*a, **kw):
+        raise AssertionError("severity=ignore rows must never reach Firestore")
+
+    monkeypatch.setattr(models, "get_firestore_client", _fail)
+
+    models.insert_data_quality_issues([
+        {"pair": "I-YFI_INR", "interval": "1m", "issue_type": "zero_volume", "severity": "ignore", "candle_time": 1},
+    ])
+
+
+def test_insert_data_quality_issues_keeps_non_ignore_rows_alongside_ignored_ones(monkeypatch):
+    client, store = _fake_firestore_client()
+    monkeypatch.setattr(models, "get_firestore_client", lambda: client)
+
+    models.insert_data_quality_issues([
+        {"pair": "I-YFI_INR", "interval": "1m", "issue_type": "zero_volume", "severity": "ignore", "candle_time": 1},
+        {"pair": "I-BTC_INR", "interval": "1m", "issue_type": "price_spike", "severity": "warn", "candle_time": 2},
+    ])
+
+    assert list(store["data_quality_log"].keys()) == ["I-BTC_INR_1m_price_spike_2"]
+
+
 def test_get_data_quality_log_filters_by_pair_and_source(monkeypatch):
     seed = {"data_quality_log": {
         "1": {"pair": "I-BTC_INR", "source": "live", "created_at": 2},

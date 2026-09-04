@@ -1084,7 +1084,19 @@ def insert_data_quality_issues(rows: list[dict]) -> None:
     than no-ops (Postgres's DO NOTHING) -- latest wins, harmless for
     advisory logging. candle_time is None for batch-level issues (e.g.
     exchange_outage), which never deduped in Postgres either (NULLs are
-    distinct in a unique index) -- those get a plain auto-ID instead."""
+    distinct in a unique index) -- those get a plain auto-ID instead.
+
+    Drops severity="ignore" rows before writing -- src/config.py's own
+    comment on the DATA_QUALITY_SEVERITY_* block documents "ignore doesn't
+    even log", but both call sites (data_agent.py live path, data_provider
+    .py backtest path) always built their row list unconditionally from
+    every detected issue, so that promise was never actually implemented.
+    On a symbol with routinely thin volume this is the dominant write
+    source by far (real incident: ~2,000 zero_volume rows/day on a
+    handful of illiquid pairs, most of a Firestore free-tier daily write
+    quota) -- fixed here once, in the one place both callers share,
+    rather than duplicating the filter at each call site."""
+    rows = [r for r in rows if r.get("severity") != "ignore"]
     if not rows:
         return
     now = datetime.now(timezone.utc)
