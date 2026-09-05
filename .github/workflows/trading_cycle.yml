@@ -20,6 +20,11 @@ jobs:
       - run: python -m src.orchestrator --mode=paper
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          # zero_volume on thin pairs (YFI/PAXG/TAO/XAUT/HYPE/BNB/ZEC) was
+          # ~95% of this project's daily Firestore writes, recurringly
+          # exhausting the free-tier 20K/day cap — see src/db/models.py::
+          # insert_data_quality_issues. Not a secret, a plain config value.
+          DATA_QUALITY_SEVERITY_ZERO_VOLUME: ignore
 
   real:
     runs-on: ubuntu-latest
@@ -36,3 +41,4 @@ jobs:
           COINDCX_API_KEY: ${{ secrets.COINDCX_API_KEY }}
           COINDCX_API_SECRET: ${{ secrets.COINDCX_API_SECRET }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          DATA_QUALITY_SEVERITY_ZERO_VOLUME: ignore
